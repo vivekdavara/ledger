@@ -4,8 +4,9 @@ The questions an interviewer is likely to ask about Ledger, with short answers t
 grows each day; this version covers day 1 (the money type, the validator, the schema and its invariants, the
 migration runner, the binary). Read DESIGN.md first for the full picture.
 
-**Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the three migrations in
-`internal/store/migrations/` → `internal/store/migrate.go` → `internal/store/differential_test.go`.
+**Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the migrations in
+`internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
+`internal/store/migrate.go` → `internal/store/differential_test.go`.
 
 ## The model
 

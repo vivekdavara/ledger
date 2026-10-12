@@ -78,7 +78,7 @@ closed: a statement that gets around the expected order of operations is rejecte
 | I1 | The postings of an entry sum to zero in each currency | `ledger.Entry.Validate` | deferred constraint trigger, checked at commit |
 | I2 | An entry has between 2 and 64 postings, exactly as many as it declares | `Validate` | the same trigger: `posting_count` must match |
 | I3 | A posting's currency is its account's currency | checked against the account | composite foreign key `(account_id, currency)` |
-| I4 | An account's `balance` is the sum of its postings; each posting records the balance after it and the account's version, with no gaps | the database does it | `BEFORE INSERT` trigger on postings; `UNIQUE (account_id, account_version)` |
+| I4 | An account's `balance` is the sum of its postings; each posting records the balance after it and the account's version, with no gaps | the database does it | `BEFORE` and `AFTER INSERT` triggers on postings; `UNIQUE (account_id, account_version)` |
 | I5 | A protected account never goes below zero on its normal side | checked before posting | `CHECK` on accounts, evaluated on every balance change |
 | I6 | Entries and postings are never updated or deleted | no code path does it | triggers reject `UPDATE`, `DELETE` and `TRUNCATE` |
 | I7 | A balance changes only through a posting | no code path does it | trigger on accounts rejects direct changes |
