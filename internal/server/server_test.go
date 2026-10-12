@@ -59,10 +59,14 @@ func TestReadyzDoesNotHangWithTheDatabase(t *testing.T) {
 		<-ctx.Done() // a database that never answers
 		return ctx.Err()
 	}, quiet)
+	// The request's own 10 s deadline is a backstop: without the handler's timeout this test fails, not hangs.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	start := time.Now()
-	code, _ := get(t, hung, "GET", "/readyz")
-	if took := time.Since(start); code != 503 || took > 5*time.Second {
-		t.Fatalf("got %d after %v; want 503 within the 2 s timeout", code, took)
+	rec := httptest.NewRecorder()
+	hung.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil).WithContext(ctx))
+	if took := time.Since(start); rec.Code != 503 || took > 5*time.Second {
+		t.Fatalf("got %d after %v; want 503 within the 2 s timeout", rec.Code, took)
 	}
 }
 

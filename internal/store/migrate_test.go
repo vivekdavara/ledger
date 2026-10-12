@@ -34,6 +34,15 @@ func migrate(t *testing.T, pool *pgxpool.Pool, m map[string]string) ([]int, erro
 	return store.MigrateFS(context.Background(), pool, files(m))
 }
 
+// noConnectionLeft fails if MigrateFS kept a connection checked out: its transaction wasn't rolled back. Uncommitted
+// DDL is invisible to other connections, so the table checks alone can't see a missing rollback.
+func noConnectionLeft(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if n := pool.Stat().AcquiredConns(); n != 0 {
+		t.Fatalf("%d connections still checked out after MigrateFS returned: a transaction left open", n)
+	}
+}
+
 func count(t *testing.T, pool *pgxpool.Pool, sql string) int {
 	t.Helper()
 	var n int
@@ -96,6 +105,7 @@ func TestMigrateRefusesAnEditedMigration(t *testing.T) {
 	if !errors.Is(err, store.ErrMigrations) || !strings.Contains(err.Error(), "0001_widgets.sql was changed") {
 		t.Fatalf("got %v, %v; want an error naming the edited file", applied, err)
 	}
+	noConnectionLeft(t, pool)
 	if tableExists(t, pool, "gadgets") {
 		t.Fatal("the pending migration ran even though an applied one had changed")
 	}
@@ -112,6 +122,7 @@ func TestMigrateRefusesADatabaseNewerThanTheFiles(t *testing.T) {
 	if !errors.Is(err, store.ErrMigrations) || !strings.Contains(err.Error(), "version 0002") {
 		t.Fatalf("got %v; want an error about version 0002", err)
 	}
+	noConnectionLeft(t, pool)
 }
 
 func TestMigrateFailureLeavesNothingBehind(t *testing.T) {
@@ -125,6 +136,7 @@ func TestMigrateFailureLeavesNothingBehind(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "apply 0002_broken.sql") {
 		t.Fatalf("got %v; want an error naming 0002_broken.sql", err)
 	}
+	noConnectionLeft(t, pool)
 	// One transaction: the good migration before it, and even schema_migrations, were rolled back.
 	for _, table := range []string{"widgets", "gadgets", "schema_migrations"} {
 		if tableExists(t, pool, table) {

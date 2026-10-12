@@ -57,11 +57,21 @@ func EmptySchema(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() {
-		pool.Close()
-		// The test's own context is already cancelled when cleanups run, so use a fresh one.
+		// pool.Close waits for every connection to come back, so a test that leaked one (a transaction never
+		// committed or rolled back) would hang here. Report it and move on instead.
+		closed := make(chan struct{})
+		go func() { pool.Close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(10 * time.Second):
+			t.Errorf("%d connections were still checked out at the end of the test: a transaction left open?",
+				pool.Stat().AcquiredConns())
+		}
+		// The test's own context is already cancelled when cleanups run, so use a fresh one. The lock timeout
+		// turns a leaked transaction's locks into an error rather than a hang.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		exec(t, ctx, url, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		exec(t, ctx, url, "SET lock_timeout = '10s'; DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
 	})
 	return pool
 }
