@@ -137,8 +137,10 @@ reaches. Netting them into one posting is always possible.
 - **Exact parsing.** `"12.34"` in USD is 1234. `"12.345"` in USD is an error, not a rounding.
 - **Bounds.** A posting is at most 10^15 minor units either way (ten trillion dollars), checked in Go and by a
   `CHECK`. With at most 64 postings, no sum in an entry can overflow `int64`: 64 × 10^15 is below 9.2 × 10^18.
-  Go still adds with an overflow check, and Postgres sums `BIGINT` as `NUMERIC`. The bound also keeps every amount
-  exact in a JSON number read by JavaScript (2^53 ≈ 9.007 × 10^15).
+  A constant in `internal/ledger` stops compiling if either bound changes enough to break that, so the entry
+  validator can add with plain `+`. Sums that have no such bound (balances) use `money.Add`, which reports
+  overflow, and Postgres sums `BIGINT` as `NUMERIC`. The bound also keeps every amount exact in a JSON number read
+  by JavaScript (2^53 ≈ 9.007 × 10^15).
 - A balance that would leave `BIGINT` makes the posting fail with `bigint out of range`; it never wraps.
 
 ## Schema (migration 0001)
