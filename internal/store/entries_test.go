@@ -337,3 +337,55 @@ func TestAnEarlyCheckDoesNotExcuseLaterPostings(t *testing.T) {
 	}
 	checkBooks(t, db)
 }
+
+// The SQL review was stopped before it could try every write path, so here are the remaining ones: COPY, and a
+// writable CTE that creates the entry and its postings in one statement. Each must keep the books, and each must
+// still be rejected at commit when the entry doesn't balance.
+func TestOtherWritePathsKeepTheRules(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	ctx := context.Background()
+	viaCopy := func(amounts [2]int64) error {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		entry, err := insertEntry(tx, "copied", 2)
+		if err != nil {
+			return err
+		}
+		rows := [][]any{
+			{entry, b.cash, "USD", amounts[0], int64(0), int64(1)},
+			{entry, b.alice, "USD", amounts[1], int64(0), int64(1)},
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"postings"},
+			[]string{"entry_id", "account_id", "currency", "amount", "balance_after", "account_version"},
+			pgx.CopyFromRows(rows)); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	viaCTE := func(amounts [2]int64) error {
+		_, err := db.Exec(ctx, `WITH e AS (
+				INSERT INTO journal_entries (description, posting_count) VALUES ('one statement', 2) RETURNING id)
+			INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
+			SELECT e.id, p.account, 'USD', p.amount, 0, 1
+			  FROM e, unnest($1::bigint[], $2::bigint[]) AS p(account, amount)`,
+			[]int64{b.cash, b.alice}, amounts[:])
+		return err
+	}
+	for name, write := range map[string]func([2]int64) error{"COPY": viaCopy, "writable CTE": viaCTE} {
+		if err := write([2]int64{1000, -1000}); err != nil {
+			t.Errorf("%s, balanced: %v", name, err)
+		}
+		if err := write([2]int64{1000, -999}); constraint(err) != "entry_balanced" {
+			t.Errorf("%s, unbalanced: got %v, want entry_balanced", name, err)
+		}
+	}
+	if bal, ver := balanceOf(t, db, b.cash); bal != 2000 || ver != 2 {
+		t.Fatalf("cash: balance %d, version %d; want 2000 and 2 (the two balanced writes)", bal, ver)
+	}
+	checkBooks(t, db)
+}
