@@ -98,36 +98,42 @@ The check runs from two places:
   was created, entries are immutable, and the count would no longer match.
 - After each entry insert, so an entry with no postings at all can't commit.
 
-**Checking each entry once (migration 0004).** As first written, the check ran N + 1 times at commit for an entry
-of N postings, and each run read all N postings: quadratic in the entry's size. But the per-posting check is only
-needed for postings added to an entry from an earlier transaction. A new entry's own check runs at this commit
-anyway. So each entry records the transaction that created it (`created_xact`, from `pg_current_xact_id()`), and a
-posting's check is skipped when its entry belongs to the current transaction. Why that is safe:
-
-- `pg_current_xact_id()` is the top-level transaction's 64-bit id, the same inside a savepoint, and it never wraps
-  around, so an old entry can never look new.
-- A trigger sets the stamp, whatever the client sends. Transaction ids are sequential, so a client allowed to
-  choose the stamp could name a later transaction and append to the entry from it unchecked.
-- Entries are append-only, so the stamp can't change later; entries from before 0004 have none, and always get
-  the full check.
-
-The cost before and after is under "Results" in the README.
+**An optimisation that was wrong (migrations 0004 and 0005).** For an entry of N postings the check runs N + 1
+times at commit, each run reading all N postings: quadratic in the entry's size. Migration 0004 tried to run it
+once per entry: each entry recorded the transaction that created it, and a posting's check was skipped when its
+entry was the current transaction's own, on the grounds that the entry's own check would run at commit anyway.
+That reasoning was wrong. `SET CONSTRAINTS ALL IMMEDIATE` runs the entry's check early, and once run it is used
+up, so a posting appended afterwards was never checked: an entry committed with three postings against two
+declared, out of balance (found by a review agent; `TestAnEarlyCheckDoesNotExcuseLaterPostings`). Migration 0005
+undid it. Every posting's check is the full check again. The last posting's check runs after the last posting
+exists, whenever the client makes the checks run, so the final entry is always seen. The measured cost is under
+"Results" in the README.
 
 ### Why the database keeps the balance (I4, I5)
 
-Each account row holds a cached `balance` and a `version`. A `BEFORE INSERT` trigger on postings adds the amount
-to the account and copies the new balance and version onto the posting:
+Each account row holds a cached `balance` and a `version`, kept by two triggers on postings (migration 0006):
 
 ```sql
-UPDATE accounts SET balance = balance + NEW.amount, version = version + 1
- WHERE id = NEW.account_id AND currency = NEW.currency
-RETURNING balance, version INTO NEW.balance_after, NEW.account_version;
+-- BEFORE INSERT (ledger_prepare_posting): lock the account and work out the posting's balance and version.
+SELECT balance, version INTO current_balance, current_version
+  FROM accounts WHERE id = NEW.account_id AND currency = NEW.currency FOR UPDATE;
+NEW.balance_after := current_balance + NEW.amount;
+NEW.account_version := current_version + 1;
+
+-- AFTER INSERT (ledger_apply_posting): write them to the account, only for a row that was really inserted.
+UPDATE accounts SET balance = NEW.balance_after, version = NEW.account_version
+ WHERE id = NEW.account_id AND version = NEW.account_version - 1;
 ```
+
+Why two triggers and not one: Postgres runs `BEFORE` triggers first and only then decides whether to insert the
+row. As first written (0002), the `BEFORE` trigger moved the balance itself. `INSERT ... ON CONFLICT DO NOTHING`
+on a conflicting posting then skipped the row and kept the balance change: a balance moved with no posting. An
+`AFTER` row trigger runs only for rows that were inserted. Both review agents found this on day 1.
 
 - **The cache can't drift.** No code path can insert a posting without moving the balance, so reading a balance
   is one row, not a sum over the account's history.
-- **Overdraft protection is atomic.** The `CHECK` on accounts runs inside that `UPDATE`, while it holds the row
-  lock, so two concurrent payments can't both spend the same $10.
+- **Overdraft protection is atomic.** The `CHECK` on accounts runs on the `AFTER` trigger's `UPDATE`, under the
+  row lock the `BEFORE` trigger took, so two concurrent payments can't both spend the same $10.
 - **The history is a chain.** `account_version` numbers an account's postings 1, 2, 3, … with no gaps, and each
   posting's `balance_after` is the previous one plus its amount. The reconciliation job (day 3) checks the chain,
   and statements paginate by version.
@@ -163,15 +169,18 @@ Three migrations, one per kind of rule:
   uniqueness, the overdraft `CHECK`).
 - `0002_balances.sql`: the database keeps the balances (I4, I5, I7): the posting trigger and the account guard.
 - `0003_entries.sql`: the rules about a whole entry (I1, I2) checked at commit, and append-only history (I6).
-- `0004_check_entries_once.sql`: the same check, run once per entry instead of once per posting (see "Checking
-  each entry once" above). A new migration rather than an edit to 0003, because 0003's checksum is recorded
-  wherever it has already run.
+- `0004_check_entries_once.sql` and `0005_undo_check_skip.sql`: an optimisation of the commit-time check, and its
+  reversal once a review showed it unsound (see "An optimisation that was wrong" above). Applied migrations are
+  never edited: their checksums are recorded wherever they ran, so a fix is a new migration.
+- `0006_apply_after_insert.sql`: the balance is written by an `AFTER INSERT` trigger, so a row Postgres skips
+  moves nothing.
+- `0007_pin_search_path.sql`: every ledger function resolves names in its own schema (see "Limitations").
 
 ```
 currencies       code PK, exponent
 accounts         id PK, name UNIQUE, type, currency → currencies, allow_negative,
                  balance, version, created_at, UNIQUE (id, currency)
-journal_entries  id PK, description, posting_count, created_at, created_xact
+journal_entries  id PK, description, posting_count, created_at
 postings         id PK, entry_id → journal_entries, (account_id, currency) → accounts (id, currency),
                  amount, balance_after, account_version,
                  UNIQUE (entry_id, account_id), UNIQUE (account_id, account_version)
@@ -208,6 +217,9 @@ Plain SQL files embedded in the binary (`internal/store/migrations/NNNN_name.sql
   starting at once apply the migrations once; the second waits, then finds nothing to do. Without the lock this
   fails in practice: `CREATE TABLE IF NOT EXISTS` isn't safe under concurrency, and in the runner's test 7 of 8
   concurrent runners failed on `pg_type_typname_nsp_index` when the lock was removed.
+- The transaction runs at `READ COMMITTED` whatever the session's default. Under `REPEATABLE READ` or
+  `SERIALIZABLE` its snapshot would be fixed by the lock statement, before the wait, and a runner that waited
+  couldn't see what the first one applied (7 of 8 runners failed that way in the review's test).
 - `schema_migrations` records each version with a SHA-256 of its file. If an applied migration's file changes
   later, startup fails instead of running a schema that doesn't match the code.
 - Postgres DDL is transactional, so a failing migration leaves nothing behind.
@@ -281,7 +293,16 @@ response, then retries it with the same idempotency key, and checks that the eff
   account in batches.
 - **Single database.** No sharding. Entries that span shards would need a distributed transaction.
 - **The database owner can switch the triggers off.** The application should connect as a role that owns
-  nothing, with `INSERT` and `SELECT` only on the ledger tables. Day 1 doesn't set up roles.
+  nothing. Because the trigger functions run with the caller's rights, that role currently needs `UPDATE` on
+  accounts as well as `INSERT` and `SELECT` on entries and postings (the guard still stops it setting a balance
+  directly). Making the trigger functions `SECURITY DEFINER` would remove the `UPDATE`; their pinned
+  `search_path` (0007) is what makes that safe. Day 1 doesn't set up roles.
+- **Pinned search paths.** Each ledger function resolves table names in the schema it was created in, with
+  `pg_temp` last, so a session's temporary tables can't stand in for the ledger's (found in review on day 1). A
+  new function must be pinned too; `TestEveryFunctionPinsItsSearchPath` fails until it is.
+- **One entry per statement.** Two postings to the same account in one `INSERT` (from different entries) read
+  the same version in their `BEFORE` triggers, and the second fails on `postings_account_version_unique`. It fails
+  closed, and the service posts one entry at a time anyway.
 - **No business time yet.** `created_at` is when the entry was recorded. A separate effective date (for
   backdated corrections) is a later addition.
 - **Single-currency accounts.** A multi-currency customer has one account per currency.

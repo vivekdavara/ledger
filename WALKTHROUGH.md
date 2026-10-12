@@ -71,12 +71,14 @@ the count no longer matches. With either trigger removed, a test fails: `TestPos
 entry trigger, `TestChecksThatRunEarlyFailClosed`).
 
 **Doesn't checking after every posting make big entries slow?**
-It did: as first written, an entry of N postings was checked N + 1 times at commit, each time reading all N. The
-per-posting check is only needed for postings added to an entry from an earlier transaction, so migration 0004
-stamps each entry with `pg_current_xact_id()` and skips a posting's check when the entry is the current
-transaction's own. The entry's own check still runs at commit. A trigger sets the stamp, because transaction ids are
-sequential: a client that could choose it could name a later transaction and append from there unchecked. Three
-deliberately broken versions of 0004 each fail a test. The before-and-after cost is in the README's "Results".
+Yes, quadratically: an entry of N postings is checked N + 1 times at commit, each time reading all N. Migration
+0004 tried to check once per entry. It stamped each entry with its transaction and skipped a posting's check when
+the entry was the current transaction's own, since the entry's own check would run at commit. A review agent
+showed the reasoning wrong: `SET CONSTRAINTS ALL IMMEDIATE` runs the entry's check early, and once run it is used
+up, so a posting appended afterwards was never checked, and an unbalanced entry committed. Migration 0005 undid
+it (`TestAnEarlyCheckDoesNotExcuseLaterPostings`). The lesson: an optimisation that skips a safety check needs a
+proof that holds whatever order the client makes things happen in. The measured cost is in the README's
+"Results".
 
 **What if a client runs `SET CONSTRAINTS ALL IMMEDIATE`?**
 The check then runs right after the entry insert, before the postings exist, and the insert fails
@@ -84,8 +86,8 @@ The check then runs right after the entry insert, before the postings exist, and
 entry, it never lets one through.
 
 **Why does the database keep the balance instead of the service?**
-A `BEFORE INSERT` trigger on postings adds the amount to the account's row and copies the new balance and version
-onto the posting (`0002_balances.sql`). No code path can insert a posting without moving the balance, so the cache
+A `BEFORE INSERT` trigger on postings locks the account row and works out the new balance and version; an `AFTER
+INSERT` trigger writes them to the account (`0006_apply_after_insert.sql`). No code path can insert a posting without moving the balance, so the cache
 can't drift; each account's postings form a gapless chain (version 1, 2, 3 …, each `balance_after` the previous
 plus the amount). The client can't choose those values either
 (`TestTheClientCannotChooseBalanceAfterOrVersion`).
@@ -117,6 +119,22 @@ client sends it.
 The table owner can disable triggers. In production the service should connect as a role that owns nothing and
 has only `INSERT` and `SELECT` on these tables; day 1 doesn't set that up (DESIGN.md, "Limitations").
 
+**Tell me about a bug you found in your own design.**
+On day 1 the balance moved in the `BEFORE INSERT` trigger. Postgres runs `BEFORE` triggers first and only then
+decides whether to insert the row, so `INSERT ... ON CONFLICT DO NOTHING` on a posting that conflicted returned
+`INSERT 0 0`, no error, and left the account's balance moved with no posting behind it: money from nothing, and no
+commit-time check either, since no row existed to trigger one. Two independent review agents found it. The fix
+was to split the work (0006): the `BEFORE` trigger only locks and computes, and the `AFTER` trigger, which runs
+only for inserted rows, writes the balance. `TestASkippedPostingMovesNoBalance` tries three `ON CONFLICT` forms and
+a forced primary-key conflict.
+
+**Why does every function pin its `search_path`?**
+The trigger functions name tables without a schema, so they used to resolve them through the caller's
+`search_path`, and `pg_temp` comes first there. Any role may create a temporary table by default, and one named
+`accounts` took the triggers' reads and writes: postings committed while the real balance stayed at zero
+(`TestATempTableCannotStandInForTheLedgersTables`). Migration 0007 pins each function to its own schema with
+`pg_temp` last, and `TestEveryFunctionPinsItsSearchPath` fails for any new function that isn't pinned.
+
 ## Migrations and tests
 
 **How do migrations work, and why the advisory lock?**
@@ -124,7 +142,9 @@ Plain SQL files embedded in the binary, applied in one transaction under a trans
 the schema, each recorded with a SHA-256 of its file (`migrate.go`). The lock matters because `CREATE TABLE IF NOT
 EXISTS` is not safe when two processes run it at once: with the lock removed, 7 of 8 concurrent runners in
 `TestMigrateConcurrentRunnersApplyOnce` failed on `pg_type_typname_nsp_index`. The checksum stops a binary from
-running against a schema built from a different version of a file.
+running against a schema built from a different version of a file. The transaction is always `READ COMMITTED`:
+under a `SERIALIZABLE` default, the lock statement would fix the snapshot before the wait, and a runner that waited
+couldn't see the first runner's work (a review found this; the race test now runs at all three levels).
 
 **How are the database tests isolated?**
 Each test gets a fresh schema (`storetest.EmptySchema`) and a pool whose `search_path` is only that schema, so
