@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -190,38 +191,6 @@ func TestAReversalRestoresEveryBalance(t *testing.T) {
 	}
 }
 
-func TestTheClientCannotChooseTheEntrysTransaction(t *testing.T) {
-	t.Parallel()
-	db := storetest.Migrated(t)
-	b := newBook(t, db)
-	ctx := context.Background()
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	// Transaction ids are sequential, so a stamp forged to name a later transaction would let that transaction
-	// append to this entry unchecked. The trigger overwrites whatever the client sends.
-	var entry int64
-	if err := tx.QueryRow(ctx, `INSERT INTO journal_entries (description, posting_count, created_xact)
-		VALUES ('forged', 2, '1') RETURNING id`).Scan(&entry); err != nil {
-		t.Fatal(err)
-	}
-	var own bool
-	if err := tx.QueryRow(ctx, `SELECT created_xact = pg_current_xact_id() FROM journal_entries WHERE id = $1`,
-		entry).Scan(&own); err != nil || !own {
-		t.Fatalf("the stamp isn't the inserting transaction's (%v)", err)
-	}
-	for _, l := range []leg{{b.cash, "USD", 100}, {b.alice, "USD", -100}} {
-		if err := insertPosting(tx, entry, l.account, l.currency, l.amount); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSavepointsDontWeakenTheCommitCheck(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
@@ -312,38 +281,59 @@ func savepoint(tx pgx.Tx, fn func() error) error {
 	return err
 }
 
-func TestEntriesWithoutAStampGetTheFullCheck(t *testing.T) {
+// Found in review: under migration 0004, SET CONSTRAINTS ... IMMEDIATE used up the entry's own check while the
+// entry was still valid, and a posting appended afterwards skipped its check. Each case must be rejected.
+func TestAnEarlyCheckDoesNotExcuseLaterPostings(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
 	b := newBook(t, db)
-	ctx := context.Background()
-	// An entry posted before migration 0004 has no stamp. Make one by posting with the stamp trigger off.
-	if _, err := db.Exec(ctx, `ALTER TABLE journal_entries DISABLE TRIGGER journal_entries_stamp`); err != nil {
-		t.Fatal(err)
-	}
-	old := mustPost(t, db, "from before 0004", leg{b.cash, "USD", 5000}, leg{b.alice, "USD", -5000})
-	if _, err := db.Exec(ctx, `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_stamp`); err != nil {
-		t.Fatal(err)
-	}
-	if n := count(t, db, `SELECT count(*) FROM journal_entries WHERE created_xact IS NULL`); n != 1 {
-		t.Fatalf("%d unstamped entries, want 1", n)
-	}
 	vault := createAccount(t, db, account{"cash:vault", "asset", "USD", false})
-	err := func() error {
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		if err := insertPosting(tx, old, vault, "USD", 100); err != nil {
-			return err
-		}
-		if err := insertPosting(tx, old, b.bob, "USD", -100); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
-	}()
-	if got := constraint(err); got != "entry_posting_count" {
-		t.Fatalf("appending to an unstamped entry: got %v (constraint %q)", err, got)
+	cases := []struct {
+		name     string
+		appended []leg
+		deferred bool // switch the checks back to deferred before appending
+	}{
+		{"an unbalanced posting", []leg{{vault, "USD", 500}}, false},
+		{"a balanced pair", []leg{{vault, "USD", 500}, {b.bob, "USD", -500}}, false},
+		{"a balanced pair, checks deferred again", []leg{{vault, "USD", 500}, {b.bob, "USD", -500}}, true},
 	}
+	for _, tc := range cases {
+		err := func() error {
+			ctx := context.Background()
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			e, err := insertEntry(tx, tc.name, 2)
+			if err != nil {
+				return err
+			}
+			if err := insertPosting(tx, e, b.cash, "USD", 100); err != nil {
+				return err
+			}
+			if err := insertPosting(tx, e, b.alice, "USD", -100); err != nil {
+				return err
+			}
+			// The entry is complete and valid here, so the early check passes.
+			if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err != nil {
+				return fmt.Errorf("the early check failed: %w", err)
+			}
+			if tc.deferred {
+				if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+					return err
+				}
+			}
+			for _, l := range tc.appended {
+				if err := insertPosting(tx, e, l.account, l.currency, l.amount); err != nil {
+					return err
+				}
+			}
+			return tx.Commit(ctx)
+		}()
+		if got := constraint(err); got != "entry_posting_count" {
+			t.Errorf("%s: got %v (constraint %q), want entry_posting_count", tc.name, err, got)
+		}
+	}
+	checkBooks(t, db)
 }

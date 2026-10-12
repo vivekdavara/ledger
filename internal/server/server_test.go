@@ -96,7 +96,7 @@ func TestReadyzAgainstARealDatabase(t *testing.T) {
 	empty := storetest.EmptySchema(t)
 	h = server.New(func(ctx context.Context) error { return store.Ready(ctx, empty) }, quiet)
 	code, body := get(t, h, "GET", "/readyz")
-	if code != 503 || !strings.Contains(body["reason"], "schema is at version 0, this binary needs 4") {
+	if code != 503 || !strings.Contains(body["reason"], "schema is at version 0, this binary needs 5") {
 		t.Fatalf("unmigrated schema: got %d %v", code, body)
 	}
 }
