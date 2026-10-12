@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 
@@ -284,4 +285,85 @@ func TestASkippedPostingMovesNoBalance(t *testing.T) {
 		}
 	}
 	checkBooks(t, db)
+}
+
+// Found in review: the trigger functions resolved their unqualified table names through the caller's search_path,
+// where a temporary table (pg_temp is searched first) could stand in for accounts.
+func TestATempTableCannotStandInForTheLedgersTables(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	ctx := context.Background()
+	conn, err := db.Acquire(ctx) // a temporary table belongs to one session, so use one connection throughout
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	schema := schemaOf(t, db)
+	for _, sql := range []string{
+		`CREATE TEMP TABLE accounts (id bigint, currency text, balance bigint, version bigint)`,
+		`INSERT INTO pg_temp.accounts SELECT id, currency, 0, 0 FROM ` + schema + `.accounts`,
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	defer func() { _, _ = conn.Exec(ctx, `DROP TABLE pg_temp.accounts`) }()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := insertEntry(tx, "top-up", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range []leg{{b.cash, "USD", 900}, {b.alice, "USD", -900}} {
+		if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.postings
+			(entry_id, account_id, currency, amount, balance_after, account_version) VALUES ($1, $2, $3, $4, 0, 1)`,
+			entry, l.account, l.currency, l.amount); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if bal, ver := balanceOf(t, db, b.cash); bal != 900 || ver != 1 {
+		t.Fatalf("the real cash account has balance %d, version %d; want 900 and 1", bal, ver)
+	}
+	checkBooks(t, db)
+}
+
+func TestEveryFunctionPinsItsSearchPath(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	want := "search_path=" + schemaOf(t, db) + ", pg_temp"
+	rows, err := db.Query(context.Background(), `SELECT p.oid::regprocedure::text, coalesce(p.proconfig, '{}')
+		FROM pg_proc p WHERE p.pronamespace = current_schema()::regnamespace`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	var config []string
+	n := 0
+	if _, err := pgx.ForEachRow(rows, []any{&name, &config}, func() error {
+		n++
+		if !slices.Contains(config, want) {
+			t.Errorf("%s has settings %v; want %q", name, config, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n < 6 {
+		t.Fatalf("found %d functions, expected at least 6", n)
+	}
+}
+
+func schemaOf(t *testing.T, db *pgxpool.Pool) string {
+	t.Helper()
+	var schema string
+	if err := db.QueryRow(context.Background(), `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	return schema
 }
