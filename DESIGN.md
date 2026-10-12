@@ -143,7 +143,14 @@ reaches. Netting them into one posting is always possible.
   by JavaScript (2^53 ≈ 9.007 × 10^15).
 - A balance that would leave `BIGINT` makes the posting fail with `bigint out of range`; it never wraps.
 
-## Schema (migration 0001)
+## Schema
+
+Three migrations, one per kind of rule:
+
+- `0001_schema.sql`: the tables, and every rule one row can check by itself (types, bounds, foreign keys,
+  uniqueness, the overdraft `CHECK`).
+- `0002_balances.sql`: the database keeps the balances (I4, I5, I7): the posting trigger and the account guard.
+- `0003_entries.sql`: the rules about a whole entry (I1, I2) checked at commit, and append-only history (I6).
 
 ```
 currencies       code PK, exponent
@@ -158,15 +165,34 @@ postings         id PK, entry_id → journal_entries, (account_id, currency) →
 Ids are `BIGINT GENERATED ALWAYS AS IDENTITY`: small, ordered, and easy to lock in a fixed order. This is an
 internal service, so guessable ids are acceptable; a public API would put opaque ids in front.
 
-Errors from the database carry a constraint name (`RAISE ... USING CONSTRAINT = 'entry_balanced'`), so the Go code
-can map a rejection to an API error without parsing messages.
+Errors from the database carry a constraint name, so the Go code can map a rejection to an API error without
+parsing messages. The triggers set one too (`RAISE ... USING CONSTRAINT = 'entry_balanced'`):
+
+| Constraint | Raised when |
+|---|---|
+| `entry_balanced` | at commit, an entry's postings don't sum to zero in some currency |
+| `entry_posting_count` | at commit, an entry doesn't have exactly the postings it declared |
+| `accounts_no_overdraft` | a posting would take a protected account below zero on its normal side |
+| `postings_account_currency_fkey` | the account doesn't exist, or isn't in the posting's currency |
+| `postings_one_per_account` | an entry has two postings to one account |
+| `postings_amount_range` | an amount is zero or beyond 10^15 |
+| `append_only` | an `UPDATE`, `DELETE` or `TRUNCATE` on entries or postings |
+| `balance_via_postings_only` | a balance or version is set directly, or an account is created with one |
+| `account_identity_immutable` | an account's id, type, currency or creation time is changed |
+
+**The guard's trigger-depth test.** The posting trigger updates the account row, which fires the account guard
+again. The guard tells the two apart with `pg_trigger_depth()`: depth 2 means the update came from the posting
+trigger, depth 1 means a client sent it. A role allowed to create triggers could get to depth 2 another way, but
+such a role could also just disable the guard; the defence against that is the role setup under "Limitations".
 
 ## Migrations
 
 Plain SQL files embedded in the binary (`internal/store/migrations/NNNN_name.sql`) and applied by a small runner:
 
-- Everything runs in one transaction, under a transaction-level advisory lock. Two instances starting at once
-  apply the migrations once; the second waits, then finds nothing to do.
+- Everything runs in one transaction, under a transaction-level advisory lock keyed by the schema. Two instances
+  starting at once apply the migrations once; the second waits, then finds nothing to do. Without the lock this
+  fails in practice: `CREATE TABLE IF NOT EXISTS` isn't safe under concurrency, and in the runner's test 7 of 8
+  concurrent runners failed on `pg_type_typname_nsp_index` when the lock was removed.
 - `schema_migrations` records each version with a SHA-256 of its file. If an applied migration's file changes
   later, startup fails instead of running a schema that doesn't match the code.
 - Postgres DDL is transactional, so a failing migration leaves nothing behind.
@@ -224,8 +250,13 @@ response, then retries it with the same idempotency key, and checks that the eff
 - **Database tests** run against a real Postgres 14, each in a fresh schema of its own, so tests can run in
   parallel and never see each other's rows. They skip when `LEDGER_TEST_DATABASE_URL` is unset, and fail instead
   when `CI` is set, so CI can't pass by skipping.
-- **A differential test** generates random entries, balanced and not, and checks that the Go validator and the
-  database trigger accept exactly the same ones: two implementations of one rule, each checking the other.
+- **A differential test** checks that the Go validator and the database, two implementations of the same rules,
+  agree. It draws balanced entries over real accounts, then applies none or exactly one of nine defects. Both
+  must give the same verdict for the same reason. Afterwards exactly the valid entries are committed, and
+  `checkBooks` recomputes the ledger from its postings: every currency sums to zero, every balance and version
+  matches its postings, and every account's history is an unbroken chain.
+- **Tests that are checked against a broken build.** The concurrency and commit-time tests were each run once
+  with the mechanism they test removed (the advisory lock, either deferred trigger), to see them fail.
 
 ## Limitations
 
