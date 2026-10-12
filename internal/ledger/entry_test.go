@@ -147,31 +147,44 @@ func TestPropertyBalancedEntriesValidate(t *testing.T) {
 	})
 }
 
-func TestPropertyOrderNeverMatters(t *testing.T) {
+// Whether an entry is valid never depends on the order of its postings, whatever is wrong with it. (Which rule
+// an invalid entry is reported for can depend on order: see TestTheReportedRuleCanDependOnOrder.)
+func TestPropertyValidityNeverDependsOnOrder(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		e := balancedEntry().Draw(t, "entry")
-		// Break it half the time, so the property covers rejections too.
-		if rapid.Bool().Draw(t, "break") {
-			i := rapid.IntRange(0, len(e.Postings)-1).Draw(t, "i")
-			e.Postings[i].Amount++
-			if e.Postings[i].Amount == 0 {
-				e.Postings[i].Amount = 2
+		for range rapid.IntRange(0, 3).Draw(t, "defects") {
+			i := rapid.IntRange(0, len(e.Postings)-1).Draw(t, "posting")
+			switch rapid.IntRange(0, 4).Draw(t, "kind") {
+			case 0:
+				e.Postings[i].Amount++ // unbalances, or makes the amount zero
+			case 1:
+				e.Postings[i].Amount = 0
+			case 2:
+				e.Postings[i].Currency = "XXX"
+			case 3:
+				e.Postings[i].AccountID = 0
+			case 4:
+				e.Postings[i].AccountID = e.Postings[(i+1)%len(e.Postings)].AccountID
 			}
 		}
 		shuffled := Entry{e.Description, rapid.Permutation(e.Postings).Draw(t, "shuffled")}
-		got, want := shuffled.Validate(), e.Validate()
-		if !errors.Is(got, rule(want)) || (got == nil) != (want == nil) {
-			t.Fatalf("reordering changed the result: %v, then %v", want, got)
+		if before, after := e.Validate(), shuffled.Validate(); (before == nil) != (after == nil) {
+			t.Fatalf("reordering changed validity: %v, then %v", before, after)
 		}
 	})
 }
 
-func rule(err error) error {
-	var ve *ValidationError
-	if errors.As(err, &ve) {
-		return ve.Rule
+// Validate reports the first broken rule it meets, so with two defects the order decides which one is named. The
+// entry is rejected either way. (The example comes from the day-1 review.)
+func TestTheReportedRuleCanDependOnOrder(t *testing.T) {
+	forward := Entry{"", []Posting{p(0, "USD", 5), p(2, "XXX", -5)}}
+	backward := Entry{"", []Posting{p(2, "XXX", -5), p(0, "USD", 5)}}
+	if err := forward.Validate(); !errors.Is(err, ErrAccountID) {
+		t.Fatalf("forward: got %v, want ErrAccountID", err)
 	}
-	return err
+	if err := backward.Validate(); !errors.Is(err, ErrCurrency) {
+		t.Fatalf("backward: got %v, want ErrCurrency", err)
+	}
 }
 
 func TestPropertyChangingAnyAmountUnbalances(t *testing.T) {

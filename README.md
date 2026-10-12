@@ -85,8 +85,9 @@ within 2 s and its schema is at the binary's newest migration, and 503 with the 
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
-- `internal/ledger`: every validation rule, plus properties over random balanced entries: they validate, order
-  never matters, moving any amount or currency unbalances them, and a reversal cancels out.
+- `internal/ledger`: every validation rule, plus properties over random balanced entries: they validate, moving
+  any amount or currency unbalances them, a reversal cancels out, and whether an entry is valid never depends on
+  its postings' order, with up to three defects mixed in.
 - `internal/store`: each test gets a fresh schema in `ledger_test`. The migration runner (eight concurrent
   runners apply each migration once); every constraint and trigger by name; ten concurrent $5 payments against
   $30 (always six succeed); and a differential property test where the Go validator and the database must agree,

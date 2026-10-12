@@ -260,8 +260,9 @@ response, then retries it with the same idempotency key, and checks that the eff
 ## Testing
 
 - **Unit and property tests** (`testing` and [rapid](https://pkg.go.dev/pgregory.net/rapid)) for money and the
-  entry validator: random balanced entries validate, changing any amount breaks the balance, and the order of the
-  postings never matters.
+  entry validator: random balanced entries validate, changing any amount breaks the balance, and whether an entry
+  is valid never depends on the order of its postings, even with several defects. (Which rule is reported can:
+  `Validate` names the first one it meets.)
 - **Database tests** run against a real Postgres 14, each in a fresh schema of its own, so tests can run in
   parallel and never see each other's rows. They skip when `LEDGER_TEST_DATABASE_URL` is unset, and fail instead
   when `CI` is set, so CI can't pass by skipping.
