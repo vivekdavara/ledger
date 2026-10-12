@@ -65,7 +65,7 @@ func TestAnUnreachableDatabaseFailsWithoutShowingThePassword(t *testing.T) {
 
 func TestMigrateAppliesOnceThenNothing(t *testing.T) {
 	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t))}
-	for i, want := range []string{`"applied":[1,2,3]`, `"applied":[]`} {
+	for i, want := range []string{`"applied":[1,2,3,4]`, `"applied":[]`} {
 		var out bytes.Buffer
 		if code := run(context.Background(), []string{"migrate"}, env(vars), &out, nil); code != 0 ||
 			!strings.Contains(out.String(), want) {

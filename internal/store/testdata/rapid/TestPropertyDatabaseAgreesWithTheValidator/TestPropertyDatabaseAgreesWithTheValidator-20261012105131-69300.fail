@@ -1,0 +1,41 @@
+# 2026/10/12 10:51:31.287624 [TestPropertyDatabaseAgreesWithTheValidator] [rapid] draw entry: ledger.Entry{Description:"", Postings:[]ledger.Posting{ledger.Posting{AccountID:1, Currency:"CAD", Amount:1}, ledger.Posting{AccountID:2, Currency:"CAD", Amount:1}, ledger.Posting{AccountID:3, Currency:"CAD", Amount:-2}}}
+# 2026/10/12 10:51:31.287662 [TestPropertyDatabaseAgreesWithTheValidator] [rapid] draw defect: store_test.defect{name:"unbalanced", apply:(func(*rapid.T, *ledger.Entry) bool)(0x1008e1c70), rule:(*errors.errorString)(0x10105d010), wantDB:(func(error) bool)(0x1008e1bd0)}
+# 2026/10/12 10:51:31.287686 [TestPropertyDatabaseAgreesWithTheValidator] [rapid] draw posting: 0
+# 2026/10/12 10:51:31.287686 [TestPropertyDatabaseAgreesWithTheValidator] [rapid] draw d: 1
+# 2026/10/12 10:51:31.288037 [TestPropertyDatabaseAgreesWithTheValidator] defect "unbalanced": the validator said postings do not sum to zero: off in CAD by 1, but the database said <nil>
+# 
+v0.4.8#14880874498606015047
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x8000000000000
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1

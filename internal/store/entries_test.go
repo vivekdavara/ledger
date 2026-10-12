@@ -189,3 +189,161 @@ func TestAReversalRestoresEveryBalance(t *testing.T) {
 		t.Fatalf("%d postings, want all 8: the mistake stays in the history", n)
 	}
 }
+
+func TestTheClientCannotChooseTheEntrysTransaction(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Transaction ids are sequential, so a stamp forged to name a later transaction would let that transaction
+	// append to this entry unchecked. The trigger overwrites whatever the client sends.
+	var entry int64
+	if err := tx.QueryRow(ctx, `INSERT INTO journal_entries (description, posting_count, created_xact)
+		VALUES ('forged', 2, '1') RETURNING id`).Scan(&entry); err != nil {
+		t.Fatal(err)
+	}
+	var own bool
+	if err := tx.QueryRow(ctx, `SELECT created_xact = pg_current_xact_id() FROM journal_entries WHERE id = $1`,
+		entry).Scan(&own); err != nil || !own {
+		t.Fatalf("the stamp isn't the inserting transaction's (%v)", err)
+	}
+	for _, l := range []leg{{b.cash, "USD", 100}, {b.alice, "USD", -100}} {
+		if err := insertPosting(tx, entry, l.account, l.currency, l.amount); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSavepointsDontWeakenTheCommitCheck(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	old := mustPost(t, db, "top-up", leg{b.cash, "USD", 5000}, leg{b.alice, "USD", -5000})
+	vault := createAccount(t, db, account{"cash:vault", "asset", "USD", false})
+	// Each script runs in one transaction; postings go in through savepoints, released or rolled back.
+	cases := []struct {
+		name       string
+		script     func(tx pgx.Tx) error
+		constraint string // "" means the commit must succeed
+	}{
+		{"a balanced entry built inside a savepoint", func(tx pgx.Tx) error {
+			return savepoint(tx, func() error {
+				e, err := insertEntry(tx, "inside", 2)
+				if err != nil {
+					return err
+				}
+				if err := insertPosting(tx, e, vault, "USD", 100); err != nil {
+					return err
+				}
+				return insertPosting(tx, e, b.bob, "USD", -100)
+			})
+		}, ""},
+		{"an unbalanced posting added in a savepoint", func(tx pgx.Tx) error {
+			e, err := insertEntry(tx, "outside", 2)
+			if err != nil {
+				return err
+			}
+			if err := insertPosting(tx, e, vault, "USD", 100); err != nil {
+				return err
+			}
+			return savepoint(tx, func() error { return insertPosting(tx, e, b.bob, "USD", -99) })
+		}, "entry_balanced"},
+		{"a balanced pair appended to an old entry in a savepoint", func(tx pgx.Tx) error {
+			return savepoint(tx, func() error {
+				if err := insertPosting(tx, old, vault, "USD", 100); err != nil {
+					return err
+				}
+				return insertPosting(tx, old, b.bob, "USD", -100)
+			})
+		}, "entry_posting_count"},
+		{"the postings rolled back with their savepoint", func(tx pgx.Tx) error {
+			e, err := insertEntry(tx, "emptied", 2)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(context.Background(), `SAVEPOINT s`); err != nil {
+				return err
+			}
+			if err := insertPosting(tx, e, vault, "USD", 100); err != nil {
+				return err
+			}
+			if err := insertPosting(tx, e, b.bob, "USD", -100); err != nil {
+				return err
+			}
+			_, err = tx.Exec(context.Background(), `ROLLBACK TO SAVEPOINT s`)
+			return err
+		}, "entry_posting_count"},
+	}
+	for _, tc := range cases {
+		ctx := context.Background()
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tc.script(tx)
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		_ = tx.Rollback(ctx)
+		if got := constraint(err); got != tc.constraint || (tc.constraint == "" && err != nil) {
+			t.Errorf("%s: got %v (constraint %q), want %q", tc.name, err, got, tc.constraint)
+		}
+	}
+	checkBooks(t, db)
+}
+
+func savepoint(tx pgx.Tx, fn func() error) error {
+	ctx := context.Background()
+	if _, err := tx.Exec(ctx, `SAVEPOINT s`); err != nil {
+		return err
+	}
+	if err := fn(); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `RELEASE SAVEPOINT s`)
+	return err
+}
+
+func TestEntriesWithoutAStampGetTheFullCheck(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	ctx := context.Background()
+	// An entry posted before migration 0004 has no stamp. Make one by posting with the stamp trigger off.
+	if _, err := db.Exec(ctx, `ALTER TABLE journal_entries DISABLE TRIGGER journal_entries_stamp`); err != nil {
+		t.Fatal(err)
+	}
+	old := mustPost(t, db, "from before 0004", leg{b.cash, "USD", 5000}, leg{b.alice, "USD", -5000})
+	if _, err := db.Exec(ctx, `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_stamp`); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, `SELECT count(*) FROM journal_entries WHERE created_xact IS NULL`); n != 1 {
+		t.Fatalf("%d unstamped entries, want 1", n)
+	}
+	vault := createAccount(t, db, account{"cash:vault", "asset", "USD", false})
+	err := func() error {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := insertPosting(tx, old, vault, "USD", 100); err != nil {
+			return err
+		}
+		if err := insertPosting(tx, old, b.bob, "USD", -100); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}()
+	if got := constraint(err); got != "entry_posting_count" {
+		t.Fatalf("appending to an unstamped entry: got %v (constraint %q)", err, got)
+	}
+}
