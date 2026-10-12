@@ -98,8 +98,20 @@ The check runs from two places:
   was created, entries are immutable, and the count would no longer match.
 - After each entry insert, so an entry with no postings at all can't commit.
 
-For an entry with N postings the check runs N + 1 times at commit, each one an index lookup of N rows. With N at
-most 64 that is cheap; day 4 measures it.
+**Checking each entry once (migration 0004).** As first written, the check ran N + 1 times at commit for an entry
+of N postings, and each run read all N postings: quadratic in the entry's size. But the per-posting check is only
+needed for postings added to an entry from an earlier transaction. A new entry's own check runs at this commit
+anyway. So each entry records the transaction that created it (`created_xact`, from `pg_current_xact_id()`), and a
+posting's check is skipped when its entry belongs to the current transaction. Why that is safe:
+
+- `pg_current_xact_id()` is the top-level transaction's 64-bit id, the same inside a savepoint, and it never wraps
+  around, so an old entry can never look new.
+- A trigger sets the stamp, whatever the client sends. Transaction ids are sequential, so a client allowed to
+  choose the stamp could name a later transaction and append to the entry from it unchecked.
+- Entries are append-only, so the stamp can't change later; entries from before 0004 have none, and always get
+  the full check.
+
+The cost before and after is under "Results" in the README.
 
 ### Why the database keeps the balance (I4, I5)
 
@@ -151,12 +163,15 @@ Three migrations, one per kind of rule:
   uniqueness, the overdraft `CHECK`).
 - `0002_balances.sql`: the database keeps the balances (I4, I5, I7): the posting trigger and the account guard.
 - `0003_entries.sql`: the rules about a whole entry (I1, I2) checked at commit, and append-only history (I6).
+- `0004_check_entries_once.sql`: the same check, run once per entry instead of once per posting (see "Checking
+  each entry once" above). A new migration rather than an edit to 0003, because 0003's checksum is recorded
+  wherever it has already run.
 
 ```
 currencies       code PK, exponent
 accounts         id PK, name UNIQUE, type, currency → currencies, allow_negative,
                  balance, version, created_at, UNIQUE (id, currency)
-journal_entries  id PK, description, posting_count, created_at
+journal_entries  id PK, description, posting_count, created_at, created_xact
 postings         id PK, entry_id → journal_entries, (account_id, currency) → accounts (id, currency),
                  amount, balance_after, account_version,
                  UNIQUE (entry_id, account_id), UNIQUE (account_id, account_version)

@@ -55,8 +55,9 @@ number read by JavaScript, whose doubles are exact only up to 2^53 ≈ 9.007 × 
 
 **Where is "postings sum to zero" enforced?**
 Twice. `ledger.Entry.Validate` checks it first and says which rule broke and which posting. The database checks
-it again at commit (`0003_entries.sql`), so a bug in the service, a second writer, or someone in `psql` can't
-commit an unbalanced entry. The differential test checks that the two implementations agree.
+it again at commit (`0003_entries.sql`, `0004_check_entries_once.sql`), so a bug in the service, a second writer,
+or someone in `psql` can't commit an unbalanced entry. The differential test checks that the two implementations
+agree.
 
 **Why a deferred constraint trigger and not a CHECK?**
 A `CHECK` sees one row; this rule is about a group of rows, and it only holds once all of an entry's postings
@@ -68,6 +69,14 @@ catches postings added later to an entry committed earlier. Adding a balanced pa
 sum alone can't catch that. The entry declares its `posting_count` when it is created, entries are immutable, and
 the count no longer matches. With either trigger removed, a test fails: `TestPostingCountMustMatch` (and, for the
 entry trigger, `TestChecksThatRunEarlyFailClosed`).
+
+**Doesn't checking after every posting make big entries slow?**
+It did: as first written, an entry of N postings was checked N + 1 times at commit, each time reading all N. The
+per-posting check is only needed for postings added to an entry from an earlier transaction, so migration 0004
+stamps each entry with `pg_current_xact_id()` and skips a posting's check when the entry is the current
+transaction's own. The entry's own check still runs at commit. A trigger sets the stamp, because transaction ids are
+sequential: a client that could choose it could name a later transaction and append from there unchecked. Three
+deliberately broken versions of 0004 each fail a test. The before-and-after cost is in the README's "Results".
 
 **What if a client runs `SET CONSTRAINTS ALL IMMEDIATE`?**
 The check then runs right after the entry insert, before the postings exist, and the insert fails

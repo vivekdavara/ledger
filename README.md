@@ -100,7 +100,7 @@ cmd/ledgerd/              the binary: migrate and serve
 internal/money/           currencies, amounts, exact parsing
 internal/ledger/          Entry, Posting, Validate
 internal/store/           Open, the migration runner, Ready
-internal/store/migrations 0001_schema, 0002_balances, 0003_entries
+internal/store/migrations 0001_schema, 0002_balances, 0003_entries, 0004_check_entries_once
 internal/store/storetest/ a fresh schema per test
 internal/server/          HTTP handlers
 ```
