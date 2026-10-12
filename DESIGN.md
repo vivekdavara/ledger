@@ -1,0 +1,238 @@
+# Ledger: design
+
+A double-entry payments ledger: the system of record that says how much money every account holds and why. Every
+movement of money is a **journal entry** made of **postings**, and the postings of an entry always sum to zero in
+each currency, so money is moved, never created or destroyed. Go 1.27, PostgreSQL 14 (pgx), gRPC + REST.
+
+This file is the plan for all five days. Day 1 builds the parts everything else stands on: the money type, the
+entry validator, the schema with its database-enforced invariants, the migration runner, a health endpoint and CI.
+
+## Vocabulary
+
+- **Account**: a named bucket of money in one currency, such as `wallet:alice` or `revenue:fees`. It has a
+  **type**: asset, liability, equity, revenue or expense.
+- **Journal entry**: one business event ("Alice paid Bob $20 with a $0.60 fee"). It is atomic: all of its
+  postings are recorded, or none are.
+- **Posting**: one line of an entry: an account, a currency and a signed amount.
+
+### Sign convention
+
+Amounts are signed integers in the currency's minor unit (cents for USD, yen for JPY, fils for KWD).
+**Positive is a debit, negative is a credit.** An account's stored `balance` is the plain sum of its postings.
+
+What a person calls the balance depends on the account's **normal side**:
+
+| Type | Normal side | Balance as shown | Example |
+|---|---|---|---|
+| asset | debit | `balance` | `cash:bank` (money the platform holds) |
+| expense | debit | `balance` | `expense:card-fees` |
+| liability | credit | `-balance` | `wallet:alice` (money the platform owes Alice) |
+| equity | credit | `-balance` | `equity:owner` |
+| revenue | credit | `-balance` | `revenue:fees` |
+
+So a healthy customer wallet has a negative stored balance (it is a credit balance), and shows as positive. One
+signed column keeps the zero-sum rule a plain `SUM(amount) = 0`. The alternative, separate debit and credit
+columns as TigerBeetle stores them, makes every sum two sums.
+
+### Examples
+
+Alice tops up $50 by card. The platform's bank balance goes up and so does what it owes Alice:
+
+| Account | Type | Amount (cents) |
+|---|---|---|
+| `cash:bank` | asset | +5000 |
+| `wallet:alice` | liability | −5000 |
+
+Alice pays Bob $20, and the platform keeps a 3% fee:
+
+| Account | Type | Amount (cents) |
+|---|---|---|
+| `wallet:alice` | liability | +2000 |
+| `wallet:bob` | liability | −1940 |
+| `revenue:fees` | revenue | −60 |
+
+A currency conversion is one entry with two balanced currencies. Each account has one currency, so the
+conversion goes through an FX account per currency:
+
+| Account | Currency | Amount |
+|---|---|---|
+| `wallet:alice:usd` | USD | +10000 |
+| `fx:usd` | USD | −10000 |
+| `fx:eur` | EUR | +9200 |
+| `wallet:alice:eur` | EUR | −9200 |
+
+USD sums to zero and EUR sums to zero. The rate is the ratio of the two legs; the FX accounts' balances are the
+platform's currency position.
+
+A mistake is never edited away. It is corrected by a **reversing entry** with every amount negated, so the history
+shows both the mistake and its correction.
+
+## Invariants and where each is enforced
+
+The application checks every rule first, to give a clear error. The database checks the rules again, so a bug in
+the application, a second writer, or a hand-typed `psql` session can't break them. Every database check fails
+closed: a statement that gets around the expected order of operations is rejected, never accepted.
+
+| # | Invariant | Application (Go) | Database |
+|---|---|---|---|
+| I1 | The postings of an entry sum to zero in each currency | `ledger.Entry.Validate` | deferred constraint trigger, checked at commit |
+| I2 | An entry has between 2 and 64 postings, exactly as many as it declares | `Validate` | the same trigger: `posting_count` must match |
+| I3 | A posting's currency is its account's currency | checked against the account | composite foreign key `(account_id, currency)` |
+| I4 | An account's `balance` is the sum of its postings; each posting records the balance after it and the account's version, with no gaps | the database does it | `BEFORE INSERT` trigger on postings; `UNIQUE (account_id, account_version)` |
+| I5 | A protected account never goes below zero on its normal side | checked before posting | `CHECK` on accounts, evaluated on every balance change |
+| I6 | Entries and postings are never updated or deleted | no code path does it | triggers reject `UPDATE`, `DELETE` and `TRUNCATE` |
+| I7 | A balance changes only through a posting | no code path does it | trigger on accounts rejects direct changes |
+
+I1 and I4 together give the property the property tests check from day 3: **in every currency, the balances of all
+accounts sum to zero**, whatever transfers ran and in whatever order.
+
+### Why a deferred constraint trigger (I1, I2)
+
+A `CHECK` constraint sees one row, but I1 is about a group of rows. The rule can only be checked once all of an
+entry's postings exist, so it runs at commit: `CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`.
+
+The check runs from two places:
+
+- After each posting insert, so postings can't be appended to an entry that was committed earlier. Adding a
+  balanced pair to an old entry would keep I1, but I2 catches it: the entry declared its `posting_count` when it
+  was created, entries are immutable, and the count would no longer match.
+- After each entry insert, so an entry with no postings at all can't commit.
+
+For an entry with N postings the check runs N + 1 times at commit, each one an index lookup of N rows. With N at
+most 64 that is cheap; day 4 measures it.
+
+### Why the database keeps the balance (I4, I5)
+
+Each account row holds a cached `balance` and a `version`. A `BEFORE INSERT` trigger on postings adds the amount
+to the account and copies the new balance and version onto the posting:
+
+```sql
+UPDATE accounts SET balance = balance + NEW.amount, version = version + 1
+ WHERE id = NEW.account_id AND currency = NEW.currency
+RETURNING balance, version INTO NEW.balance_after, NEW.account_version;
+```
+
+- **The cache can't drift.** No code path can insert a posting without moving the balance, so reading a balance
+  is one row, not a sum over the account's history.
+- **Overdraft protection is atomic.** The `CHECK` on accounts runs inside that `UPDATE`, while it holds the row
+  lock, so two concurrent payments can't both spend the same $10.
+- **The history is a chain.** `account_version` numbers an account's postings 1, 2, 3, … with no gaps, and each
+  posting's `balance_after` is the previous one plus its amount. The reconciliation job (day 3) checks the chain,
+  and statements paginate by version.
+
+The cost is a hot row: every entry that touches `revenue:fees` updates the same row, and those updates serialise.
+That is a real limit for high-volume ledgers. Day 4 measures it under contention, and the known fixes are listed
+under "Limitations".
+
+An account appears at most once per entry (`UNIQUE (entry_id, account_id)`). The overdraft check runs per posting,
+so two postings to one account (+100 then −50) could fail on an intermediate state that the entry as a whole never
+reaches. Netting them into one posting is always possible.
+
+## Money
+
+- **Integers, never floats.** Amounts are `int64` in Go and `BIGINT` in Postgres, in minor units.
+- **Currencies** live in a `currencies` table (code, exponent), seeded with a few ISO 4217 codes: USD, EUR, GBP,
+  CAD, CHF and INR (exponent 2), JPY (0) and KWD (3). The Go registry in `internal/money` has the same list, and a
+  test checks the two agree.
+- **Exact parsing.** `"12.34"` in USD is 1234. `"12.345"` in USD is an error, not a rounding.
+- **Bounds.** A posting is at most 10^15 minor units either way (ten trillion dollars), checked in Go and by a
+  `CHECK`. With at most 64 postings, no sum in an entry can overflow `int64`: 64 × 10^15 is below 9.2 × 10^18.
+  Go still adds with an overflow check, and Postgres sums `BIGINT` as `NUMERIC`. The bound also keeps every amount
+  exact in a JSON number read by JavaScript (2^53 ≈ 9.007 × 10^15).
+- A balance that would leave `BIGINT` makes the posting fail with `bigint out of range`; it never wraps.
+
+## Schema (migration 0001)
+
+```
+currencies       code PK, exponent
+accounts         id PK, name UNIQUE, type, currency → currencies, allow_negative,
+                 balance, version, created_at, UNIQUE (id, currency)
+journal_entries  id PK, description, posting_count, created_at
+postings         id PK, entry_id → journal_entries, (account_id, currency) → accounts (id, currency),
+                 amount, balance_after, account_version,
+                 UNIQUE (entry_id, account_id), UNIQUE (account_id, account_version)
+```
+
+Ids are `BIGINT GENERATED ALWAYS AS IDENTITY`: small, ordered, and easy to lock in a fixed order. This is an
+internal service, so guessable ids are acceptable; a public API would put opaque ids in front.
+
+Errors from the database carry a constraint name (`RAISE ... USING CONSTRAINT = 'entry_balanced'`), so the Go code
+can map a rejection to an API error without parsing messages.
+
+## Migrations
+
+Plain SQL files embedded in the binary (`internal/store/migrations/NNNN_name.sql`) and applied by a small runner:
+
+- Everything runs in one transaction, under a transaction-level advisory lock. Two instances starting at once
+  apply the migrations once; the second waits, then finds nothing to do.
+- `schema_migrations` records each version with a SHA-256 of its file. If an applied migration's file changes
+  later, startup fails instead of running a schema that doesn't match the code.
+- Postgres DDL is transactional, so a failing migration leaves nothing behind.
+
+Why not goose or golang-migrate: the runner is about a hundred lines, its behaviour is fully tested, and it has no
+dependency. Its limit: a statement that can't run in a transaction (`CREATE INDEX CONCURRENTLY`) needs a different
+path, which nothing here needs yet.
+
+## Concurrency (days 2 and 3)
+
+- **Day 2: serializable transactions with retries.** A transfer runs at `SERIALIZABLE`. On a serialization failure
+  (`40001`) or a deadlock (`40P01`) the whole transaction is retried with backoff and jitter, a bounded number of
+  times. Postings are inserted in account-id order, so the row locks are always taken in one order.
+- **Day 3: row locking compared with optimistic concurrency.** The same transfer under `READ COMMITTED`, where
+  concurrent updates of an account row wait for each other, against `SERIALIZABLE`, where one of them fails and
+  retries. The comparison measures throughput and retries on a hot account and on spread-out accounts. A property
+  test runs random concurrent transfers and checks that every currency still sums to zero and every account's
+  chain is intact.
+
+## API (day 2)
+
+gRPC on port 9103 and REST on 8103, both thin layers over one service:
+
+- `CreateAccount(name, type, currency, allow_negative)`
+- `PostEntry(idempotency_key, description, postings[])`: atomic and serializable. Errors are distinct: unbalanced,
+  unknown account, currency mismatch, insufficient funds, idempotency-key reuse with a different request.
+- `GetAccount(id)`: the balance, both stored and as shown.
+- `ListPostings(account_id, after_version, limit)`: the history, paginated by version.
+
+**Idempotency keys.** The client sends a key with each `PostEntry`. The key, a hash of the canonical request and
+the resulting entry id are stored in the same transaction as the entry. A retry with the same key and request
+returns the original entry; the same key with a different request is rejected. Exactly-once effects under retries
+and crashes is what day 4 tests by failure injection.
+
+## Outbox and reconciliation (day 3)
+
+- **Transactional outbox.** Each posted entry writes an `entry_posted` event row in the same transaction. A
+  publisher reads unpublished rows in order (`FOR UPDATE SKIP LOCKED`), delivers them, and marks them sent. Events
+  are delivered at least once, so consumers dedupe by event id.
+- **Reconciliation job.** It recomputes everything from postings and compares it with the stored state: each
+  balance against the sum of its postings and against the last `balance_after`, version gaps, every entry's sums,
+  and each currency's total. It reports any difference; it never fixes data silently.
+
+## Load and failure injection (day 4)
+
+A Go load generator posts transfers over the API with configurable contention (how many accounts, how skewed the
+choice is), and reports throughput and latency percentiles. Failure injection kills a request between commit and
+response, then retries it with the same idempotency key, and checks that the effect happened exactly once.
+
+## Testing
+
+- **Unit and property tests** (`testing` and [rapid](https://pkg.go.dev/pgregory.net/rapid)) for money and the
+  entry validator: random balanced entries validate, changing any amount breaks the balance, and the order of the
+  postings never matters.
+- **Database tests** run against a real Postgres 14, each in a fresh schema of its own, so tests can run in
+  parallel and never see each other's rows. They skip when `LEDGER_TEST_DATABASE_URL` is unset, and fail instead
+  when `CI` is set, so CI can't pass by skipping.
+- **A differential test** generates random entries, balanced and not, and checks that the Go validator and the
+  database trigger accept exactly the same ones: two implementations of one rule, each checking the other.
+
+## Limitations
+
+- **Hot accounts.** Every posting to an account updates its row, so a busy account serialises its writers. The
+  known fixes, not built here: split the account into N sub-accounts and sum them on read, or post to a hot
+  account in batches.
+- **Single database.** No sharding. Entries that span shards would need a distributed transaction.
+- **The database owner can switch the triggers off.** The application should connect as a role that owns
+  nothing, with `INSERT` and `SELECT` only on the ledger tables. Day 1 doesn't set up roles.
+- **No business time yet.** `created_at` is when the entry was recorded. A separate effective date (for
+  backdated corrections) is a later addition.
+- **Single-currency accounts.** A multi-currency customer has one account per currency.
