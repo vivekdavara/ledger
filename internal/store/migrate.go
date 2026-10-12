@@ -62,7 +62,7 @@ func LoadMigrations(fsys fs.FS) ([]Migration, error) {
 
 // Beginner is what Migrate needs from a connection: *pgxpool.Pool and *pgx.Conn both have it.
 type Beginner interface {
-	Begin(ctx context.Context) (pgx.Tx, error)
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
 // MigrateFS applies the pending migrations from fsys to the current schema (the first schema on the
@@ -80,7 +80,10 @@ func MigrateFS(ctx context.Context, db Beginner, fsys fs.FS) (applied []int, err
 	if err != nil {
 		return nil, err
 	}
-	tx, err := db.Begin(ctx)
+	// Read committed whatever the session's default. Under repeatable read or serializable the snapshot would be
+	// taken by the lock statement, before the wait, so a runner that waited couldn't see what the first one
+	// applied and would apply it again.
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin migration transaction: %w", err)
 	}

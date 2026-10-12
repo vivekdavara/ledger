@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -134,7 +135,34 @@ func TestMigrateFailureLeavesNothingBehind(t *testing.T) {
 
 func TestMigrateConcurrentRunnersApplyOnce(t *testing.T) {
 	t.Parallel()
-	pool := storetest.EmptySchema(t)
+	runnersApplyOnce(t, storetest.EmptySchema(t))
+}
+
+// Found in review: the lock is the transaction's first statement, so under a repeatable-read or serializable
+// session default the snapshot was taken before the lock wait, and a runner that had waited couldn't see what the
+// first one applied. It must work whatever the database or role default is.
+func TestMigrateConcurrentRunnersApplyOnceAtEveryIsolationLevel(t *testing.T) {
+	t.Parallel()
+	for _, level := range []string{"read committed", "repeatable read", "serializable"} {
+		u, err := url.Parse(storetest.SchemaURL(t, storetest.EmptySchema(t)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		q.Set("default_transaction_isolation", level)
+		u.RawQuery = strings.ReplaceAll(q.Encode(), "+", "%20") // pgx doesn't read + as a space
+		pool, err := pgxpool.New(context.Background(), u.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Run(strings.ReplaceAll(level, " ", "_"), func(t *testing.T) { runnersApplyOnce(t, pool) })
+		pool.Close()
+	}
+}
+
+// runnersApplyOnce races eight runners on one empty schema: exactly one applies the migrations, and none fails.
+func runnersApplyOnce(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
 	// The sleep holds the lock long enough for every runner to be waiting on it.
 	slow := map[string]string{
 		"0001_widgets.sql": twoMigrations["0001_widgets.sql"] + ` SELECT pg_sleep(0.3);`,
