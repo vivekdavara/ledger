@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	neturl "net/url"
 	"os"
 	"testing"
 	"time"
@@ -85,4 +86,22 @@ func Migrated(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("migrate: %v", err)
 	}
 	return pool
+}
+
+// SchemaURL returns a database URL whose connections use db's schema, for code under test that opens its own pool
+// from a URL. pgx passes unknown URL parameters such as search_path to the server as settings.
+func SchemaURL(t testing.TB, db *pgxpool.Pool) string {
+	t.Helper()
+	var schema string
+	if err := db.QueryRow(context.Background(), `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatalf("current_schema: %v", err)
+	}
+	u, err := neturl.Parse(URL(t))
+	if err != nil {
+		t.Fatalf("parse %s: %v", EnvURL, err)
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }

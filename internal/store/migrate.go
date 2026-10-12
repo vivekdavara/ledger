@@ -117,6 +117,7 @@ func MigrateFS(ctx context.Context, db Beginner, fsys fs.FS) (applied []int, err
 		}
 	}
 
+	applied = []int{} // not nil, so "nothing to do" logs as [] rather than null
 	for _, m := range migrations {
 		if _, ok := done[m.Version]; ok {
 			continue
