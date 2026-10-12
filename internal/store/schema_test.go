@@ -2,72 +2,14 @@ package store_test
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/money"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 )
-
-// constraint returns the name of the constraint a Postgres error reports, or "" for any other error.
-func constraint(err error) string {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.ConstraintName
-	}
-	return ""
-}
-
-type account struct {
-	name, typ, currency string
-	allowNegative       bool
-}
-
-func createAccount(t *testing.T, db *pgxpool.Pool, a account) int64 {
-	t.Helper()
-	var id int64
-	err := db.QueryRow(context.Background(),
-		`INSERT INTO accounts (name, type, currency, allow_negative) VALUES ($1, $2, $3, $4) RETURNING id`,
-		a.name, a.typ, a.currency, a.allowNegative).Scan(&id)
-	if err != nil {
-		t.Fatalf("create account %q: %v", a.name, err)
-	}
-	return id
-}
-
-// rolledBack runs fn in a transaction that is always rolled back, and returns fn's error. Each scenario checks
-// one statement and leaves nothing behind.
-func rolledBack(t *testing.T, db *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
-	t.Helper()
-	ctx := context.Background()
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	return fn(tx)
-}
-
-func insertEntry(tx pgx.Tx, description string, postingCount int) (int64, error) {
-	var id int64
-	err := tx.QueryRow(context.Background(),
-		`INSERT INTO journal_entries (description, posting_count) VALUES ($1, $2) RETURNING id`,
-		description, postingCount).Scan(&id)
-	return id, err
-}
-
-func insertPosting(tx pgx.Tx, entryID, accountID int64, currency string, amount int64) error {
-	// balance_after and account_version are placeholders: from migration 0002 a trigger sets them.
-	_, err := tx.Exec(context.Background(),
-		`INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
-		 VALUES ($1, $2, $3, $4, 0, 1)`, entryID, accountID, currency, amount)
-	return err
-}
 
 func TestOpenErrorsHideThePassword(t *testing.T) {
 	for _, url := range []string{"postgres://ledger:s3cret-pw@%zz/ledger", "postgres://ledger:s3cret-pw@127.0.0.1:1/x"} {
