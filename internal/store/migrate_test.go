@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -202,5 +203,30 @@ func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	}
 	if got[0].SQL != "one" || got[9].Name != "0010_j.sql" || len(got[0].Checksum) != 64 {
 		t.Fatalf("unexpected first or last migration: %+v, %+v", got[0], got[9])
+	}
+}
+
+// The embed pattern is migrations/*.sql, so a file named, say, 0005_x.SQL would be left out of the binary without
+// a word, and never run. Every file in the directory must be one the binary carries.
+func TestEveryMigrationFileIsEmbedded(t *testing.T) {
+	onDisk, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embedded, err := store.LoadMigrations(store.Migrations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool)
+	for _, m := range embedded {
+		names[m.Name] = true
+	}
+	for _, f := range onDisk {
+		if !names[f.Name()] {
+			t.Errorf("migrations/%s is not embedded in the binary", f.Name())
+		}
+	}
+	if len(embedded) != len(onDisk) || embedded[len(embedded)-1].Version != len(onDisk) {
+		t.Fatalf("%d files on disk, %d embedded", len(onDisk), len(embedded))
 	}
 }
