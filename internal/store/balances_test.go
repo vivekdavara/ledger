@@ -242,3 +242,46 @@ func TestABalanceThatWouldOverflowFailsInsteadOfWrapping(t *testing.T) {
 		t.Fatalf("balance is %d after the failed posting; it should be unchanged", bal)
 	}
 }
+
+// Found in review: when the balance moved in a BEFORE trigger, Postgres could still skip the row afterwards
+// (ON CONFLICT DO NOTHING, or DO UPDATE whose WHERE is false), and the balance stayed moved with no posting.
+func TestASkippedPostingMovesNoBalance(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	b := newBook(t, db)
+	entry := mustPost(t, db, "top-up", leg{b.cash, "USD", 5000}, leg{b.alice, "USD", -5000})
+	var postingID int64
+	if err := db.QueryRow(context.Background(), `SELECT id FROM postings WHERE account_id = $1`, b.cash).
+		Scan(&postingID); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
+		 VALUES ($1, $2, 'USD', 700, 0, 1) ON CONFLICT DO NOTHING`,
+		`INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
+		 VALUES ($1, $2, 'USD', 700, 0, 1) ON CONFLICT (entry_id, account_id) DO NOTHING`,
+		`INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
+		 VALUES ($1, $2, 'USD', 700, 0, 1)
+		 ON CONFLICT (entry_id, account_id) DO UPDATE SET amount = EXCLUDED.amount WHERE false`,
+	} {
+		tag, err := db.Exec(context.Background(), sql, entry, b.cash)
+		if err != nil || tag.RowsAffected() != 0 {
+			t.Fatalf("%s: %v, %d rows; want a silently skipped row", sql, err, tag.RowsAffected())
+		}
+	}
+	// A conflict on the primary key (the id forced), on an account the entry doesn't use.
+	spare := createAccount(t, db, account{"cash:spare", "asset", "USD", true})
+	tag, err := db.Exec(context.Background(), `INSERT INTO postings
+		(id, entry_id, account_id, currency, amount, balance_after, account_version) OVERRIDING SYSTEM VALUE
+		VALUES ($1, $2, $3, 'USD', 700, 0, 1) ON CONFLICT DO NOTHING`, postingID, entry, spare)
+	if err != nil || tag.RowsAffected() != 0 {
+		t.Fatalf("primary-key conflict: %v, %d rows", err, tag.RowsAffected())
+	}
+	for id, want := range map[int64][2]int64{b.cash: {5000, 1}, spare: {0, 0}} {
+		if bal, ver := balanceOf(t, db, id); bal != want[0] || ver != want[1] {
+			t.Errorf("account %d: balance %d version %d after skipped inserts, want %d and %d", id, bal, ver,
+				want[0], want[1])
+		}
+	}
+	checkBooks(t, db)
+}
