@@ -3,13 +3,15 @@ package store
 
 import (
 	"context"
+	"embed"
 	"fmt"
+	"io/fs"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Open connects to Postgres and checks that the connection works. The URL is never put in an error, since it can
-// hold a password.
+// Open connects to Postgres and checks that the connection works. Its errors never show the password: pgx
+// redacts it from the URL it quotes.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -24,4 +26,21 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 	return pool, nil
+}
+
+//go:embed migrations/*.sql
+var embedded embed.FS
+
+// Migrations returns the migrations built into the binary.
+func Migrations() fs.FS {
+	sub, err := fs.Sub(embedded, "migrations")
+	if err != nil {
+		panic(err) // "migrations" is a valid path, so Sub can't fail
+	}
+	return sub
+}
+
+// Migrate applies the built-in migrations that haven't been applied yet. See MigrateFS.
+func Migrate(ctx context.Context, db Beginner) ([]int, error) {
+	return MigrateFS(ctx, db, Migrations())
 }

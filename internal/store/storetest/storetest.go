@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/store"
 )
 
 // EnvURL names the environment variable that holds the test database's URL.
@@ -74,4 +75,14 @@ func exec(t testing.TB, ctx context.Context, url, sql string) {
 	if _, err := conn.Exec(ctx, sql); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
+}
+
+// Migrated is EmptySchema with every built-in migration applied.
+func Migrated(t testing.TB) *pgxpool.Pool {
+	t.Helper()
+	pool := EmptySchema(t)
+	if _, err := store.Migrate(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return pool
 }
