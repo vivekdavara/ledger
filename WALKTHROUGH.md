@@ -2,11 +2,14 @@
 
 The questions an interviewer is likely to ask about Ledger, with short answers that point at the code. This file
 grows each day; this version covers day 1 (the money type, the validator, the schema and its invariants, the
-migration runner, the binary). Read DESIGN.md first for the full picture.
+migration runner, the binary) and day 2 (the API: REST and gRPC over one service, serializable posting with
+retries, idempotency keys). Read DESIGN.md first for the full picture.
 
 **Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the migrations in
 `internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
-`internal/store/migrate.go` → `internal/store/differential_test.go`.
+`internal/store/migrate.go` → `internal/store/differential_test.go`. For day 2: `internal/store/ledger.go`
+(`PostEntry` and `postOnce`) → `internal/ledger/posted.go` (`Entry.Hash`) → `internal/apierr/apierr.go` →
+`internal/server/api.go` → `internal/grpcapi/grpcapi.go` → `internal/store/service_test.go`.
 
 ## The model
 
@@ -162,3 +165,108 @@ exactly the valid entries must be in the database, and the books must still bala
 Liveness answers "should this process be restarted?" and checks nothing, so a database outage doesn't make an
 orchestrator restart every instance. Readiness answers "should this instance get traffic?": the database must
 answer within 2 s and the schema must be at the binary's newest migration (`store.Ready`).
+
+## The API (day 2)
+
+**Walk me through posting a payment.**
+`Store.PostEntry` (`internal/store/ledger.go`) validates the key and the entry, hashes the entry, and runs an
+attempt: one `SERIALIZABLE` transaction that looks up the key, locks the entry's accounts in id order with
+`SELECT ... ORDER BY id FOR UPDATE`, checks the rules that need the accounts (exists, currency, overdraft, balance
+range), inserts the entry, its postings in one statement and the key, and commits; the deferred checks run at the
+commit. An attempt aborted with `40001` or `40P01` is retried with backoff. DESIGN.md has it step by step.
+
+**What does the idempotency key protect against, exactly?**
+A client that doesn't know whether its request worked: a timeout, a dropped connection, a crash before it read the
+answer. It retries with the same key. The key and the entry are written in one transaction, so the key exists if
+and only if the entry does; the retry either finds the key and gets the original entry back, or finds nothing and
+posts. Either way the money moves once. `TestARetriedRequestPostsOnce` covers the sequential case and
+`TestConcurrentRetriesOfOneRequestPostOnce` the concurrent one.
+
+**What if two retries with the same key arrive at the same moment?**
+Both read the key as unused. Both try to lock the same accounts; one gets the locks, posts and commits. The other
+was waiting on a row the winner changed, and under `SERIALIZABLE` that is a serialization failure (`40001`), not a
+wait-and-continue. It retries, now finds the key, and replays. If they collide on the key's primary key instead
+(`23505`), that is retried the same way. The test holds twelve requests at a barrier (a test hook after the key
+lookup) until all have read the key, so the race really happens: one posts, eleven retry and replay, and the
+test asserts at least eleven retries.
+
+**Why hash the request at all? Isn't the key enough?**
+The key says "this is the same operation"; the hash checks that it really is. A client bug that reuses a key for
+a different payment would otherwise get the old payment's answer and believe the new one went through. With the
+hash it gets `idempotency_key_reused`. The hash covers the description and the postings as a set, sorted by
+account id (`Entry.Hash`): a retry that lists the postings in another order is the same entry, so it replays.
+
+**Why doesn't a rejected request store its key?**
+The rejection's transaction rolls back, and storing the failure would need a second transaction. A retry after
+"insufficient funds" sees the accounts as they are now: if money arrived in between, it posts. The effect still
+happens at most once per key. Stripe saves the first answer, failures included; that's a defensible alternative,
+named in DESIGN.md.
+
+**Why `SERIALIZABLE` if you lock the rows anyway?**
+The locks give the order; `SERIALIZABLE` makes the transaction's reads safe. The key lookup and the account checks
+are reads, and the decision to post depends on them. Under `READ COMMITTED` the locked rows would be re-read after
+the wait, which works for the balances, but every read the code adds later would need the same care. Here,
+anything Postgres can't serialize aborts with `40001` and is retried. The price is retries on a hot account
+instead of waits: in one run, the eight-worker test logged 83 retries for 80 transfers among four wallets. Day 3
+measures the two strategies against each other.
+
+**How do you avoid deadlocks?**
+Every attempt locks its accounts in ascending id order before touching them, in one statement, and `EXPLAIN`
+shows the plan is `LockRows` over a `Sort` on id, so rows are locked as they come out sorted. Two entries that
+share accounts wait in the same order and can't form a cycle. If one still happened, `40P01` is retried.
+
+**What does the service check, and what does the database check?**
+Both check everything. The service checks first so the error can name the rule and the posting ("posting 0:
+insufficient funds: account 2 (wallet:alice) has 30.00 USD, the posting takes 30.01"). Its checks run on the rows it
+has locked, so they can't go stale before the insert. The database checks again with its constraints and triggers,
+and if it ever rejects something the service let through, `translate` maps the constraint name to the same error.
+
+**How do REST and gRPC stay consistent?**
+Both take the `ledger.Service` interface and only translate. Errors go through one table, `internal/apierr`: a
+stable reason, an HTTP status and a gRPC code per error. REST puts the reason in its JSON, gRPC in a
+`google.rpc.ErrorInfo` (`INSUFFICIENT_FUNDS`), with the posting's index in both. In the hand check, a key used over
+REST replayed over gRPC.
+
+**Why are REST amounts strings?**
+A JSON number is a double in JavaScript, exact only up to 2^53. A posting is capped at 10^15 minor units, but a
+balance isn't. Strings in the major unit (`"19.40"`) are exact everywhere and readable, and `money.Parse` refuses
+`"19.405"` in USD instead of rounding it. gRPC uses `int64` minor units; its JSON form (grpcurl) prints them as
+strings for the same reason.
+
+**Why is an unknown account a 422 and not a 404?**
+404 is for the resource in the URL. `POST /v1/entries` naming a missing account would read as "no such endpoint".
+`GET /v1/accounts/999` is a 404. In gRPC both are `NOT_FOUND`, with different reasons (`UNKNOWN_ACCOUNT`,
+`NOT_FOUND`).
+
+**What happens when the retries run out?**
+`ErrConflict`: HTTP 409, gRPC `ABORTED`, reason `conflict`. The key wasn't stored, so the client can retry with the
+same key safely (`TestRetriesRunOut`). The policy is 10 attempts, waits uniform in [0, min(100 ms, 1 ms ×
+2^(n−1))]: "full jitter", so colliding transactions spread out instead of colliding again in step.
+
+**How do you test a serialization failure deterministically?**
+A test hook (`export_test.go`) runs code at named points of an attempt. `TestASerializationFailureIsRetried`
+commits another payment from the same wallet right after the attempt's snapshot. The attempt's `FOR UPDATE` then
+meets a row changed since its snapshot, fails with `40001`, and the second attempt posts against the new balance:
+exactly one retry, and Alice's posting lands at version 3 with the right balance.
+
+**Why is account creation idempotent by name, and not by key?**
+Names are already unique, so the name is a natural key: a retry finds its account. `INSERT ... ON CONFLICT DO
+NOTHING RETURNING` then a `SELECT` by name. The same attributes give the existing account (HTTP 200 instead of
+201); different ones are `account_name_taken`.
+
+**What is migration 0008's CHECK on balances for?**
+The API shows a credit-normal account's balance negated. Every `bigint` can be negated except -2^63, so
+`accounts_balance_negatable` keeps balances above it and the shown balance always fits in an `int64`. Reaching it
+takes over 9,000 maximum postings, so `TestABalanceStopsShortOfTheSmallestBigint` sets the balance with the
+triggers off (`session_replication_role = replica`) and shows the CHECK still refuses it: constraints aren't
+triggers.
+
+**How is the gRPC code generated without protoc?**
+The generators are Go programs: buf, protoc-gen-go and protoc-gen-go-grpc are pinned in a separate module,
+`tools/go.mod`, and run with `go tool -modfile=tools/go.mod`. A separate module keeps buf's many dependencies out
+of the service's `go.mod`. `make proto` lints and regenerates; the output is committed.
+
+**How does ledgerd shut down?**
+Both listeners open before either serves, so a taken port fails startup instead of leaving half a service
+(`TestServeFailsIfAPortIsTaken`). On SIGTERM, `http.Server.Shutdown` and gRPC's `GracefulStop` run together with a
+10 s grace; then `Stop` cuts off whatever is still running.
