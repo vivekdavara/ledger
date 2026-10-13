@@ -553,3 +553,55 @@ func TestTheBackoffDoublesUpToItsCap(t *testing.T) {
 		t.Fatalf("waits %v, want %v", waits, want)
 	}
 }
+
+// A connection lost during a delivery loses nothing: here the publisher's backend is terminated while the sink holds
+// the batch, the mark can't commit, and the next batch, on a new connection, delivers the events again.
+func TestALostConnectionDuringDeliveryLosesNoEvent(t *testing.T) {
+	t.Parallel()
+	db, _, _ := ledgerWith(t, 3)
+	ctx := context.Background()
+	// A pool of its own, with a name, so the test ends exactly the publisher's backend and no other test's.
+	name := fmt.Sprintf("outbox-lost-connection-%d", time.Now().UnixNano())
+	cfg, err := pgxpool.ParseConfig(storetest.SchemaURL(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = name
+	publisherDB, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisherDB.Close()
+	sk := &sink{}
+	lost := false
+	sk.deliver = func(context.Context, []outbox.Event) error {
+		if !lost {
+			lost = true
+			// The pid first, then that one backend: Postgres doesn't promise to filter on the name before it calls
+			// pg_terminate_backend in the same WHERE clause, and a first version of this test ended its own session.
+			var pid int
+			ended := false
+			err := db.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE application_name = $1`, name).Scan(&pid)
+			if err == nil {
+				err = db.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, pid).Scan(&ended)
+			}
+			if err != nil || !ended {
+				t.Errorf("ending the publisher's backend: %v, %v", ended, err)
+			}
+		}
+		return nil
+	}
+	p := outbox.New(publisherDB, sk, outbox.Options{})
+	if n, err := p.PublishOnce(ctx); n != 0 || err == nil {
+		t.Fatalf("published %d, %v; want the mark to fail with the connection", n, err)
+	}
+	if n := unpublished(t, db); n != 3 {
+		t.Fatalf("%d unpublished after the lost connection, want 3", n)
+	}
+	if n, err := p.PublishOnce(ctx); n != 3 || err != nil {
+		t.Fatalf("on a new connection: published %d, %v; want 3", n, err)
+	}
+	if got := sk.events(); len(got) != 6 || len(outbox.Dedupe(map[int64]bool{}, got)) != 3 {
+		t.Fatalf("%d deliveries, want each of the 3 events twice", len(got))
+	}
+}
