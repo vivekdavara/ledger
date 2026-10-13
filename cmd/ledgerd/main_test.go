@@ -17,6 +17,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
+	"github.com/vivekdavara/ledger/internal/ledger"
+	"github.com/vivekdavara/ledger/internal/outbox"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 	"google.golang.org/grpc"
@@ -48,7 +50,7 @@ func env(vars map[string]string) func(string) string {
 func TestUsage(t *testing.T) {
 	for _, args := range [][]string{nil, {"help"}, {"serve", "extra"}} {
 		var out bytes.Buffer
-		if code := run(context.Background(), args, env(nil), &out, nil); code != 2 || !strings.Contains(out.String(), "usage") {
+		if code := run(context.Background(), args, env(nil), io.Discard, &out, nil); code != 2 || !strings.Contains(out.String(), "usage") {
 			t.Errorf("run(%q) = %d, %q; want 2 and the usage", args, code, out.String())
 		}
 	}
@@ -56,7 +58,7 @@ func TestUsage(t *testing.T) {
 
 func TestADatabaseURLIsRequired(t *testing.T) {
 	var out bytes.Buffer
-	if code := run(context.Background(), []string{"serve"}, env(nil), &out, nil); code != 1 ||
+	if code := run(context.Background(), []string{"serve"}, env(nil), io.Discard, &out, nil); code != 1 ||
 		!strings.Contains(out.String(), "LEDGER_DATABASE_URL is not set") {
 		t.Fatalf("got %d, %q", code, out.String())
 	}
@@ -66,7 +68,7 @@ func TestAnUnknownIsolationLevelIsRefused(t *testing.T) {
 	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
 		"LEDGER_ISOLATION": "repeatable-read"}
 	var out bytes.Buffer
-	if code := run(context.Background(), []string{"serve"}, env(vars), &out, nil); code != 1 ||
+	if code := run(context.Background(), []string{"serve"}, env(vars), io.Discard, &out, nil); code != 1 ||
 		!strings.Contains(out.String(), `unknown isolation level \"repeatable-read\"`) {
 		t.Fatalf("got %d, %q", code, out.String())
 	}
@@ -75,7 +77,7 @@ func TestAnUnknownIsolationLevelIsRefused(t *testing.T) {
 func TestAnUnreachableDatabaseFailsWithoutShowingThePassword(t *testing.T) {
 	var out bytes.Buffer
 	vars := map[string]string{"LEDGER_DATABASE_URL": "postgres://ledger:s3cret-pw@127.0.0.1:1/ledger?connect_timeout=2"}
-	if code := run(context.Background(), []string{"migrate"}, env(vars), &out, nil); code != 1 {
+	if code := run(context.Background(), []string{"migrate"}, env(vars), io.Discard, &out, nil); code != 1 {
 		t.Fatalf("got exit %d, want 1", code)
 	}
 	if strings.Contains(out.String(), "s3cret-pw") {
@@ -95,7 +97,7 @@ func TestMigrateAppliesOnceThenNothing(t *testing.T) {
 	}
 	for i, want := range []string{`"applied":[` + strings.Join(all, ",") + `]`, `"applied":[]`} {
 		var out bytes.Buffer
-		if code := run(context.Background(), []string{"migrate"}, env(vars), &out, nil); code != 0 ||
+		if code := run(context.Background(), []string{"migrate"}, env(vars), io.Discard, &out, nil); code != 0 ||
 			!strings.Contains(out.String(), want) {
 			t.Fatalf("run %d: exit %d, log %s; want %s", i+1, code, out.String(), want)
 		}
@@ -114,7 +116,7 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 	var logs syncBuffer
 	listening := make(chan addrs, 1)
 	exit := make(chan int, 1)
-	go func() { exit <- run(ctx, []string{"serve"}, env(vars), &logs, listening) }()
+	go func() { exit <- run(ctx, []string{"serve"}, env(vars), io.Discard, &logs, listening) }()
 
 	var at addrs
 	select {
@@ -196,7 +198,7 @@ func TestServeFailsIfAPortIsTaken(t *testing.T) {
 		"LEDGER_GRPC_ADDR":    taken.Addr().String(),
 	}
 	var logs syncBuffer
-	if code := run(context.Background(), []string{"serve"}, env(vars), &logs, nil); code != 1 ||
+	if code := run(context.Background(), []string{"serve"}, env(vars), io.Discard, &logs, nil); code != 1 ||
 		!strings.Contains(logs.String(), "address already in use") {
 		t.Fatalf("exit %d, log %s", code, logs.String())
 	}
@@ -228,7 +230,7 @@ func startInFlight(t *testing.T, grace string) inFlight {
 	f := inFlight{stop: stop, exit: make(chan int, 1), logs: &syncBuffer{}, rest: make(chan error, 1),
 		grpc: make(chan error, 1), db: db}
 	listening := make(chan addrs, 1)
-	go func() { f.exit <- run(ctx, []string{"serve"}, env(vars), f.logs, listening) }()
+	go func() { f.exit <- run(ctx, []string{"serve"}, env(vars), io.Discard, f.logs, listening) }()
 	var at addrs
 	select {
 	case at = <-listening:
@@ -373,5 +375,75 @@ func TestAStopAsServeStartsIsClean(t *testing.T) {
 		if code := serve(ctx, db, store.New(db), "127.0.0.1:0", "127.0.0.1:0", 10*time.Second, log, nil); code != 0 {
 			t.Fatalf("run %d: exit %d: %s", i, code, logs.String())
 		}
+	}
+}
+
+// ledgerd publish writes the outbox's events to stdout as JSON lines: the entries posted before it started, then
+// one posted while it runs. A stop signal ends it with exit 0, and every event it wrote is marked published.
+func TestPublishWritesEventsAsJSONLines(t *testing.T) {
+	db := storetest.Migrated(t)
+	svc := store.New(db)
+	ctx := context.Background()
+	var accounts [2]int64
+	for i, name := range []string{"cash:bank", "wallet:alice"} {
+		typ := map[int]ledger.AccountType{0: ledger.Asset, 1: ledger.Liability}[i]
+		a, _, err := svc.CreateAccount(ctx, ledger.NewAccount{Name: name, Type: typ, Currency: "USD"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		accounts[i] = a.ID
+	}
+	topUp := func(key string) ledger.PostedEntry {
+		e, _, err := svc.PostEntry(ctx, key, ledger.Entry{Description: key, Postings: []ledger.Posting{
+			{AccountID: accounts[0], Currency: "USD", Amount: 500}, {AccountID: accounts[1], Currency: "USD", Amount: -500}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	posted := []ledger.PostedEntry{topUp("top-up-1"), topUp("top-up-2")}
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	var stdout, logs syncBuffer
+	exit := make(chan int, 1)
+	go func() {
+		exit <- run(runCtx, []string{"publish"}, env(map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, db)}),
+			&stdout, &logs, nil)
+	}()
+	lines := func(n int) []string {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n"); len(got) >= n && got[0] != "" {
+				return got
+			}
+		}
+		t.Fatalf("fewer than %d lines after 10 s: %q; log %s", n, stdout.String(), logs.String())
+		return nil
+	}
+	lines(2)
+	posted = append(posted, topUp("top-up-3"))
+	got := lines(3)
+	stop()
+	if code := <-exit; code != 0 || !strings.Contains(logs.String(), `"msg":"stopped"`) {
+		t.Fatalf("exit %d, log %s", code, logs.String())
+	}
+	if len(got) != 3 {
+		t.Fatalf("%d lines, want 3: %q", len(got), got)
+	}
+	for i, line := range got {
+		var e outbox.Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("line %d: %v", i, err)
+		}
+		if e.Type != outbox.EntryPosted || e.EntryID != posted[i].ID || e.Description != posted[i].Description ||
+			len(e.Postings) != 2 || e.Postings[1].BalanceAfter != posted[i].Postings[1].BalanceAfter {
+			t.Fatalf("line %d: %+v, want entry %+v", i, e, posted[i])
+		}
+	}
+	var unpublished int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&unpublished); err != nil ||
+		unpublished != 0 {
+		t.Fatalf("%d unpublished, %v", unpublished, err)
 	}
 }

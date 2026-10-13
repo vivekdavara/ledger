@@ -2,6 +2,8 @@
 //
 //	ledgerd migrate   apply pending migrations, then exit
 //	ledgerd serve     apply pending migrations, then serve REST and gRPC until SIGINT or SIGTERM
+//	ledgerd publish   apply pending migrations, then deliver the outbox's events as JSON lines on stdout, at least
+//	                  once each, until SIGINT or SIGTERM
 //
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
 // endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103), LEDGER_SHUTDOWN_GRACE (how long in-flight work
@@ -19,11 +21,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/grpcapi"
+	"github.com/vivekdavara/ledger/internal/outbox"
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
 	"google.golang.org/grpc"
@@ -39,19 +44,23 @@ const (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stderr, nil))
+	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr, nil))
 }
 
 // addrs are the addresses ledgerd listens on, once both ports are open.
 type addrs struct{ HTTP, GRPC string }
 
-// run is main without the process, so tests can drive it: it returns the exit code, and stops serving when ctx
-// is cancelled. If listening isn't nil it receives the servers' addresses once both ports are open.
-func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer,
+// commands are ledgerd's subcommands.
+var commands = []string{"migrate", "serve", "publish"}
+
+// run is main without the process, so tests can drive it: it returns the exit code, and stops serving (or
+// publishing) when ctx is cancelled. If listening isn't nil it receives the servers' addresses once both ports are
+// open.
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer,
 	listening chan<- addrs) int {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	if len(args) != 1 || (args[0] != "migrate" && args[0] != "serve") {
-		fmt.Fprintln(stderr, "usage: ledgerd migrate|serve")
+	if len(args) != 1 || !slices.Contains(commands, args[0]) {
+		fmt.Fprintln(stderr, "usage: ledgerd "+strings.Join(commands, "|"))
 		return 2
 	}
 	url := getenv("LEDGER_DATABASE_URL")
@@ -80,8 +89,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return 1
 	}
 	log.Info("migrated", "applied", applied)
-	if args[0] == "migrate" {
+	switch args[0] {
+	case "migrate":
 		return 0
+	case "publish":
+		return publish(ctx, db, stdout, log)
 	}
 
 	grace := defaultShutdownGrace
@@ -100,6 +112,21 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	}
 	return serve(ctx, db, store.NewWithOptions(db, store.Options{Isolation: isolation}), httpAddr, grpcAddr, grace,
 		log, listening)
+}
+
+// publish delivers the outbox's events to out, one JSON line each, until ctx is cancelled (DESIGN.md, "Outbox
+// (day 3)"). A failed write leaves the events unpublished, to be written again.
+func publish(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.Logger) int {
+	log.Info("publishing")
+	err := outbox.New(db, outbox.JSONLines{W: out}, outbox.Options{}).Run(ctx, func(err error) {
+		log.Error("publish", "err", err)
+	})
+	if !errors.Is(err, context.Canceled) {
+		log.Error("publish", "err", err)
+		return 1
+	}
+	log.Info("stopped")
+	return 0
 }
 
 // serve runs the REST and gRPC servers over one store until ctx is cancelled, then stops both gracefully: no new

@@ -1,0 +1,132 @@
+# 2026/10/13 10:30:28.774387 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw keys: 2
+# 2026/10/13 10:30:28.774436 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw entry: ledger.Entry{Description:"b", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:864}, ledger.Posting{AccountID:2, Currency:"USD", Amount:-1684}, ledger.Posting{AccountID:6, Currency:"USD", Amount:820}}}
+# 2026/10/13 10:30:28.774469 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw retries: 3
+# 2026/10/13 10:30:28.774478 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw conflicting: true
+# 2026/10/13 10:30:28.774501 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw other: ledger.Entry{Description:"i", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:-3641}, ledger.Posting{AccountID:6, Currency:"USD", Amount:3641}}}
+# 2026/10/13 10:30:28.774593 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw entry: ledger.Entry{Description:"", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:3}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-219}, ledger.Posting{AccountID:4, Currency:"USD", Amount:216}}}
+# 2026/10/13 10:30:28.774620 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw retries: 3
+# 2026/10/13 10:30:28.774627 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw conflicting: true
+# 2026/10/13 10:30:28.774653 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw other: ledger.Entry{Description:"zl", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:534}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-534}}}
+# 2026/10/13 10:30:28.774706 [TestPropertyEachKeyPostsOnce/serializable] [rapid] draw order: []store_test.send{store_test.send{key:"r4-k1", entry:ledger.Entry{Description:"", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:3}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-219}, ledger.Posting{AccountID:4, Currency:"USD", Amount:216}}}}, store_test.send{key:"r4-k0", entry:ledger.Entry{Description:"i", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:-3641}, ledger.Posting{AccountID:6, Currency:"USD", Amount:3641}}}}, store_test.send{key:"r4-k0", entry:ledger.Entry{Description:"b", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:864}, ledger.Posting{AccountID:2, Currency:"USD", Amount:-1684}, ledger.Posting{AccountID:6, Currency:"USD", Amount:820}}}}, store_test.send{key:"r4-k0", entry:ledger.Entry{Description:"b", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:864}, ledger.Posting{AccountID:2, Currency:"USD", Amount:-1684}, ledger.Posting{AccountID:6, Currency:"USD", Amount:820}}}}, store_test.send{key:"r4-k1", entry:ledger.Entry{Description:"", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:3}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-219}, ledger.Posting{AccountID:4, Currency:"USD", Amount:216}}}}, store_test.send{key:"r4-k0", entry:ledger.Entry{Description:"b", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:864}, ledger.Posting{AccountID:2, Currency:"USD", Amount:-1684}, ledger.Posting{AccountID:6, Currency:"USD", Amount:820}}}}, store_test.send{key:"r4-k1", entry:ledger.Entry{Description:"", Postings:[]ledger.Posting{ledger.Posting{AccountID:2, Currency:"USD", Amount:3}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-219}, ledger.Posting{AccountID:4, Currency:"USD", Amount:216}}}}, store_test.send{key:"r4-k1", entry:ledger.Entry{Description:"zl", Postings:[]ledger.Posting{ledger.Posting{AccountID:4, Currency:"USD", Amount:534}, ledger.Posting{AccountID:1, Currency:"USD", Amount:-534}}}}}
+# 2026/10/13 10:30:28.789969 [TestPropertyEachKeyPostsOnce/serializable] key r4-k0: a send of the posted entry got {ID:0 Description: CreatedAt:0001-01-01 00:00:00 +0000 UTC Postings:[]}, failed to connect to `user=vivekdavara database=ledger_test`:
+# 	[::1]:5432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300)
+# 	127.0.0.1:5432 (localhost): server error: FATAL: sorry, too many clients already (SQLSTATE 53300); want entry 11
+# 
+v0.4.8#17316681161512694854
+0x1cf475b775609d
+0x1758515198739
+0x1
+0x15af872d842ad0
+0x1258d48e37cbab
+0x3
+0x146ac565d568fa
+0xa444019458649
+0x6
+0x6
+0x6
+0x1
+0x1009b4a84052c9
+0x1c8c2ff1e0fb8b
+0x6
+0x5
+0x5c3b27c135a06
+0x1a0a64d88aca81
+0x0
+0x10f49fc84033c
+0x1
+0x20c2bd6003146
+0x65d2daad5ebc1
+0x151b48e0e1d49c
+0x360
+0x11b201a0c1e496
+0x1577327b9e08be
+0x693
+0x15028f788592c9
+0x10b7bc6cb9111f
+0x2
+0x1
+0x8c60fbdfdacbc
+0x1f25cadfff6464
+0x1
+0x10cc36a32f1c36
+0x124fd42c407492
+0x5
+0xee414d4f03bb
+0x9540314668def
+0x0
+0xb437b54892084
+0x8
+0x1b598b6edf23b
+0x1fd7f6f941f067
+0x1e3a127ff08fc4
+0x192e
+0x18cd
+0x13e0
+0xe38
+0x5c6508cb282f9
+0x175a58d7e49327
+0x6
+0x1
+0x25cd75d3e1415
+0x9c79b427b69ea
+0x0
+0x187d84bffd8cfc
+0x1921f68c4ed6f2
+0x7
+0x7
+0x6
+0x3
+0x28e2108ab479c
+0x26dc70bf07f8a
+0x2c7ca840ff2cb
+0x5f7d5ccb25a01
+0x3
+0x18a749b0cc06d3
+0x122e0bfa4d8a52
+0xda
+0x7947afedc8026
+0x1c8f6d74efe834
+0x2
+0x1
+0x1c2aa5d98ae345
+0x1b3f27e2173d60
+0x3
+0x3edbd5fab4ce3
+0x5627cdce00979
+0x3
+0xf0212f4b7dd39
+0x19f3deb3ef906
+0x0
+0x13148449fc2c3a
+0x101e2569a9a7e
+0x0
+0x3d8dab385ed66
+0x16f7806ab8b125
+0x0
+0x1f92785ec115e5
+0xffffffffffffffff
+0x17dd235ccc0f63
+0x0
+0x13daf7ca609191
+0xb
+0x21d8e6818b14
+0xc3019317862f7
+0x14da3000c2d2b4
+0x216
+0x160e10cbb34118
+0x5
+0x137137647e06ae
+0x2
+0x113fc65e8c731a
+0x6
+0x3
+0x1b25aa0e904403
+0x7
+0x2
+0x127de31c65bffe
+0x2
+0xac6f7ce902516
+0x0
+0x748e075bb6e84
+0x0
+0xd9c3bac5d1998
