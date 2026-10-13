@@ -447,3 +447,57 @@ func TestPublishWritesEventsAsJSONLines(t *testing.T) {
 		t.Fatalf("%d unpublished, %v", unpublished, err)
 	}
 }
+
+// ledgerd reconcile prints the report and exits 0 on a clean ledger, 3 once the books are damaged, and 1, changing
+// nothing, on a schema that isn't current.
+func TestReconcileExitsByWhatItFound(t *testing.T) {
+	db := storetest.Migrated(t)
+	ctx := context.Background()
+	svc := store.New(db)
+	var ids []int64
+	for _, a := range []ledger.NewAccount{{Name: "cash:bank", Type: ledger.Asset, Currency: "USD"},
+		{Name: "wallet:alice", Type: ledger.Liability, Currency: "USD"}} {
+		acct, _, err := svc.CreateAccount(ctx, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, acct.ID)
+	}
+	if _, _, err := svc.PostEntry(ctx, "top-up", ledger.Entry{Postings: []ledger.Posting{
+		{AccountID: ids[0], Currency: "USD", Amount: 500}, {AccountID: ids[1], Currency: "USD", Amount: -500}}}); err != nil {
+		t.Fatal(err)
+	}
+	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, db)}
+	reconcile := func() (int, store.Report, string) {
+		t.Helper()
+		var out, logs bytes.Buffer
+		code := run(ctx, []string{"reconcile"}, env(vars), &out, &logs, nil)
+		var r store.Report
+		if code != 1 {
+			if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+				t.Fatalf("the report isn't JSON: %v: %s", err, out.String())
+			}
+		}
+		return code, r, logs.String()
+	}
+	if code, r, logs := reconcile(); code != 0 || !r.Clean() || r.Entries != 1 || r.Postings != 2 {
+		t.Fatalf("clean ledger: exit %d, report %+v, log %s", code, r, logs)
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM outbox`); err != nil {
+		t.Fatal(err)
+	}
+	if code, r, logs := reconcile(); code != 3 || r.Clean() || !strings.Contains(logs, `"checks":["entry_events"]`) {
+		t.Fatalf("damaged ledger: exit %d, report %+v, log %s", code, r, logs)
+	}
+	// A schema one migration behind: reconcile refuses, and doesn't migrate it.
+	if _, err := db.Exec(ctx, `DELETE FROM schema_migrations WHERE version = (SELECT max(version) FROM schema_migrations)`); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, logs := reconcile(); code != 1 || !strings.Contains(logs, "run ledgerd migrate") {
+		t.Fatalf("old schema: exit %d, log %s", code, logs)
+	}
+	var version int
+	if err := db.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil || version != 8 {
+		t.Fatalf("schema at version %d, %v: reconcile changed it", version, err)
+	}
+}

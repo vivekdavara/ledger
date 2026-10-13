@@ -4,6 +4,9 @@
 //	ledgerd serve     apply pending migrations, then serve REST and gRPC until SIGINT or SIGTERM
 //	ledgerd publish   apply pending migrations, then deliver the outbox's events as JSON lines on stdout, at least
 //	                  once each, until SIGINT or SIGTERM
+//	ledgerd reconcile recompute the books from the postings and print the report as JSON on stdout; exit 0 if it
+//	                  found no difference, 3 if it found some, 1 if it couldn't run. It changes nothing, migrations
+//	                  included: the schema must be current.
 //
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
 // endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103), LEDGER_SHUTDOWN_GRACE (how long in-flight work
@@ -13,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,7 +55,10 @@ func main() {
 type addrs struct{ HTTP, GRPC string }
 
 // commands are ledgerd's subcommands.
-var commands = []string{"migrate", "serve", "publish"}
+var commands = []string{"migrate", "serve", "publish", "reconcile"}
+
+// exitDifferences is reconcile's exit code when it found differences: distinct from 1, its own failure.
+const exitDifferences = 3
 
 // run is main without the process, so tests can drive it: it returns the exit code, and stops serving (or
 // publishing) when ctx is cancelled. If listening isn't nil it receives the servers' addresses once both ports are
@@ -83,6 +90,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return 1
 	}
 	defer db.Close()
+	if args[0] == "reconcile" {
+		return reconcile(ctx, db, stdout, log)
+	}
 	applied, err := store.Migrate(ctx, db)
 	if err != nil {
 		log.Error("migrate", "err", err)
@@ -112,6 +122,37 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	return serve(ctx, db, store.NewWithOptions(db, store.Options{Isolation: isolation}), httpAddr, grpcAddr, grace,
 		log, listening)
+}
+
+// reconcile runs the reconciliation and prints its report (DESIGN.md, "Reconciliation (day 3)").
+func reconcile(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.Logger) int {
+	if err := store.Ready(ctx, db); err != nil {
+		log.Error("reconcile", "err", err)
+		return 1
+	}
+	report, err := store.Reconcile(ctx, db)
+	if err != nil {
+		log.Error("reconcile", "err", err)
+		return 1
+	}
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(report); err != nil {
+		log.Error("write the report", "err", err)
+		return 1
+	}
+	if !report.Clean() {
+		var failed []string
+		for _, c := range report.Checks {
+			if c.Differences > 0 {
+				failed = append(failed, c.Name)
+			}
+		}
+		log.Error("the books don't reconcile", "checks", failed)
+		return exitDifferences
+	}
+	log.Info("reconciled", "entries", report.Entries, "postings", report.Postings)
+	return 0
 }
 
 // publish delivers the outbox's events to out, one JSON line each, until ctx is cancelled (DESIGN.md, "Outbox
