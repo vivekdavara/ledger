@@ -14,7 +14,8 @@ lint:
 test:
 	go test -race -count=1 -timeout 4m ./...
 
-# The cost of the commit-time check (README, "Results"). Needs a quiet machine.
+# README, "Results": the commit-time check's cost (BenchmarkPostEntry) and the service's
+# (BenchmarkServicePostEntry). Needs a quiet machine.
 bench:
 	go test -run '^$$' -bench PostEntry -benchtime 2s -count 3 ./internal/store
 

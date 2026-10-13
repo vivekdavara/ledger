@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/vivekdavara/ledger/internal/ledger"
+	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 )
 
@@ -68,5 +70,51 @@ func benchmarkPostEntry(b *testing.B, n int, check bool) {
 		if err := tx.Commit(ctx); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkServicePostEntry posts the same entries through store.Store.PostEntry, the API's path: validate and
+// hash in Go, then one SERIALIZABLE transaction that looks up the key, locks the accounts, inserts the entry, its
+// postings and the key, and commits. Against BenchmarkPostEntry's check=on rows, the difference is what the
+// service adds. "replay" sends one key again and again: the cost of answering a retry.
+//
+//	go test -run '^$' -bench ServicePostEntry -benchtime 2s -count 5 ./internal/store
+func BenchmarkServicePostEntry(b *testing.B) {
+	for _, n := range []int{2, 8, 64} {
+		b.Run(fmt.Sprintf("postings=%d/new", n), func(b *testing.B) { benchmarkServicePostEntry(b, n, false) })
+		b.Run(fmt.Sprintf("postings=%d/replay", n), func(b *testing.B) { benchmarkServicePostEntry(b, n, true) })
+	}
+}
+
+func benchmarkServicePostEntry(b *testing.B, n int, replay bool) {
+	db := storetest.Migrated(b)
+	s := store.New(db)
+	ctx := context.Background()
+	e := ledger.Entry{Description: "bench", Postings: make([]ledger.Posting, n)}
+	for i := range n {
+		a, _, err := s.CreateAccount(ctx, ledger.NewAccount{Name: fmt.Sprintf("bench:%d", i), Type: ledger.Asset,
+			Currency: "USD", AllowNegative: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		e.Postings[i] = ledger.Posting{AccountID: a.ID, Currency: "USD", Amount: 1 - 2*int64(i%2)}
+	}
+	if _, _, err := s.PostEntry(ctx, "replayed", e); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		key := "replayed"
+		if !replay {
+			i++
+			key = fmt.Sprintf("bench-%d", i)
+		}
+		if _, replayed, err := s.PostEntry(ctx, key, e); err != nil || replayed != replay {
+			b.Fatalf("replayed %v, %v", replayed, err)
+		}
+	}
+	if s.Retries() != 0 {
+		b.Fatalf("%d retries with one client", s.Retries())
 	}
 }
