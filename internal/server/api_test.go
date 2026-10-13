@@ -398,3 +398,28 @@ func TestARequestStuckOnALockGivesUpAtItsDeadline(t *testing.T) {
 		t.Fatalf("after the lock: %d %v", r.code, r.body)
 	}
 }
+
+// A replay is the original answer: the entry is rebuilt from append-only history, so the body is the same bytes.
+func TestAReplayIsTheOriginalResponseByteForByte(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	cash := createAccount(t, h, "cash:bank", "asset", "USD")
+	alice := createAccount(t, h, "wallet:alice", "liability", "USD")
+	body := fmt.Sprintf(`{"description":"top up","postings":[{"account_id":%d,"currency":"USD","amount":"50.00"},
+		{"account_id":%d,"currency":"USD","amount":"-50.00"}]}`, cash, alice)
+	send := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/entries", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "top-up-1")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	first, again := send(), send()
+	if first.Code != http.StatusCreated || again.Code != http.StatusOK {
+		t.Fatalf("statuses %d and %d", first.Code, again.Code)
+	}
+	if first.Body.String() != again.Body.String() {
+		t.Fatalf("the replay differs:\n%s\n%s", first.Body.String(), again.Body.String())
+	}
+}

@@ -260,3 +260,91 @@ func TestDisjointTransfersRetries(t *testing.T) {
 	checkBooks(t, db)
 	t.Logf("%d workers x %d transfers on their own accounts: %d retries, %d gave up", workers, each, s.Retries(), gaveUp)
 }
+
+// History says a page is stable however many postings arrive while a client pages: the next page starts after the
+// last version seen, so postings that arrive in between are neither skipped nor repeated.
+func TestPagingIsStableWhilePostingsArrive(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	s := store.New(db)
+	ids := fundedWallets(t, s, 2, 1000000)
+	ctx := context.Background()
+	pay := func(key string) {
+		if _, _, err := s.PostEntry(ctx, key, ledger.Entry{Postings: []ledger.Posting{
+			pst(ids[0], "USD", 1), pst(ids[1], "USD", -1)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 3 {
+		pay(fmt.Sprintf("before-%d", i))
+	}
+	var seen []int64
+	after := int64(0)
+	for page := 0; ; page++ {
+		if page == 10 { // seven postings in pages of two: a page that repeats would otherwise loop forever
+			t.Fatalf("still paging after 10 pages: %v", seen)
+		}
+		lines, err := s.History(ctx, ids[0], after, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) == 0 {
+			break
+		}
+		for _, l := range lines {
+			seen = append(seen, l.Posting.AccountVersion)
+		}
+		after = lines[len(lines)-1].Posting.AccountVersion
+		if page < 3 {
+			pay(fmt.Sprintf("during-%d", page)) // arrives between pages
+		}
+	}
+	// The funding, three payments before, three during: versions 1 to 7, each once, in order.
+	want := []int64{1, 2, 3, 4, 5, 6, 7}
+	if fmt.Sprint(seen) != fmt.Sprint(want) {
+		t.Fatalf("versions seen %v, want %v", seen, want)
+	}
+}
+
+// Ten creates of one name at once, with two types between them: one creates it, the callers asking for the same
+// account get it back, and the others are told the name is taken.
+func TestConcurrentCreatesWithClashingTypes(t *testing.T) {
+	t.Parallel()
+	s := store.New(storetest.Migrated(t))
+	results := make([]error, 10)
+	created := make([]bool, 10)
+	var wg sync.WaitGroup
+	for i := range 10 {
+		typ := ledger.Asset
+		if i%2 == 1 {
+			typ = ledger.Expense
+		}
+		wg.Go(func() {
+			_, created[i], results[i] = s.CreateAccount(context.Background(),
+				ledger.NewAccount{Name: "contested", Type: typ, Currency: "USD"})
+		})
+	}
+	wg.Wait()
+	fresh, sameType, taken := 0, 0, 0
+	var winner ledger.AccountType
+	for i, err := range results {
+		typ := ledger.Asset
+		if i%2 == 1 {
+			typ = ledger.Expense
+		}
+		switch {
+		case err == nil && created[i]:
+			fresh++
+			winner = typ
+		case err == nil:
+			sameType++
+		case errors.Is(err, ledger.ErrNameTaken):
+			taken++
+		default:
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+	if fresh != 1 || sameType != 4 || taken != 5 {
+		t.Fatalf("%d created, %d got the existing %s account, %d refused; want 1, 4, 5", fresh, sameType, winner, taken)
+	}
+}
