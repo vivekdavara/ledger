@@ -238,7 +238,7 @@ func TestHistoryDefaultAndLargestPages(t *testing.T) {
 func TestDisjointTransfersRetries(t *testing.T) {
 	t.Parallel()
 	atEachLevel(t, func(t *testing.T, level store.Isolation) {
-		db := storetest.Migrated(t)
+		db := storetest.MigratedWithConns(t, 16) // a connection per worker, as on day 2
 		const workers, each = 16, 25
 		ids := fundedWallets(t, store.New(db), 2*workers, 100000)
 		s := at(db, level)

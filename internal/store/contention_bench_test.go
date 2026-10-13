@@ -45,7 +45,7 @@ func BenchmarkContention(b *testing.B) {
 }
 
 func benchmarkContention(b *testing.B, layout string, level store.Isolation, padding int) {
-	db := storetest.Migrated(b)
+	db := storetest.MigratedWithConns(b, contentionWorkers)
 	ctx := context.Background()
 	setup := store.New(db)
 	open := func(name string, typ ledger.AccountType) int64 {

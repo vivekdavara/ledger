@@ -33,9 +33,21 @@ func URL(t testing.TB) string {
 	return url
 }
 
-// EmptySchema creates a new, empty schema and returns a pool whose connections use only that schema. The pool is
-// closed and the schema dropped when the test ends.
+// DefaultConns is the most connections a test's pool opens. Tests run in parallel, eight at a time on this Mac, and
+// Postgres allows 100 connections by default (CI's too): sixteen each ran out ("too many clients") once every
+// concurrency test ran at both isolation levels.
+const DefaultConns = 8
+
+// EmptySchema creates a new, empty schema and returns a pool of up to DefaultConns connections that use only that
+// schema. The pool is closed and the schema dropped when the test ends.
 func EmptySchema(t testing.TB) *pgxpool.Pool {
+	t.Helper()
+	return EmptySchemaWithConns(t, DefaultConns)
+}
+
+// EmptySchemaWithConns is EmptySchema with a pool of up to conns connections, for a test that measures what
+// that many concurrent transactions do.
+func EmptySchemaWithConns(t testing.TB, conns int) *pgxpool.Pool {
 	t.Helper()
 	url := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -51,7 +63,7 @@ func EmptySchema(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("parse %s: %v", EnvURL, err)
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
-	cfg.MaxConns = 16 // enough for the concurrency tests to really run at once
+	cfg.MaxConns = int32(conns)
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -91,7 +103,13 @@ func exec(t testing.TB, ctx context.Context, url, sql string) {
 // Migrated is EmptySchema with every built-in migration applied.
 func Migrated(t testing.TB) *pgxpool.Pool {
 	t.Helper()
-	pool := EmptySchema(t)
+	return MigratedWithConns(t, DefaultConns)
+}
+
+// MigratedWithConns is EmptySchemaWithConns with every built-in migration applied.
+func MigratedWithConns(t testing.TB, conns int) *pgxpool.Pool {
+	t.Helper()
+	pool := EmptySchemaWithConns(t, conns)
 	if _, err := store.Migrate(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
