@@ -109,7 +109,7 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 		"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
 		"LEDGER_HTTP_ADDR":    "127.0.0.1:0", // any free port
 		"LEDGER_GRPC_ADDR":    "127.0.0.1:0",
-		"LEDGER_ISOLATION":    "read-committed",
+		"LEDGER_ISOLATION":    "serializable", // not the default, so the log shows the setting was used
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
@@ -158,7 +158,7 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 		t.Fatalf("read over gRPC: %v, %v", got, err)
 	}
 
-	if !strings.Contains(logs.String(), `"isolation":"read-committed"}`) {
+	if !strings.Contains(logs.String(), `"isolation":"serializable"}`) {
 		t.Errorf("the log doesn't show LEDGER_ISOLATION's level: %s", logs.String())
 	}
 

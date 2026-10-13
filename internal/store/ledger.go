@@ -60,8 +60,11 @@ const (
 	Serializable  Isolation = "serializable"
 )
 
-// DefaultIsolation is the level a Store posts at unless its Options say otherwise.
-const DefaultIsolation = Serializable
+// DefaultIsolation is the level a Store posts at unless its Options say otherwise. Read committed since day 3: every
+// rule holds at both levels, and on a ledger of 20,000 accounts read committed posted 1.2 to 1.7 times as many
+// transfers a second with no retries, where serializable retried 0.55 to 0.80 times a transfer and gave up on 2 to
+// 3% of the transfers to one hot account (DESIGN.md, "Concurrency (day 3)").
+const DefaultIsolation = ReadCommitted
 
 // ParseIsolation reads an isolation level as LEDGER_ISOLATION spells it: "read-committed" or "serializable".
 func ParseIsolation(s string) (Isolation, error) {
