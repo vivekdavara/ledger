@@ -305,6 +305,28 @@ func TestOnePublisherKeepsEachAccountsOrder(t *testing.T) {
 			if err := outbox.CheckOrder(got); err != nil {
 				t.Fatal(err)
 			}
+			// The stream is a complete record: a consumer that dedupes it and adds up each account's postings, in
+			// the order they arrive, ends with every account's balance, and each posting's balance_after is the
+			// running total so far.
+			balances := map[int64]int64{}
+			for _, e := range outbox.Dedupe(map[int64]bool{}, got) {
+				for _, p := range e.Postings {
+					balances[p.AccountID] += p.Amount
+					if p.BalanceAfter != balances[p.AccountID] {
+						t.Fatalf("event %d: account %d's balance_after %d, the stream so far gives %d", e.ID,
+							p.AccountID, p.BalanceAfter, balances[p.AccountID])
+					}
+				}
+			}
+			for id, rebuilt := range balances {
+				a, err := s.Account(context.Background(), id)
+				if err != nil || a.Balance != rebuilt {
+					t.Fatalf("account %d: balance %d (%v), the stream gives %d", id, a.Balance, err, rebuilt)
+				}
+			}
+			if len(balances) != 5 { // cash and the four wallets
+				t.Fatalf("the stream names %d accounts, want 5", len(balances))
+			}
 		})
 	}
 }
