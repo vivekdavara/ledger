@@ -163,7 +163,7 @@ reaches. Netting them into one posting is always possible.
 
 ## Schema
 
-Three migrations, one per kind of rule:
+Three migrations, one per kind of rule, then the fixes and the API's additions:
 
 - `0001_schema.sql`: the tables, and every rule one row can check by itself (types, bounds, foreign keys,
   uniqueness, the overdraft `CHECK`).
@@ -175,6 +175,8 @@ Three migrations, one per kind of rule:
 - `0006_apply_after_insert.sql`: the balance is written by an `AFTER INSERT` trigger, so a row Postgres skips
   moves nothing.
 - `0007_pin_search_path.sql`: every ledger function resolves names in its own schema (see "Limitations").
+- `0008_api.sql` (day 2): the `idempotency_keys` table, and `accounts_balance_negatable`, which keeps every balance
+  above -2^63 so the API's shown balance always fits.
 
 ```
 currencies       code PK, exponent
@@ -184,6 +186,7 @@ journal_entries  id PK, description, posting_count, created_at
 postings         id PK, entry_id → journal_entries, (account_id, currency) → accounts (id, currency),
                  amount, balance_after, account_version,
                  UNIQUE (entry_id, account_id), UNIQUE (account_id, account_version)
+idempotency_keys key PK, request_hash (32 bytes), entry_id → journal_entries UNIQUE, created_at
 ```
 
 Ids are `BIGINT GENERATED ALWAYS AS IDENTITY`: small, ordered, and easy to lock in a fixed order. This is an
@@ -230,9 +233,11 @@ path, which nothing here needs yet.
 
 ## Concurrency (days 2 and 3)
 
-- **Day 2: serializable transactions with retries.** A transfer runs at `SERIALIZABLE`. On a serialization failure
-  (`40001`) or a deadlock (`40P01`) the whole transaction is retried with backoff and jitter, a bounded number of
-  times. Postings are inserted in account-id order, so the row locks are always taken in one order.
+- **Day 2: serializable transactions with retries.** Each attempt at posting an entry is one `SERIALIZABLE`
+  transaction. It locks the entry's accounts in id order (`SELECT ... WHERE id = ANY($1) ORDER BY id FOR UPDATE`;
+  the lock is taken row by row as the sorted rows come out), so two entries never wait for each other in a cycle.
+  Under `SERIALIZABLE`, an attempt that finds an account row changed since its snapshot fails with `40001` instead
+  of waiting, and is retried: see "Posting an entry, step by step" below.
 - **Day 3: row locking compared with optimistic concurrency.** The same transfer under `READ COMMITTED`, where
   concurrent updates of an account row wait for each other, against `SERIALIZABLE`, where one of them fails and
   retries. The comparison measures throughput and retries on a hot account and on spread-out accounts. A property
@@ -241,18 +246,129 @@ path, which nothing here needs yet.
 
 ## API (day 2)
 
-gRPC on port 9103 and REST on 8103, both thin layers over one service:
+Two thin layers over one service. `ledger.Service` (`internal/ledger/service.go`) is the interface, `store.Store`
+(`internal/store/ledger.go`) the implementation; the REST layer (`internal/server/api.go`, port 8103) and the gRPC
+layer (`internal/grpcapi`, port 9103, `proto/ledger/v1/ledger.proto`) only translate requests and errors.
 
-- `CreateAccount(name, type, currency, allow_negative)`
-- `PostEntry(idempotency_key, description, postings[])`: atomic and serializable. Errors are distinct: unbalanced,
-  unknown account, currency mismatch, insufficient funds, idempotency-key reuse with a different request.
-- `GetAccount(id)`: the balance, both stored and as shown.
-- `ListPostings(account_id, after_version, limit)`: the history, paginated by version.
+| Operation | REST | gRPC |
+|---|---|---|
+| Create an account | `POST /v1/accounts` | `CreateAccount` |
+| Read an account | `GET /v1/accounts/{id}` | `GetAccount` |
+| An account's history | `GET /v1/accounts/{id}/postings?after_version=&limit=` | `ListPostings` |
+| Post an entry | `POST /v1/entries` with an `Idempotency-Key` header | `PostEntry` (`idempotency_key` field) |
 
-**Idempotency keys.** The client sends a key with each `PostEntry`. The key, a hash of the canonical request and
-the resulting entry id are stored in the same transaction as the entry. A retry with the same key and request
-returns the original entry; the same key with a different request is rejected. Exactly-once effects under retries
-and crashes is what day 4 tests by failure injection.
+**Amounts.** gRPC carries `int64` minor units, the service's own representation. REST carries decimal strings in
+the currency's major unit (`"20.00"`, `"-19.40"`, `"1500"` for JPY), read by `money.Parse` and written by
+`money.Format`. So a REST client never handles a float, `"12.345"` in USD is a 400 rather than a rounding, and a
+balance beyond 2^53 minor units stays exact in JavaScript, which a JSON number would not.
+
+**The shown balance.** An account is returned with its stored `balance` (debits positive) and its `shown_balance`,
+positive on the account's normal side (`Account.Shown`). Negating a `bigint` fails for exactly one value, -2^63,
+so migration 0008 adds `accounts_balance_negatable CHECK (balance > -9223372036854775808)`: the range is
+symmetric and the shown balance always fits.
+
+**Creating accounts is idempotent by name.** Names are unique, so a retried `CreateAccount` finds its account:
+the same name, type, currency and overdraft setting returns the existing account (`created` false, HTTP 200
+instead of 201). The same name with anything else different is `account_name_taken`. Implemented as `INSERT ...
+ON CONFLICT ON CONSTRAINT accounts_name_unique DO NOTHING RETURNING`, then a `SELECT` by name when nothing came
+back; under `READ COMMITTED` that `SELECT` sees the row the conflicting insert committed.
+
+**History pages by version.** `after_version` and a limit (1 to 1000, default 100). Versions are dense and never
+change, so a page is stable while new postings arrive, and the next page starts after the last version seen;
+`next_after_version` is set when a page is full. The account check and the page come from one statement (a
+`LEFT JOIN LATERAL`), so "no such account" and "no postings yet" can't be confused.
+
+### Idempotency keys
+
+A client sends a key with every `PostEntry` and the same key when it retries; the key is required.
+
+- **Format:** 1 to 200 visible ASCII characters (`ValidKey`; the database checks the same rule), so a key travels
+  in an HTTP header unchanged. The header value is the key as is: `"abc"` with quotes is a different key from
+  `abc`.
+- **What is stored:** `idempotency_keys (key, request_hash, entry_id)`, inserted in the entry's own transaction.
+  The key and the entry commit together or not at all.
+- **What the hash covers:** `Entry.Hash` is a SHA-256 of a canonical JSON encoding of the description and the
+  postings sorted by account id. Each account appears once in an entry, so the sorted postings are the entry's
+  set of postings: a retry that lists them in another order is the same request, while any change of amount,
+  account, currency or description is a different one.
+- **A retry with the same request** finds the key and gets the original entry back, rebuilt from the database:
+  entries and postings are append-only, so the rebuilt answer is the original, field for field. REST answers 200
+  with `Idempotent-Replayed: true` (201 the first time); gRPC sets `replayed`. Keys are one namespace across both
+  APIs: a REST request's key replays over gRPC.
+- **The same key with a different request** is refused (`idempotency_key_reused`). Validation runs first, so a
+  malformed request is reported as malformed whatever its key.
+- **A rejected request leaves no trace,** its key included: a rejection is decided by the request and the state of
+  the accounts at the time, and its transaction rolls back. A client that retries after "insufficient funds" gets
+  whatever the accounts say now. The effect still happens at most once per key. Stripe stores rejections too; that
+  needs a second transaction per failure and was left out.
+- **Concurrent requests with one key:** each reads the key as unused, the first to lock the accounts posts, and the
+  others fail on the locked rows with `40001` (or on the key's primary key with `23505`), retry, find the key and
+  replay. `TestConcurrentRetriesOfOneRequestPostOnce` makes twelve requests read the key before any proceeds:
+  one posts and eleven replay.
+- **Keys never expire yet.** A retention job (delete keys older than, say, 30 days) would bound the table; a retry
+  after that would post again.
+
+### Posting an entry, step by step
+
+`Store.PostEntry` validates the key and the entry (`Entry.Validate`), hashes the entry, then runs attempts:
+
+1. `BEGIN ISOLATION LEVEL SERIALIZABLE`.
+2. Look up the key. The same hash: load the entry, commit, return it as a replay. A different hash:
+   `ErrKeyReused`. This first statement also fixes the transaction's snapshot.
+3. Lock the entry's accounts in id order with `FOR UPDATE`, and check what needs them, naming the posting at fault:
+   the account exists (`unknown_account`), is in the posting's currency (`currency_mismatch`), isn't overdrawn by it
+   (`insufficient_funds`, the same rule as the `accounts_no_overdraft` CHECK, in `Account.Overdraws`), and keeps a
+   balance the ledger can store (`balance_out_of_range`).
+4. Insert the entry, then all its postings in one statement, in account-id order (`INSERT ... SELECT FROM unnest(...)
+   WITH ORDINALITY ... ORDER BY n`). The triggers fill in `balance_after` and `account_version`; the row locks they
+   take are already held.
+5. Insert the key.
+6. Commit: the deferred checks run here.
+
+When an attempt fails with `40001` (serialization failure), `40P01` (deadlock) or a unique violation on the key,
+the whole attempt is retried after a "full jitter" wait: uniform between zero and min(100 ms, 1 ms × 2^(n−1)),
+so transactions that collided don't collide again in step. After 10 attempts the result is `ErrConflict`
+(`conflict`, HTTP 409, gRPC `ABORTED`): safe to retry with the same key. Nothing else is retried; a lost
+connection is reported as `unavailable` (503), and the client's retry with its key is what makes that safe.
+
+The service checks every rule before the database does, for the errors' sake; the database checks them all again.
+If the database rejects something the service let through, `translate` maps the constraint name to the same error.
+
+### Errors
+
+One table (`internal/apierr`) gives each error a stable reason, an HTTP status and a gRPC code, so the two APIs
+can't disagree. REST answers `{"error": {"reason", "message", "posting"}}`; gRPC answers a status with a
+`google.rpc.ErrorInfo` whose reason is the same word in capitals and whose metadata `posting` names the posting at
+fault (its index in the request).
+
+| Reason | Meaning | HTTP | gRPC |
+|---|---|---|---|
+| `malformed_request` | not one JSON object, an unknown field, a missing `Idempotency-Key` | 400 | `INVALID_ARGUMENT` |
+| `invalid_argument` | a rule the request alone breaks: counts, amounts, currencies, names, types, keys, pages | 400 | `INVALID_ARGUMENT` |
+| `unbalanced` | postings don't sum to zero in some currency | 400 | `INVALID_ARGUMENT` |
+| `not_found` | the account in the request's path | 404 | `NOT_FOUND` |
+| `unknown_account` | an account a posting names | 422 | `NOT_FOUND` |
+| `currency_mismatch` | the posting's currency isn't its account's | 422 | `FAILED_PRECONDITION` |
+| `insufficient_funds` | the posting would overdraw a protected account | 422 | `FAILED_PRECONDITION` |
+| `balance_out_of_range` | the balance would leave the range the ledger stores | 422 | `FAILED_PRECONDITION` |
+| `idempotency_key_reused` | the key posted a different entry | 422 | `FAILED_PRECONDITION` |
+| `account_name_taken` | the name belongs to a different account | 409 | `ALREADY_EXISTS` |
+| `conflict` | the retries ran out under contention; retry with the same key | 409 | `ABORTED` |
+| `unavailable` | the database didn't answer | 503 | `UNAVAILABLE` |
+| `internal` | anything else | 500 | `INTERNAL` |
+
+400 means the same request would fail against any ledger; 422 means it is well formed but this ledger's state
+refuses it. `unknown_account` is 422 and not 404 because a 404 from `POST /v1/entries` would read as "no such
+endpoint". `unavailable` and `internal` errors are logged in full and the client sees only the status text, since
+their messages can name hosts or queries.
+
+### Generated code
+
+There is no `protoc` or `buf` on this Mac, so the generators are Go tools pinned in their own module,
+`tools/go.mod` (buf v1.73.0, protoc-gen-go v1.36.12, protoc-gen-go-grpc v1.6.2, grpcurl v1.9.4), and run with
+`go tool -modfile=tools/go.mod`. Their dependencies stay out of the service's `go.mod`. `make proto` lints the
+proto file with buf's `STANDARD` rules and regenerates `internal/gen`; the generated code is committed, so a build
+never needs the generators.
 
 ## Outbox and reconciliation (day 3)
 
