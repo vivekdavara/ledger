@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
@@ -224,5 +225,49 @@ func TestRESTErrors(t *testing.T) {
 	}
 	if r := call(t, h, "POST", "/v1/entries", "big", `{"description":"`+strings.Repeat("x", 70<<10)+`"}`); r.code != 400 {
 		t.Errorf("a 70 KB body: %d %v", r.code, r.body)
+	}
+}
+
+func TestARequestStuckOnALockGivesUpAtItsDeadline(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	h := server.NewWithTimeout(func(ctx context.Context) error { return store.Ready(ctx, db) }, store.New(db), quiet,
+		300*time.Millisecond)
+	cash := createAccount(t, h, "cash:bank", "asset", "USD")
+	alice := createAccount(t, h, "wallet:alice", "liability", "USD")
+	pay := fmt.Sprintf(`{"postings":[{"account_id":%d,"currency":"USD","amount":"1.00"},
+		{"account_id":%d,"currency":"USD","amount":"-1.00"}]}`, cash, alice)
+	// Another session holds Alice's row, as a stuck psql session might.
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE`, alice); err != nil {
+		t.Fatal(err)
+	}
+	// The client's own 10 s deadline is a backstop: without the server's bound this test fails on the time
+	// taken, instead of hanging.
+	backstop, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("POST", "/v1/entries", strings.NewReader(pay)).WithContext(backstop)
+	req.Header.Set("Idempotency-Key", "pay-1")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	h.ServeHTTP(rec, req)
+	took := time.Since(start)
+	if rec.Code != http.StatusGatewayTimeout || !strings.Contains(rec.Body.String(), `"deadline_exceeded"`) {
+		t.Fatalf("got %d %s, want 504 deadline_exceeded", rec.Code, rec.Body.String())
+	}
+	if took > 5*time.Second {
+		t.Fatalf("gave up after %v, not at the server's 300 ms bound", took)
+	}
+	// Nothing was posted and the key wasn't used up: once the lock is gone, the same request posts.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := call(t, h, "POST", "/v1/entries", "pay-1", pay); r.code != http.StatusCreated {
+		t.Fatalf("after the lock: %d %v", r.code, r.body)
 	}
 }

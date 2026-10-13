@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,17 +128,33 @@ func toPostedEntryJSON(e ledger.PostedEntry) postedEntryJSON {
 	return out
 }
 
+// RequestTimeout bounds each API request. One stuck behind a lock (a psql session holding an account's row, say)
+// fails with 504 deadline_exceeded instead of holding a connection and a database session for as long as the
+// client waits. It is below the server's 30 s write timeout, so the client always gets the answer.
+const RequestTimeout = 10 * time.Second
+
 // api holds the REST handlers.
 type api struct {
-	svc ledger.Service
-	log *slog.Logger
+	svc     ledger.Service
+	log     *slog.Logger
+	timeout time.Duration
 }
 
 func (a api) routes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/accounts", a.createAccount)
-	mux.HandleFunc("GET /v1/accounts/{id}", a.getAccount)
-	mux.HandleFunc("GET /v1/accounts/{id}/postings", a.history)
-	mux.HandleFunc("POST /v1/entries", a.postEntry)
+	mux.HandleFunc("POST /v1/accounts", a.bounded(a.createAccount))
+	mux.HandleFunc("GET /v1/accounts/{id}", a.bounded(a.getAccount))
+	mux.HandleFunc("GET /v1/accounts/{id}/postings", a.bounded(a.history))
+	mux.HandleFunc("POST /v1/entries", a.bounded(a.postEntry))
+}
+
+// bounded gives a handler's request a deadline of a.timeout. The database calls under it are cancelled when it
+// passes; a posting whose outcome that leaves unknown is what the idempotency key is for.
+func (a api) bounded(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), a.timeout)
+		defer cancel()
+		h(w, r.WithContext(ctx))
+	}
 }
 
 // createAccount answers 201 with a Location for a new account, and 200 with the existing account when an identical

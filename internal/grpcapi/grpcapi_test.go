@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
 	"github.com/vivekdavara/ledger/internal/grpcapi"
@@ -182,5 +183,47 @@ func TestGRPCErrorsCarryTheReason(t *testing.T) {
 		Postings: []*ledgerv1.Posting{posting(alice, 1001), posting(cash, -1001)}})
 	if !strings.Contains(status.Convert(err).Message(), "has 10.00 USD, the posting takes 10.01") {
 		t.Fatalf("message %q", status.Convert(err).Message())
+	}
+}
+
+func TestACallStuckOnALockGivesUpAtTheServersBound(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	lis := bufconn.Listen(1 << 20)
+	srv := grpcapi.NewWithMaxCallTime(store.New(db), quiet, 300*time.Millisecond)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	conn, err := grpc.NewClient("passthrough:///ledger",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := ledgerv1.NewLedgerServiceClient(conn)
+	cash := open(t, c, "cash:bank", ledgerv1.AccountType_ACCOUNT_TYPE_ASSET, "USD")
+	alice := open(t, c, "wallet:alice", ledgerv1.AccountType_ACCOUNT_TYPE_LIABILITY, "USD")
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE`, alice); err != nil {
+		t.Fatal(err)
+	}
+	// The client's deadline is 10 s, later than the server's bound, which therefore applies. It is also a
+	// backstop: without the bound this test fails on the time taken, instead of hanging.
+	backstop, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = c.PostEntry(backstop, &ledgerv1.PostEntryRequest{IdempotencyKey: "pay-1",
+		Postings: []*ledgerv1.Posting{posting(cash, 100), posting(alice, -100)}})
+	took := time.Since(start)
+	if code, reason, _ := failure(t, err); code != codes.DeadlineExceeded || reason != "DEADLINE_EXCEEDED" {
+		t.Fatalf("got %v %s, want DEADLINE_EXCEEDED", code, reason)
+	}
+	if took > 5*time.Second {
+		t.Fatalf("gave up after %v, not at the server's 300 ms bound", took)
 	}
 }

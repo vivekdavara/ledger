@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vivekdavara/ledger/internal/apierr"
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
@@ -26,9 +27,20 @@ const ErrorDomain = "ledger.vivekdavara.github.com"
 // maxMessage bounds a request. The largest valid entry (64 postings, a 500-character description) is under 4 KB.
 const maxMessage = 64 << 10
 
+// MaxCallTime bounds each call, as RequestTimeout does each REST request: a client's own deadline applies when it
+// is sooner, and a call without one gets this.
+const MaxCallTime = 10 * time.Second
+
 // New returns a gRPC server with LedgerService and server reflection (for grpcurl) registered.
-func New(svc ledger.Service, log *slog.Logger) *grpc.Server {
-	s := grpc.NewServer(grpc.MaxRecvMsgSize(maxMessage))
+func New(svc ledger.Service, log *slog.Logger) *grpc.Server { return newServer(svc, log, MaxCallTime) }
+
+func newServer(svc ledger.Service, log *slog.Logger, maxCall time.Duration) *grpc.Server {
+	bound := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+		ctx, cancel := context.WithTimeout(ctx, maxCall) // keeps the client's deadline if that is sooner
+		defer cancel()
+		return next(ctx, req)
+	}
+	s := grpc.NewServer(grpc.MaxRecvMsgSize(maxMessage), grpc.UnaryInterceptor(bound))
 	ledgerv1.RegisterLedgerServiceServer(s, &service{svc: svc, log: log})
 	reflection.Register(s)
 	return s

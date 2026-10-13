@@ -362,6 +362,14 @@ refuses it. `unknown_account` is 422 and not 404 because a 404 from `POST /v1/en
 endpoint". `unavailable` and `internal` errors are logged in full and the client sees only the status text, since
 their messages can name hosts or queries.
 
+### Deadlines
+
+Each REST request and each gRPC call gets at most 10 s (`server.RequestTimeout`, `grpcapi.MaxCallTime`); a
+client's own sooner deadline wins. When it passes, pgx cancels the database work and the answer is
+`deadline_exceeded` (504, gRPC `DEADLINE_EXCEEDED`). Without it, a request stuck behind a lock (a `psql` session
+holding an account's row, say) would hold a connection and a database session for as long as its client waited.
+A deadline during the commit leaves the outcome unknown to the client; retrying with the same key settles it.
+
 ### Generated code
 
 There is no `protoc` or `buf` on this Mac, so the generators are Go tools pinned in their own module,
@@ -422,3 +430,13 @@ response, then retries it with the same idempotency key, and checks that the eff
 - **No business time yet.** `created_at` is when the entry was recorded. A separate effective date (for
   backdated corrections) is a later addition.
 - **Single-currency accounts.** A multi-currency customer has one account per currency.
+- **No authentication or tenants (day 2).** Any client that reaches the ports can post. Keys are one namespace for
+  all clients, so two clients choosing the same key collide (the second gets `idempotency_key_reused`, or a replay
+  of the first's entry if the entries are identical). A multi-tenant API would scope keys by client.
+- **Idempotency keys never expire.** The table grows with every entry. A retention job would bound it, at the
+  price that a retry later than the retention period posts again.
+- **Retries cost more than waits on a hot account.** Under `SERIALIZABLE`, concurrent entries on one account abort
+  and retry instead of queueing on the row lock. With enough contention the 10 attempts run out (`conflict`). Day 3
+  compares this with `READ COMMITTED`, where they wait instead.
+- **A request's outcome can be unknown to its client.** If the connection drops during the commit, the client can't
+  tell whether the entry posted; retrying with the same key is the answer, which is why the key is required.

@@ -24,9 +24,13 @@ const readyTimeout = 2 * time.Second
 //   - GET /readyz answers 200 when ready reports nil, and 503 with the reason otherwise, so a load balancer stops
 //     sending requests that would fail.
 func New(ready ReadyFunc, svc ledger.Service, log *slog.Logger) http.Handler {
+	return newHandler(ready, svc, log, RequestTimeout)
+}
+
+func newHandler(ready ReadyFunc, svc ledger.Service, log *slog.Logger, timeout time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	if svc != nil {
-		api{svc, log}.routes(mux)
+		api{svc, log, timeout}.routes(mux)
 	}
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
