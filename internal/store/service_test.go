@@ -402,7 +402,7 @@ func waitUntilBlocked(db *pgxpool.Pool, holder, n int) bool {
 func TestASerializationFailureIsRetried(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
-	s := store.New(db)
+	s := at(db, store.Serializable)
 	b := wallets(t, s)
 	// On the first attempt, another transaction pays $10 from Alice's wallet and commits while the attempt waits
 	// for her row. The attempt fails with 40001, and the second posts against the new balance.
@@ -427,7 +427,7 @@ func TestASerializationFailureIsRetried(t *testing.T) {
 func TestRetriesRunOut(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
-	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 3})
+	s := at(db, store.Serializable, store.RetryPolicy{Attempts: 3})
 	b := wallets(t, s)
 	store.SetHook(s, func(point string, attempt int) {
 		if point == "begin" {
@@ -455,7 +455,7 @@ func TestRetriesRunOut(t *testing.T) {
 func TestARetryWaitsForTheContext(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
-	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 5, BaseDelay: time.Hour, MaxDelay: time.Hour})
+	s := at(db, store.Serializable, store.RetryPolicy{Attempts: 5, BaseDelay: time.Hour, MaxDelay: time.Hour})
 	b := wallets(t, s)
 	ctx, cancel := context.WithCancel(context.Background())
 	store.SetHook(s, func(point string, attempt int) {
@@ -478,94 +478,98 @@ func TestARetryWaitsForTheContext(t *testing.T) {
 
 func TestConcurrentRetriesOfOneRequestPostOnce(t *testing.T) {
 	t.Parallel()
-	db := storetest.Migrated(t)
-	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 50, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
-	b := wallets(t, s)
-	const n = 12
-	// Every request finds the key unused before any of them goes on, so they all race to post.
-	var arrived sync.WaitGroup
-	arrived.Add(n)
-	store.SetHook(s, func(point string, attempt int) {
-		if point == "looked up" && attempt == 1 {
-			arrived.Done()
-			arrived.Wait()
-		}
-	})
-	ids := make([]int64, n)
-	fresh := 0
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for i := range n {
-		wg.Go(func() {
-			posted, replayed, err := s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
-			if err != nil {
-				t.Errorf("request %d: %v", i, err)
-				return
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			ids[i] = posted.ID
-			if !replayed {
-				fresh++
+	atEachLevel(t, func(t *testing.T, level store.Isolation) {
+		db := storetest.Migrated(t)
+		s := at(db, level, store.RetryPolicy{Attempts: 50, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
+		b := wallets(t, s)
+		const n = 12
+		// Every request finds the key unused before any of them goes on, so they all race to post.
+		var arrived sync.WaitGroup
+		arrived.Add(n)
+		store.SetHook(s, func(point string, attempt int) {
+			if point == "looked up" && attempt == 1 {
+				arrived.Done()
+				arrived.Wait()
 			}
 		})
-	}
-	wg.Wait()
-	for _, id := range ids {
-		if id != ids[0] {
-			t.Fatalf("entry ids %v, want one entry", ids)
+		ids := make([]int64, n)
+		fresh := 0
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				posted, replayed, err := s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
+				if err != nil {
+					t.Errorf("request %d: %v", i, err)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				ids[i] = posted.ID
+				if !replayed {
+					fresh++
+				}
+			})
 		}
-	}
-	if fresh != 1 {
-		t.Fatalf("%d requests posted, want 1 (the rest replayed)", fresh)
-	}
-	if bal, ver := balanceOf(t, db, b.alice); bal != -3000 || ver != 2 {
-		t.Fatalf("alice: balance %d version %d, want one payment", bal, ver)
-	}
-	if s.Retries() < n-1 {
-		t.Fatalf("%d retries; each of the %d requests that lost the race should have retried", s.Retries(), n-1)
-	}
+		wg.Wait()
+		for _, id := range ids {
+			if id != ids[0] {
+				t.Fatalf("entry ids %v, want one entry", ids)
+			}
+		}
+		if fresh != 1 {
+			t.Fatalf("%d requests posted, want 1 (the rest replayed)", fresh)
+		}
+		if bal, ver := balanceOf(t, db, b.alice); bal != -3000 || ver != 2 {
+			t.Fatalf("alice: balance %d version %d, want one payment", bal, ver)
+		}
+		if s.Retries() < n-1 {
+			t.Fatalf("%d retries; each of the %d requests that lost the race should have retried", s.Retries(), n-1)
+		}
+	})
 }
 
 // TestConcurrentTransfersKeepTheBooks runs random payments between a few accounts from many goroutines at once, so
 // they collide on the same rows, and then recomputes the ledger.
 func TestConcurrentTransfersKeepTheBooks(t *testing.T) {
 	t.Parallel()
-	db := storetest.Migrated(t)
-	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 100, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
-	ids := fundedWallets(t, s, 4, 10000)
-	const workers, each = 8, 10
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	rejected := 0
-	for w := range workers {
-		wg.Go(func() {
-			for i := range each {
-				from, to := ids[(w+i)%len(ids)], ids[(w+2*i+1)%len(ids)]
-				if from == to {
-					to = ids[(w+2*i+2)%len(ids)]
+	atEachLevel(t, func(t *testing.T, level store.Isolation) {
+		db := storetest.Migrated(t)
+		s := at(db, level, store.RetryPolicy{Attempts: 100, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
+		ids := fundedWallets(t, s, 4, 10000)
+		const workers, each = 8, 10
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		rejected := 0
+		for w := range workers {
+			wg.Go(func() {
+				for i := range each {
+					from, to := ids[(w+i)%len(ids)], ids[(w+2*i+1)%len(ids)]
+					if from == to {
+						to = ids[(w+2*i+2)%len(ids)]
+					}
+					e := ledger.Entry{Description: "transfer", Postings: []ledger.Posting{
+						pst(from, "USD", int64(100+37*i)), pst(to, "USD", -int64(100+37*i))}}
+					_, _, err := s.PostEntry(context.Background(), fmt.Sprintf("w%d-%d", w, i), e)
+					switch {
+					case errors.Is(err, ledger.ErrInsufficientFunds):
+						mu.Lock()
+						rejected++
+						mu.Unlock()
+					case err != nil:
+						t.Errorf("worker %d transfer %d: %v", w, i, err)
+					}
 				}
-				e := ledger.Entry{Description: "transfer", Postings: []ledger.Posting{
-					pst(from, "USD", int64(100+37*i)), pst(to, "USD", -int64(100+37*i))}}
-				_, _, err := s.PostEntry(context.Background(), fmt.Sprintf("w%d-%d", w, i), e)
-				switch {
-				case errors.Is(err, ledger.ErrInsufficientFunds):
-					mu.Lock()
-					rejected++
-					mu.Unlock()
-				case err != nil:
-					t.Errorf("worker %d transfer %d: %v", w, i, err)
-				}
-			}
-		})
-	}
-	wg.Wait()
-	checkBooks(t, db)
-	posted := count(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE 'w%'`)
-	if posted+rejected != workers*each {
-		t.Fatalf("%d posted and %d rejected of %d", posted, rejected, workers*each)
-	}
-	t.Logf("%d posted, %d rejected for funds, %d retries", posted, rejected, s.Retries())
+			})
+		}
+		wg.Wait()
+		checkBooks(t, db)
+		posted := count(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE 'w%'`)
+		if posted+rejected != workers*each {
+			t.Fatalf("%d posted and %d rejected of %d", posted, rejected, workers*each)
+		}
+		t.Logf("%d posted, %d rejected for funds, %d retries", posted, rejected, s.Retries())
+	})
 }
 
 // fundedWallets creates n customer wallets and gives each one the same amount from a cash account.

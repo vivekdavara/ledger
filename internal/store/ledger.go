@@ -49,26 +49,83 @@ func (p RetryPolicy) delay(n int) time.Duration {
 	return rand.N(ceiling)
 }
 
+// Isolation is the isolation level of PostEntry's transactions (DESIGN.md, "Concurrency (day 3)"). Both levels keep
+// every rule: an attempt decides only on rows it has locked and rows it wrote itself. They differ in what a
+// concurrent change to a locked account does to an attempt: at ReadCommitted it waits for the row and goes on with
+// the row as committed; at Serializable it waits and then fails with 40001, and is retried.
+type Isolation string
+
+const (
+	ReadCommitted Isolation = "read-committed"
+	Serializable  Isolation = "serializable"
+)
+
+// DefaultIsolation is the level a Store posts at unless its Options say otherwise.
+const DefaultIsolation = Serializable
+
+// ParseIsolation reads an isolation level as LEDGER_ISOLATION spells it: "read-committed" or "serializable".
+func ParseIsolation(s string) (Isolation, error) {
+	switch level := Isolation(s); level {
+	case ReadCommitted, Serializable:
+		return level, nil
+	}
+	return "", fmt.Errorf("unknown isolation level %q: use %s or %s", s, ReadCommitted, Serializable)
+}
+
+func (i Isolation) txOptions() pgx.TxOptions {
+	if i == ReadCommitted {
+		return pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
+	}
+	return pgx.TxOptions{IsoLevel: pgx.Serializable}
+}
+
+// Options configure a Store. The zero value is DefaultRetry at DefaultIsolation.
+type Options struct {
+	Retry     *RetryPolicy // nil means DefaultRetry
+	Isolation Isolation    // "" means DefaultIsolation
+}
+
 // Store is the ledger service: every operation the REST and gRPC APIs offer, over one connection pool.
 type Store struct {
-	db      *pgxpool.Pool
-	retry   RetryPolicy
-	retries atomic.Int64
+	db        *pgxpool.Pool
+	retry     RetryPolicy
+	isolation Isolation
+	retries   atomic.Int64
 
 	// hook, when set by a test, runs at named points of a PostEntry attempt.
 	hook func(point string, attempt int)
 }
 
-// New returns a Store that posts with DefaultRetry.
-func New(db *pgxpool.Pool) *Store { return NewWithRetry(db, DefaultRetry) }
+// New returns a Store that posts with DefaultRetry at DefaultIsolation.
+func New(db *pgxpool.Pool) *Store { return NewWithOptions(db, Options{}) }
 
-// NewWithRetry returns a Store with its own retry policy.
+// NewWithRetry returns a Store with its own retry policy, at DefaultIsolation.
 func NewWithRetry(db *pgxpool.Pool, retry RetryPolicy) *Store {
+	return NewWithOptions(db, Options{Retry: &retry})
+}
+
+// NewWithOptions returns a Store configured by opts. It panics on an isolation level ParseIsolation wouldn't
+// accept: that is a programming error, and posting at an unintended level must not happen quietly.
+func NewWithOptions(db *pgxpool.Pool, opts Options) *Store {
+	retry := DefaultRetry
+	if opts.Retry != nil {
+		retry = *opts.Retry
+	}
 	retry.Attempts = max(retry.Attempts, 1)
 	retry.BaseDelay = max(retry.BaseDelay, 0)
 	retry.MaxDelay = max(retry.MaxDelay, retry.BaseDelay)
-	return &Store{db: db, retry: retry}
+	isolation := opts.Isolation
+	if isolation == "" {
+		isolation = DefaultIsolation
+	}
+	if _, err := ParseIsolation(string(isolation)); err != nil {
+		panic(err)
+	}
+	return &Store{db: db, retry: retry, isolation: isolation}
 }
+
+// Isolation is the level the store posts at.
+func (s *Store) Isolation() Isolation { return s.isolation }
 
 // Retries is the number of PostEntry attempts retried so far, after a serialization failure or a deadlock.
 func (s *Store) Retries() int64 { return s.retries.Load() }
@@ -206,12 +263,12 @@ func (s *Store) History(ctx context.Context, accountID, afterVersion int64, limi
 // was already used for the same entry returns that entry with replayed true and posts nothing; a key used for a
 // different entry is ErrKeyReused. A rejected request leaves no trace, its key included.
 //
-// Each attempt first looks the key up, outside any transaction, and then posts in one SERIALIZABLE transaction. That
-// transaction locks the entry's accounts in id order, so two entries never wait for each other's locks in a cycle,
-// and checks the rules that need the accounts while it holds them, to say which posting broke which rule. The
-// database checks every rule again. When Postgres aborts an attempt to keep the transactions serializable (40001)
-// or to break a deadlock (40P01), or another request commits the same key first (23505), PostEntry retries it under
-// the store's RetryPolicy, and returns ErrConflict once the attempts run out.
+// Each attempt first looks the key up, outside any transaction, and then posts in one transaction at the store's
+// isolation level. That transaction locks the entry's accounts in id order, so two entries never wait for each
+// other's locks in a cycle, and checks the rules that need the accounts while it holds them, to say which posting
+// broke which rule. The database checks every rule again. When Postgres aborts an attempt to keep the transactions
+// serializable (40001) or to break a deadlock (40P01), or another request commits the same key first (23505),
+// PostEntry retries it under the store's RetryPolicy, and returns ErrConflict once the attempts run out.
 func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	posted ledger.PostedEntry, replayed bool, err error) {
 	if err := ledger.ValidKey(key); err != nil {
@@ -302,7 +359,7 @@ func (s *Store) at(point string, attempt int) {
 
 func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.Entry, attempt int) (
 	ledger.PostedEntry, error) {
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.db.BeginTx(ctx, s.isolation.txOptions())
 	if err != nil {
 		return ledger.PostedEntry{}, translate(err)
 	}

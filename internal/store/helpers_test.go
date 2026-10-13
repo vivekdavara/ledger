@@ -8,7 +8,32 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/store"
 )
+
+// levels are the isolation levels a Store can post at. The tests of what PostEntry guarantees under concurrency run
+// at each of them (atEachLevel).
+var levels = []store.Isolation{store.ReadCommitted, store.Serializable}
+
+// atEachLevel runs test once per isolation level, as parallel subtests named after the level.
+func atEachLevel(t *testing.T, test func(t *testing.T, level store.Isolation)) {
+	t.Helper()
+	for _, level := range levels {
+		t.Run(string(level), func(t *testing.T) {
+			t.Parallel()
+			test(t, level)
+		})
+	}
+}
+
+// at returns a store posting at the given level, with the default retry policy unless one is given.
+func at(db *pgxpool.Pool, level store.Isolation, retry ...store.RetryPolicy) *store.Store {
+	opts := store.Options{Isolation: level}
+	if len(retry) > 0 {
+		opts.Retry = &retry[0]
+	}
+	return store.NewWithOptions(db, opts)
+}
 
 // constraint returns the name of the constraint a Postgres error reports, or "" for any other error.
 func constraint(err error) string {
