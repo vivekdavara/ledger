@@ -37,18 +37,18 @@ func get(t *testing.T, h http.Handler, method, path string) (int, map[string]str
 }
 
 func TestLivezNeedsNothing(t *testing.T) {
-	h := server.New(func(context.Context) error { return errors.New("database is down") }, quiet)
+	h := server.New(func(context.Context) error { return errors.New("database is down") }, nil, quiet)
 	if code, body := get(t, h, "GET", "/livez"); code != 200 || body["status"] != "alive" {
 		t.Fatalf("got %d %v; want 200 alive even with the database down", code, body)
 	}
 }
 
 func TestReadyzReportsTheReason(t *testing.T) {
-	ready := server.New(func(context.Context) error { return nil }, quiet)
+	ready := server.New(func(context.Context) error { return nil }, nil, quiet)
 	if code, body := get(t, ready, "GET", "/readyz"); code != 200 || body["status"] != "ready" {
 		t.Fatalf("got %d %v", code, body)
 	}
-	down := server.New(func(context.Context) error { return errors.New("database unavailable: refused") }, quiet)
+	down := server.New(func(context.Context) error { return errors.New("database unavailable: refused") }, nil, quiet)
 	code, body := get(t, down, "GET", "/readyz")
 	if code != 503 || body["status"] != "not ready" || !strings.Contains(body["reason"], "refused") {
 		t.Fatalf("got %d %v; want 503 with the reason", code, body)
@@ -59,7 +59,7 @@ func TestReadyzDoesNotHangWithTheDatabase(t *testing.T) {
 	hung := server.New(func(ctx context.Context) error {
 		<-ctx.Done() // a database that never answers
 		return ctx.Err()
-	}, quiet)
+	}, nil, quiet)
 	// The request's own 10 s deadline is a backstop: without the handler's timeout this test fails, not hangs.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -72,7 +72,7 @@ func TestReadyzDoesNotHangWithTheDatabase(t *testing.T) {
 }
 
 func TestRoutes(t *testing.T) {
-	h := server.New(func(context.Context) error { return nil }, quiet)
+	h := server.New(func(context.Context) error { return nil }, nil, quiet)
 	cases := []struct {
 		method, path string
 		want         int
@@ -94,12 +94,12 @@ func TestRoutes(t *testing.T) {
 
 func TestReadyzAgainstARealDatabase(t *testing.T) {
 	migrated := storetest.Migrated(t)
-	h := server.New(func(ctx context.Context) error { return store.Ready(ctx, migrated) }, quiet)
+	h := server.New(func(ctx context.Context) error { return store.Ready(ctx, migrated) }, nil, quiet)
 	if code, body := get(t, h, "GET", "/readyz"); code != 200 {
 		t.Fatalf("migrated schema: got %d %v", code, body)
 	}
 	empty := storetest.EmptySchema(t)
-	h = server.New(func(ctx context.Context) error { return store.Ready(ctx, empty) }, quiet)
+	h = server.New(func(ctx context.Context) error { return store.Ready(ctx, empty) }, nil, quiet)
 	code, body := get(t, h, "GET", "/readyz")
 	migrations, err := store.LoadMigrations(store.Migrations())
 	if err != nil {

@@ -384,8 +384,9 @@ func retryable(err error) bool {
 }
 
 // translate turns a database rejection into the ledger's error for the rule it enforces, by constraint name
-// (DESIGN.md, "Schema"). The service checks those rules before the database does, so these are the fallback,
-// for a rule the service's check missed. Other errors, retryable ones included, pass through unchanged.
+// (DESIGN.md, "Schema"), as a ValidationError about the request as a whole. The service checks those rules before
+// the database does, so this is the fallback for a rule the service's check missed. Other errors, retryable ones
+// included, pass through unchanged.
 func translate(err error) error {
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) {
@@ -408,5 +409,5 @@ func translate(err error) error {
 	if rule == nil {
 		return err
 	}
-	return fmt.Errorf("%w (the database's check: %w)", rule, err)
+	return &ledger.ValidationError{Rule: rule, Posting: -1, Detail: "the database's check: " + pgErr.Message}
 }

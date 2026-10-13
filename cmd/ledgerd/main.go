@@ -72,7 +72,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	}
 
 	srv := &http.Server{
-		Handler:           server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, log),
+		Handler:           server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, store.New(db), log),
 		ReadHeaderTimeout: 5 * time.Second, // a client that trickles headers can't hold a connection open
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

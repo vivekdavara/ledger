@@ -1,4 +1,4 @@
-// Package server is the ledger's HTTP layer. Day 1 has the health endpoints; day 2 adds the REST API next to them.
+// Package server is the ledger's HTTP layer: the health endpoints and the REST API (api.go).
 package server
 
 import (
@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/vivekdavara/ledger/internal/ledger"
 )
 
 // ReadyFunc reports whether the service can do its job right now: nil if it can, an error saying why not if not.
@@ -15,14 +17,17 @@ type ReadyFunc func(ctx context.Context) error
 // readyTimeout bounds a readiness check, so a hung database makes /readyz fail fast instead of hanging with it.
 const readyTimeout = 2 * time.Second
 
-// New returns the handler for every route:
+// New returns the handler for every route: the REST API over svc (api.go; left out when svc is nil), and
 //
 //   - GET /livez answers 200 while the process can serve HTTP at all. It checks no dependency, so an orchestrator
 //     that restarts on failed liveness doesn't restart every instance when the database is down.
 //   - GET /readyz answers 200 when ready reports nil, and 503 with the reason otherwise, so a load balancer stops
 //     sending requests that would fail.
-func New(ready ReadyFunc, log *slog.Logger) http.Handler {
+func New(ready ReadyFunc, svc ledger.Service, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
+	if svc != nil {
+		api{svc, log}.routes(mux)
+	}
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
