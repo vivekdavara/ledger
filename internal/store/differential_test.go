@@ -190,7 +190,7 @@ func checkBooks(t *testing.T, db *pgxpool.Pool) {
 		"postings that break their account's chain": `
 			SELECT count(*) FROM (
 			    SELECT balance_after, account_version,
-			           coalesce(lag(balance_after) OVER w, 0) + amount AS expected, row_number() OVER w AS n
+			           coalesce(lag(balance_after) OVER w, 0)::numeric + amount AS expected, row_number() OVER w AS n
 			      FROM postings WINDOW w AS (PARTITION BY account_id ORDER BY account_version)) c
 			 WHERE balance_after <> expected OR account_version <> n`,
 		"entries that don't balance": `

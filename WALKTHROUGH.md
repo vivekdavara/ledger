@@ -394,18 +394,22 @@ notifying transactions on a single lock, which would put every posting in one qu
 index of the unpublished rows costs almost nothing.
 
 **What does the reconciliation check, and why one snapshot?**
-Eight things, recomputed from the postings: each currency sums to zero; each balance and version match the sum and
+Ten things, recomputed from the postings: each currency sums to zero; each balance and version match the sum and
 count of the account's postings; each balance matches the last `balance_after`; each history is a chain; each
-entry balances per currency and has the postings it declares; each entry has its event; no protected account is
-overdrawn. One `REPEATABLE READ` read-only transaction, so an entry posted mid-run is in all of the report or none.
+entry balances per currency and has the postings it declares; each posting is in its account's currency; each entry
+has its event; no posting, event or key names an entry that doesn't exist; no protected account is overdrawn. One
+`REPEATABLE READ` read-only transaction, so an entry posted mid-run is in all of the report or none.
 `TestReconcilingWhilePostingSeesOneMoment` takes reports while four workers post; at `READ COMMITTED` one report
 said 13 entries, 28 postings and 15 events, which is no state the ledger was ever in.
 
 **How do you test a check for corruption the database won't let you create?**
 As the tables' owner, inside the test's own schema: switch a guard trigger off, or drop a constraint, make the
-damage, and switch it back. `TestEachKindOfDamageIsReported` does six kinds (a balance moved by hand, a posting
-deleted, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft let through) and requires
-exactly the checks that compare what was broken to report it, and no others. That also shows why the application
+damage, and switch it back. `TestEachKindOfDamageIsReported` does eleven kinds (a balance moved by hand, a posting
+deleted, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft let through, two version
+changes, a `balance_after` at the end of `bigint`, a currency relabelled, an entry deleted with its rows left behind)
+and requires exactly the checks that compare what was broken to report it, and no others. The last three came from
+the review: the first version of the checks missed them, and the `bigint` one made the job fail instead of
+report. That also shows why the application
 should connect as a role that owns nothing (DESIGN.md, "Limitations").
 
 **Why doesn't the reconciliation fix what it finds?**

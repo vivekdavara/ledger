@@ -542,11 +542,18 @@ past them: a trigger switched off, a hand-made fix, a bug in a migration.
 | `currency_totals` | each currency's balances sum to zero |
 | `account_balances` | each account's balance and version against the sum and count of its postings |
 | `last_balance_after` | each account's balance against its last posting's `balance_after` |
-| `account_chains` | each account's postings are versions 1, 2, 3, ..., each leaving the balance before plus its amount |
+| `account_chains` | each account's postings are versions 1, 2, 3, ..., each leaving the balance before plus its amount (summed as `numeric`) |
+| `posting_currencies` | each posting is in its account's currency |
 | `entry_balances` | each entry's postings sum to zero in each currency |
 | `entry_posting_counts` | each entry has as many postings as it declares |
 | `entry_events` | each entry has its outbox event |
+| `orphan_rows` | each posting, event and key names an entry that exists, and each posting an account |
 | `protected_accounts` | no protected account is below zero on its normal side |
+
+The review on day 3 found the first eight checks missing three kinds of damage: a posting relabelled to another
+currency, an entry deleted with its postings, event and key left behind (`posting_currencies` and `orphan_rows` came
+from it), and a `balance_after` at the end of `bigint`, whose chain sum overflowed and made Reconcile fail instead of
+report (it sums as `numeric` now).
 
 - **One snapshot.** All of it runs in one read-only `REPEATABLE READ` transaction, so entries posted meanwhile are in
   all of the report or none of it. `TestReconcilingWhilePostingSeesOneMoment` takes reports while four workers post:
@@ -559,10 +566,14 @@ past them: a trigger switched off, a hand-made fix, a bug in a migration.
 - **Exit codes** for `ledgerd reconcile`: 0 clean, 3 differences found (the log names the checks), 1 it couldn't
   run. It changes nothing, so it doesn't migrate either: on an old schema it stops and says to run `ledgerd
   migrate`.
-- **Tested against real damage.** `TestEachKindOfDamageIsReported` damages a ledger in six ways its rules forbid,
-  as the tables' owner can (switching a guard trigger off, dropping a constraint): a balance moved by hand, a
-  posting deleted from a history, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft
-  let through. Each must be reported by exactly the checks that compare what it broke, and by no other.
+- **Tested against real damage.** `TestEachKindOfDamageIsReported` damages a ledger in eleven ways its rules
+  forbid, as the tables' owner can (switching a guard trigger off, dropping a constraint): a balance moved by hand,
+  a posting deleted from a history, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft
+  let through, a posting's version moved, an account's version moved, a `balance_after` at the end of `bigint`,
+  postings relabelled to another currency, and an entry deleted with its rows left behind. Each must be reported by
+  exactly the checks that compare what it broke, and by no other. `TestAHealthyLedgerAtTheEdgesReconciles` (from
+  the review) is the other side: no difference on a ledger with an empty account, an entry in two currencies, an
+  overdraft setting switched both ways, and balances at ±(2^63 − 1).
 
 ## Load and failure injection (day 4)
 
@@ -601,7 +612,7 @@ response, then retries it with the same idempotency key, and checks that the eff
   number each account's versions on with no gap or repeat, and no protected account is overdrawn at any version.
   The outbox's tests cover each delivery outcome (published once, a failure recorded and retried, a lost mark
   redelivered, a second publisher skipping the first's rows, one publisher keeping each account's order), and the
-  reconciliation's cover six kinds of damage made on purpose (see "Reconciliation"). Each mechanism was removed
+  reconciliation's cover eleven kinds of damage made on purpose (see "Reconciliation"). Each mechanism was removed
   once to see its test fail.
 
 ## Limitations

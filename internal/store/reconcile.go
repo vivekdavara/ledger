@@ -68,9 +68,13 @@ var checks = []struct{ name, description, sql string }{
 		       format('account %s: posting %s is version %s leaving %s, expected version %s leaving %s',
 		              account_id, id, account_version, balance_after, n, expected)
 		  FROM (SELECT id, account_id, account_version, balance_after, row_number() OVER w AS n,
-		               coalesce(lag(balance_after) OVER w, 0) + amount AS expected
+		               coalesce(lag(balance_after) OVER w, 0)::numeric + amount AS expected
 		          FROM postings WINDOW w AS (PARTITION BY account_id ORDER BY account_version)) c
 		 WHERE account_version <> n OR balance_after <> expected`},
+	{"posting_currencies", "every posting is in its account's currency", `
+		SELECT lpad(p.id::text, 20, '0'),
+		       format('posting %s is in %s, its account %s in %s', p.id, p.currency, a.id, a.currency)
+		  FROM postings p JOIN accounts a ON a.id = p.account_id WHERE p.currency <> a.currency`},
 	{"entry_balances", "every entry's postings sum to zero in each currency", `
 		SELECT lpad(entry_id::text, 20, '0') || currency,
 		       format('entry %s is off by %s in %s', entry_id, sum(amount), currency)
@@ -83,6 +87,19 @@ var checks = []struct{ name, description, sql string }{
 	{"entry_events", "every entry has its outbox event", `
 		SELECT lpad(e.id::text, 20, '0'), format('entry %s has no event', e.id)
 		  FROM journal_entries e WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.entry_id = e.id)`},
+	{"orphan_rows", "every posting, event and key names an entry that exists, and every posting an account", `
+		SELECT lpad(p.entry_id::text, 20, '0'), format('posting %s names entry %s, which does not exist', p.id, p.entry_id)
+		  FROM postings p WHERE NOT EXISTS (SELECT 1 FROM journal_entries e WHERE e.id = p.entry_id)
+		UNION ALL
+		SELECT lpad(o.entry_id::text, 20, '0'), format('event %s names entry %s, which does not exist', o.id, o.entry_id)
+		  FROM outbox o WHERE NOT EXISTS (SELECT 1 FROM journal_entries e WHERE e.id = o.entry_id)
+		UNION ALL
+		SELECT lpad(k.entry_id::text, 20, '0'), format('key %s names entry %s, which does not exist', k.key, k.entry_id)
+		  FROM idempotency_keys k WHERE NOT EXISTS (SELECT 1 FROM journal_entries e WHERE e.id = k.entry_id)
+		UNION ALL
+		SELECT lpad(p.entry_id::text, 20, '0'),
+		       format('posting %s names account %s, which does not exist', p.id, p.account_id)
+		  FROM postings p WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = p.account_id)`},
 	{"protected_accounts", "no protected account is below zero on its normal side", `
 		SELECT lpad(id::text, 20, '0'),
 		       format('account %s (%s, a protected %s account) has balance %s', id, name, type, balance)

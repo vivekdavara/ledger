@@ -113,7 +113,7 @@ stdout, at least once each, until SIGTERM, so a consumer dedupes by `id`. The fi
 LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./cmd/ledgerd reconcile
 ```
 
-`reconcile` recomputes the books from the postings in one snapshot and prints a JSON report of eight checks. It
+`reconcile` recomputes the books from the postings in one snapshot and prints a JSON report of ten checks. It
 exits 0 when they all agree, 3 when any found a difference (the log names which), 1 when it couldn't run. It
 changes nothing, so it doesn't migrate: run it against a current schema.
 
@@ -222,7 +222,7 @@ at both isolation levels), all green locally and in CI:
   returned postings number each account's versions with no gap or repeat, and no protected account is overdrawn at
   any version. `TestWhatASerializablePostingHasRead` lists one posting's SIRead locks at three ledger sizes. Every
   entry gets one outbox event, whatever writes it, and the migration backfills older entries. Reconciliation: a
-  healthy ledger is clean; six kinds of damage (made by switching a guard trigger off or dropping a constraint) are
+  healthy ledger is clean, at the edges of `bigint` too; eleven kinds of damage (made by switching a guard trigger off or dropping a constraint) are
   each reported by exactly the checks they should trip; reports taken while entries are posted are all clean and
   self-consistent, and that test fails if the report doesn't read one snapshot.
 - `internal/outbox`: each event published once, in order, with the postings `PostEntry` returned; a failed delivery
