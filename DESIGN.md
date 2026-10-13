@@ -266,6 +266,11 @@ sums an account's last hour of postings, say, where two concurrent payments coul
 skew). At `READ COMMITTED` such a check must lock what it reads, or be a constraint. That is the price of the
 default, and why the level is still a setting.
 
+The property test shows the difference. With the lock removed from step 1 (`FOR UPDATE` dropped from the accounts
+query), the service decides on balances it hasn't locked: at `READ COMMITTED` some refusals then come from the
+database's fallback instead of the service's check, and `TestPropertyConcurrentTransfersMatchAModel` fails (three
+runs of three); at `SERIALIZABLE` the stale read ends in `40001` and a retry, and it still passes.
+
 ### Why serializable aborts transfers that share nothing
 
 At `SERIALIZABLE` Postgres records what each transaction has read (SIRead locks), and of two concurrent transactions

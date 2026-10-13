@@ -20,7 +20,8 @@ import (
 // protected and unprotected accounts, so they collide on rows and some overdraw. After each batch the ledger must be
 // what the accepted entries alone imply, whatever the interleaving:
 //
-//   - an entry is accepted, or refused for insufficient funds and leaves no trace; nothing else happens to it;
+//   - an entry is accepted, or refused for insufficient funds by the service's own check, naming the posting, and
+//     leaves no trace; nothing else happens to it;
 //   - each account's balance is its balance before the batch plus the accepted postings to it;
 //   - the postings PostEntry returned for an account number its versions on from the batch's start with no gap or
 //     repeat, and each one's balance_after is the one before plus its amount: one serial order explains them all;
@@ -122,8 +123,12 @@ func TestPropertyConcurrentTransfersMatchAModel(t *testing.T) {
 			}
 			byAccount := map[int64][]ledger.PostedPosting{}
 			for i, r := range results {
+				verr, isValidation := errors.AsType[*ledger.ValidationError](r.err)
 				switch {
-				case errors.Is(r.err, ledger.ErrInsufficientFunds):
+				// A refusal must come from the service's own check, made on locked rows, and name the posting. The
+				// database's fallback (posting -1) means the service decided on a balance that wasn't the account's
+				// (found in review: with the lock removed, this test still passed).
+				case isValidation && errors.Is(r.err, ledger.ErrInsufficientFunds) && verr.Posting >= 0:
 					refused++
 					continue
 				case r.err != nil:
