@@ -21,27 +21,32 @@ import (
 
 // RetryPolicy bounds how PostEntry retries a transaction that Postgres aborted to keep it serializable.
 type RetryPolicy struct {
-	Attempts  int           // attempts in all, at least 1
-	BaseDelay time.Duration // the first retry waits up to this long
-	MaxDelay  time.Duration // no retry waits longer
+	Attempts  int           // attempts in all; less than 1 means 1
+	BaseDelay time.Duration // the first retry waits up to this long; zero means retries don't wait
+	MaxDelay  time.Duration // no retry waits longer; less than BaseDelay means BaseDelay
 }
 
 // DefaultRetry is the policy New uses.
 var DefaultRetry = RetryPolicy{Attempts: 10, BaseDelay: time.Millisecond, MaxDelay: 100 * time.Millisecond}
 
-// delay is how long to wait before attempt n+1: "full jitter", uniform between zero and an exponentially growing
-// cap, so transactions that collided once don't collide again in lockstep.
+// delay is how long to wait before attempt n+1: "full jitter", uniform in [0, min(MaxDelay, BaseDelay * 2^(n-1))),
+// so transactions that collided once don't collide again in lockstep. The cap doubles until it reaches MaxDelay
+// and stops there, so it can't overflow whatever the policy (found in review: a shift overflowed, and
+// rand.N(MaxInt64 + 1) panicked).
 func (p RetryPolicy) delay(n int) time.Duration {
-	ceiling := p.MaxDelay
-	if n <= 32 { // past that, the doubling has long reached any sensible MaxDelay
-		if d := p.BaseDelay << (n - 1); d > 0 && d < ceiling {
-			ceiling = d
+	ceiling := p.BaseDelay
+	for i := 1; i < n && ceiling < p.MaxDelay; i++ {
+		if ceiling > p.MaxDelay/2 {
+			ceiling = p.MaxDelay
+			break
 		}
+		ceiling *= 2
 	}
+	ceiling = min(ceiling, p.MaxDelay)
 	if ceiling <= 0 {
 		return 0
 	}
-	return rand.N(ceiling + 1)
+	return rand.N(ceiling)
 }
 
 // Store is the ledger service: every operation the REST and gRPC APIs offer, over one connection pool.
@@ -59,9 +64,9 @@ func New(db *pgxpool.Pool) *Store { return NewWithRetry(db, DefaultRetry) }
 
 // NewWithRetry returns a Store with its own retry policy.
 func NewWithRetry(db *pgxpool.Pool, retry RetryPolicy) *Store {
-	if retry.Attempts < 1 {
-		retry.Attempts = 1
-	}
+	retry.Attempts = max(retry.Attempts, 1)
+	retry.BaseDelay = max(retry.BaseDelay, 0)
+	retry.MaxDelay = max(retry.MaxDelay, retry.BaseDelay)
 	return &Store{db: db, retry: retry}
 }
 
@@ -201,11 +206,12 @@ func (s *Store) History(ctx context.Context, accountID, afterVersion int64, limi
 // was already used for the same entry returns that entry with replayed true and posts nothing; a key used for a
 // different entry is ErrKeyReused. A rejected request leaves no trace, its key included.
 //
-// Each attempt is one SERIALIZABLE transaction. It locks the entry's accounts in id order, so two entries never
-// wait for each other's locks in a cycle, and checks the rules that need the accounts while it holds them, to say
-// which posting broke which rule. The database checks every rule again. When Postgres aborts an attempt to keep
-// the transactions serializable (40001) or to break a deadlock (40P01), PostEntry retries it under the store's
-// RetryPolicy, and returns ErrConflict once the attempts run out.
+// Each attempt first looks the key up, outside any transaction, and then posts in one SERIALIZABLE transaction. That
+// transaction locks the entry's accounts in id order, so two entries never wait for each other's locks in a cycle,
+// and checks the rules that need the accounts while it holds them, to say which posting broke which rule. The
+// database checks every rule again. When Postgres aborts an attempt to keep the transactions serializable (40001)
+// or to break a deadlock (40P01), or another request commits the same key first (23505), PostEntry retries it under
+// the store's RetryPolicy, and returns ErrConflict once the attempts run out.
 func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	posted ledger.PostedEntry, replayed bool, err error) {
 	if err := ledger.ValidKey(key); err != nil {
@@ -216,9 +222,14 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	}
 	hash := e.Hash()
 	for attempt := 1; ; attempt++ {
-		posted, replayed, err = s.postOnce(ctx, key, hash[:], e, attempt)
+		posted, found, err := s.lookUp(ctx, key, hash[:])
+		if err != nil || found {
+			return posted, found, err
+		}
+		s.at("looked up", attempt)
+		posted, err = s.postOnce(ctx, key, hash[:], e, attempt)
 		if !retryable(err) {
-			return posted, replayed, err
+			return posted, false, err
 		}
 		if attempt >= s.retry.Attempts {
 			return ledger.PostedEntry{}, false, &conflictError{attempts: attempt, last: err}
@@ -232,6 +243,32 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 		case <-timer.C:
 		}
 	}
+}
+
+// lookUp finds a key that was used before: the same request gets its entry back (found), a different one is
+// ErrKeyReused. It reads outside the posting transaction on purpose. Inside a SERIALIZABLE transaction the read
+// locks the key's index page against writers, so every concurrent request whose key landed on that page conflicted
+// with it, even with no account in common (found in review: 16 workers on separate wallets gave 456 retries and 4
+// ErrConflicts). Outside, a request racing on the same key is caught by the key's primary key instead (23505) and
+// retried. A key commits with its entry and postings and history is append-only, so the entry read here is whole.
+func (s *Store) lookUp(ctx context.Context, key string, hash []byte) (ledger.PostedEntry, bool, error) {
+	var storedHash []byte
+	var entryID int64
+	err := s.db.QueryRow(ctx, `SELECT request_hash, entry_id FROM idempotency_keys WHERE key = $1`, key).
+		Scan(&storedHash, &entryID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ledger.PostedEntry{}, false, nil
+	case err != nil:
+		return ledger.PostedEntry{}, false, translate(err)
+	case !bytes.Equal(storedHash, hash):
+		return ledger.PostedEntry{}, false, fmt.Errorf("%w: key %q was used for a different entry", ledger.ErrKeyReused, key)
+	}
+	posted, err := loadEntry(ctx, s.db, entryID)
+	if err != nil {
+		return ledger.PostedEntry{}, false, translate(err)
+	}
+	return posted, true, nil
 }
 
 // conflictError is ErrConflict once the attempts ran out. The last attempt's error stays reachable through
@@ -265,36 +302,17 @@ func (s *Store) at(point string, attempt int) {
 }
 
 func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.Entry, attempt int) (
-	_ ledger.PostedEntry, replayed bool, err error) {
+	ledger.PostedEntry, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // after a commit this does nothing
 
-	// 1. A key that was used before: the same request gets its entry back, a different one is refused. The first
-	// statement also fixes the transaction's snapshot.
-	var storedHash []byte
-	var entryID int64
-	err = tx.QueryRow(ctx, `SELECT request_hash, entry_id FROM idempotency_keys WHERE key = $1`, key).
-		Scan(&storedHash, &entryID)
-	switch {
-	case err == nil:
-		if !bytes.Equal(storedHash, hash) {
-			return ledger.PostedEntry{}, false, fmt.Errorf("%w: key %q posted entry %d", ledger.ErrKeyReused, key,
-				entryID)
-		}
-		posted, err := loadEntry(ctx, tx, entryID)
-		if err != nil {
-			return ledger.PostedEntry{}, false, translate(err)
-		}
-		return posted, true, translate(tx.Commit(ctx))
-	case !errors.Is(err, pgx.ErrNoRows):
-		return ledger.PostedEntry{}, false, translate(err)
-	}
-	s.at("snapshot", attempt)
+	s.at("begin", attempt)
 
-	// 2. Lock the accounts in id order and check what needs them, naming the posting at fault.
+	// 1. Lock the accounts in id order and check what needs them, naming the posting at fault. This first statement
+	// also fixes the transaction's snapshot.
 	ids := make([]int64, len(e.Postings))
 	for i, p := range e.Postings {
 		ids[i] = p.AccountID
@@ -302,23 +320,23 @@ func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.
 	slices.Sort(ids)
 	rows, err := tx.Query(ctx, `SELECT `+accountColumns+` FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ids)
 	if err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	accounts, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (ledger.Account, error) { return scanAccount(row) })
 	if err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	if err := checkAgainstAccounts(e, accounts); err != nil {
-		return ledger.PostedEntry{}, false, err
+		return ledger.PostedEntry{}, err
 	}
 	s.at("locked", attempt)
 
-	// 3. The entry, its postings in one statement and in account-id order, and the key. The database fills in each
+	// 2. The entry, its postings in one statement and in account-id order, and the key. The database fills in each
 	// posting's balance_after and account_version, and checks the entry as a whole at commit.
 	posted := ledger.PostedEntry{Description: e.Description}
 	if err := tx.QueryRow(ctx, `INSERT INTO journal_entries (description, posting_count) VALUES ($1, $2)
 		RETURNING id, created_at`, e.Description, len(e.Postings)).Scan(&posted.ID, &posted.CreatedAt); err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	sorted := slices.Clone(e.Postings)
 	slices.SortFunc(sorted, func(a, b ledger.Posting) int { return cmp.Compare(a.AccountID, b.AccountID) })
@@ -334,22 +352,22 @@ func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.
 		RETURNING id, entry_id, account_id, currency, amount, balance_after, account_version`,
 		posted.ID, accountIDs, currencies, amounts)
 	if err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	posted.Postings, err = pgx.CollectRows(rows, scanPosting)
 	if err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	slices.SortFunc(posted.Postings, func(a, b ledger.PostedPosting) int { return cmp.Compare(a.AccountID, b.AccountID) })
 	if _, err := tx.Exec(ctx, `INSERT INTO idempotency_keys (key, request_hash, entry_id) VALUES ($1, $2, $3)`,
 		key, hash, posted.ID); err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
 	s.at("commit", attempt)
 	if err := tx.Commit(ctx); err != nil {
-		return ledger.PostedEntry{}, false, translate(err)
+		return ledger.PostedEntry{}, translate(err)
 	}
-	return posted, false, nil
+	return posted, nil
 }
 
 // checkAgainstAccounts checks the rules that need the accounts: each exists, is in its posting's currency, isn't
@@ -395,13 +413,19 @@ func scanPosting(row pgx.CollectableRow) (ledger.PostedPosting, error) {
 	return p, err
 }
 
-func loadEntry(ctx context.Context, tx pgx.Tx, id int64) (ledger.PostedEntry, error) {
+// queryer is what loadEntry reads through: a pool or a transaction.
+type queryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func loadEntry(ctx context.Context, db queryer, id int64) (ledger.PostedEntry, error) {
 	e := ledger.PostedEntry{ID: id}
-	if err := tx.QueryRow(ctx, `SELECT description, created_at FROM journal_entries WHERE id = $1`, id).
+	if err := db.QueryRow(ctx, `SELECT description, created_at FROM journal_entries WHERE id = $1`, id).
 		Scan(&e.Description, &e.CreatedAt); err != nil {
 		return ledger.PostedEntry{}, err
 	}
-	rows, err := tx.Query(ctx, `SELECT id, entry_id, account_id, currency, amount, balance_after, account_version
+	rows, err := db.Query(ctx, `SELECT id, entry_id, account_id, currency, amount, balance_after, account_version
 		FROM postings WHERE entry_id = $1 ORDER BY account_id`, id)
 	if err != nil {
 		return ledger.PostedEntry{}, err

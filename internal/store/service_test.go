@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
@@ -345,19 +346,69 @@ func TestTheDatabaseChecksKeysToo(t *testing.T) {
 	}
 }
 
+// conflict makes the attempt that calls it, from its "begin" hook, fail with 40001. Another transaction posts from
+// one account to another and holds the first's row, then commits once some session waits for that row. The waiting
+// attempt's snapshot predates the commit, so under SERIALIZABLE the row it gets is one changed since, and Postgres
+// aborts it.
+func conflict(t *testing.T, db *pgxpool.Pool, from, to, cents int64) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := insertEntry(tx, "concurrent", 2)
+	if err == nil {
+		err = insertPosting(tx, entry, from, "USD", cents)
+	}
+	if err == nil {
+		err = insertPosting(tx, entry, to, "USD", -cents)
+	}
+	var holder int
+	if err == nil {
+		err = tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holder)
+	}
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	go func() {
+		if !waitUntilBlocked(db, holder, 1) {
+			t.Errorf("nothing waited for the concurrent transaction")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Errorf("concurrent commit: %v", err)
+		}
+	}()
+}
+
+// waitUntilBlocked waits up to 10 s for n sessions to be blocked by the backend holder, directly or behind another
+// waiter, and reports whether they were.
+func waitUntilBlocked(db *pgxpool.Pool, holder, n int) bool {
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		var waiting int
+		if err := db.QueryRow(context.Background(), `
+			WITH RECURSIVE blocked (pid) AS (
+			    SELECT pid FROM pg_stat_activity WHERE $1::integer = ANY (pg_blocking_pids(pid))
+			    UNION
+			    SELECT a.pid FROM pg_stat_activity a JOIN blocked b ON b.pid = ANY (pg_blocking_pids(a.pid)))
+			SELECT count(*) FROM blocked`, holder).Scan(&waiting); err == nil && waiting >= n {
+			return true
+		}
+	}
+	return false
+}
+
 func TestASerializationFailureIsRetried(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
 	s := store.New(db)
 	b := wallets(t, s)
-	// On the first attempt, after its snapshot, another request pays from Alice's wallet and commits. The first
-	// attempt's lock on that row then fails with 40001, and the second attempt posts against the new balance.
-	other := store.New(db)
+	// On the first attempt, another transaction pays $10 from Alice's wallet and commits while the attempt waits
+	// for her row. The attempt fails with 40001, and the second posts against the new balance.
 	store.SetHook(s, func(point string, attempt int) {
-		if point == "snapshot" && attempt == 1 {
-			if _, _, err := other.PostEntry(context.Background(), "concurrent", payment(b, 1000)); err != nil {
-				t.Errorf("concurrent payment: %v", err)
-			}
+		if point == "begin" && attempt == 1 {
+			conflict(t, db, b.alice, b.bob, 1000)
 		}
 	})
 	posted, replayed, err := s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
@@ -378,13 +429,9 @@ func TestRetriesRunOut(t *testing.T) {
 	db := storetest.Migrated(t)
 	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 3})
 	b := wallets(t, s)
-	other := store.New(db)
 	store.SetHook(s, func(point string, attempt int) {
-		if point == "snapshot" {
-			key := fmt.Sprintf("concurrent-%d", attempt)
-			if _, _, err := other.PostEntry(context.Background(), key, payment(b, 100)); err != nil {
-				t.Errorf("concurrent payment: %v", err)
-			}
+		if point == "begin" {
+			conflict(t, db, b.alice, b.bob, 100)
 		}
 	})
 	_, _, err := s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
@@ -412,16 +459,17 @@ func TestARetryWaitsForTheContext(t *testing.T) {
 	b := wallets(t, s)
 	ctx, cancel := context.WithCancel(context.Background())
 	store.SetHook(s, func(point string, attempt int) {
-		if point == "snapshot" && attempt == 1 {
-			if _, _, err := store.New(db).PostEntry(context.Background(), "concurrent", payment(b, 100)); err != nil {
-				t.Errorf("concurrent payment: %v", err)
-			}
-			time.AfterFunc(50*time.Millisecond, cancel)
+		if point == "begin" && attempt == 1 {
+			conflict(t, db, b.alice, b.bob, 100)
+			time.AfterFunc(500*time.Millisecond, cancel)
 		}
 	})
 	start := time.Now()
 	if _, _, err := s.PostEntry(ctx, "pay-1", payment(b, 2000)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if s.Retries() != 1 {
+		t.Fatalf("%d retries: the cancel came before the retry's wait", s.Retries())
 	}
 	if waited := time.Since(start); waited > 10*time.Second {
 		t.Fatalf("waited %v after the cancel", waited)
@@ -434,11 +482,11 @@ func TestConcurrentRetriesOfOneRequestPostOnce(t *testing.T) {
 	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 50, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
 	b := wallets(t, s)
 	const n = 12
-	// Every request reads the key as unused before any of them goes on, so they all race to post.
+	// Every request finds the key unused before any of them goes on, so they all race to post.
 	var arrived sync.WaitGroup
 	arrived.Add(n)
 	store.SetHook(s, func(point string, attempt int) {
-		if point == "snapshot" && attempt == 1 {
+		if point == "looked up" && attempt == 1 {
 			arrived.Done()
 			arrived.Wait()
 		}
