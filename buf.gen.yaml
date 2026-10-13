@@ -1,0 +1,10 @@
+# The generators run from the tools module (tools/go.mod), so their versions are pinned there and nothing needs
+# installing. The generated code is committed: building the ledger never needs buf.
+version: v2
+plugins:
+  - local: ["go", "tool", "-modfile=tools/go.mod", "protoc-gen-go"]
+    out: internal/gen
+    opt: paths=source_relative
+  - local: ["go", "tool", "-modfile=tools/go.mod", "protoc-gen-go-grpc"]
+    out: internal/gen
+    opt: paths=source_relative

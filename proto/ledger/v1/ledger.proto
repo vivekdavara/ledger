@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/vivekdavara/ledger/internal/gen/ledger/v1;ledgerv1";
+
+// LedgerService is the gRPC face of the ledger: what the REST API offers, over the same service. Amounts are int64
+// minor units (cents for USD, yen for JPY, fils for KWD), debits positive. A failed call's status carries a
+// google.rpc.ErrorInfo whose reason is the REST API's reason in capitals (INSUFFICIENT_FUNDS) and, when one posting
+// is at fault, its index under the metadata key "posting".
+service LedgerService {
+  // CreateAccount creates an account with a zero balance. If an identical account has the name already it returns
+  // that account with created false, so a retry is safe; a different account under the name is ALREADY_EXISTS.
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+  // GetAccount returns one account with its current balance.
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  // ListPostings pages through an account's history, oldest first, by account version.
+  rpc ListPostings(ListPostingsRequest) returns (ListPostingsResponse);
+  // PostEntry records an entry atomically, once per idempotency key. A retry with the key and the same entry gets
+  // the original back with replayed true; the key with a different entry is FAILED_PRECONDITION.
+  rpc PostEntry(PostEntryRequest) returns (PostEntryResponse);
+}
+
+// AccountType sets an account's normal side: debit for assets and expenses, credit for the rest.
+enum AccountType {
+  ACCOUNT_TYPE_UNSPECIFIED = 0;
+  ACCOUNT_TYPE_ASSET = 1;
+  ACCOUNT_TYPE_LIABILITY = 2;
+  ACCOUNT_TYPE_EQUITY = 3;
+  ACCOUNT_TYPE_REVENUE = 4;
+  ACCOUNT_TYPE_EXPENSE = 5;
+}
+
+message Account {
+  int64 id = 1;
+  string name = 2;
+  AccountType type = 3;
+  // An ISO 4217 code, such as USD.
+  string currency = 4;
+  bool allow_negative = 5;
+  // The signed sum of the account's postings: debits positive.
+  int64 balance = 6;
+  // The balance as a person reads it: positive on the account's normal side.
+  int64 shown_balance = 7;
+  // The number of postings so far.
+  int64 version = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message CreateAccountRequest {
+  string name = 1;
+  AccountType type = 2;
+  string currency = 3;
+  bool allow_negative = 4;
+}
+
+message CreateAccountResponse {
+  Account account = 1;
+  // False when an identical account already had the name.
+  bool created = 2;
+}
+
+message GetAccountRequest {
+  int64 id = 1;
+}
+
+message GetAccountResponse {
+  Account account = 1;
+}
+
+message ListPostingsRequest {
+  int64 account_id = 1;
+  // Postings after this version: 0 for the first page.
+  int64 after_version = 2;
+  // 1 to 1000; 0 means 100.
+  int32 page_size = 3;
+}
+
+message HistoryLine {
+  int64 posting_id = 1;
+  int64 entry_id = 2;
+  string description = 3;
+  google.protobuf.Timestamp posted_at = 4;
+  string currency = 5;
+  int64 amount = 6;
+  int64 balance_after = 7;
+  int64 account_version = 8;
+}
+
+message ListPostingsResponse {
+  repeated HistoryLine postings = 1;
+  // Set when the page is full: pass it as after_version for the next page.
+  optional int64 next_after_version = 2;
+}
+
+message Posting {
+  int64 account_id = 1;
+  string currency = 2;
+  // Minor units, debits positive. Never zero, at most 10^15 either way.
+  int64 amount = 3;
+}
+
+message PostEntryRequest {
+  // 1 to 200 visible ASCII characters, chosen by the client. Send the same key when retrying.
+  string idempotency_key = 1;
+  string description = 2;
+  // 2 to 64 postings, at most one per account, summing to zero in each currency.
+  repeated Posting postings = 3;
+}
+
+message PostedPosting {
+  int64 id = 1;
+  int64 account_id = 2;
+  string currency = 3;
+  int64 amount = 4;
+  // The account's balance after this posting.
+  int64 balance_after = 5;
+  // This posting's place in the account's history: 1, 2, 3, ... with no gaps.
+  int64 account_version = 6;
+}
+
+message Entry {
+  int64 id = 1;
+  string description = 2;
+  google.protobuf.Timestamp created_at = 3;
+  // In account-id order.
+  repeated PostedPosting postings = 4;
+}
+
+message PostEntryResponse {
+  Entry entry = 1;
+  // True when an earlier request with the same key posted the entry; nothing was posted this time.
+  bool replayed = 2;
+}
