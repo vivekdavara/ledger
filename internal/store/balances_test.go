@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -366,4 +367,28 @@ func schemaOf(t *testing.T, db *pgxpool.Pool) string {
 		t.Fatal(err)
 	}
 	return schema
+}
+
+func TestABalanceStopsShortOfTheSmallestBigint(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	wallet := createAccount(t, db, account{"wallet:big", "liability", "USD", true})
+	// Reaching -2^63 through postings takes over 9,000 of the largest ones, so the test sets the balance with the
+	// triggers off (session_replication_role needs a superuser, which the test databases have). The CHECK still
+	// runs: constraints aren't triggers.
+	set := func(balance int64) error {
+		return rolledBack(t, db, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(context.Background(), `SET LOCAL session_replication_role = replica`); err != nil {
+				return err
+			}
+			_, err := tx.Exec(context.Background(), `UPDATE accounts SET balance = $1 WHERE id = $2`, balance, wallet)
+			return err
+		})
+	}
+	if err := set(math.MinInt64); constraint(err) != "accounts_balance_negatable" {
+		t.Fatalf("balance -2^63: got %v, want accounts_balance_negatable", err)
+	}
+	if err := set(math.MinInt64 + 1); err != nil {
+		t.Fatalf("balance -2^63 + 1: %v", err)
+	}
 }

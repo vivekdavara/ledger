@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -100,7 +101,12 @@ func TestReadyzAgainstARealDatabase(t *testing.T) {
 	empty := storetest.EmptySchema(t)
 	h = server.New(func(ctx context.Context) error { return store.Ready(ctx, empty) }, quiet)
 	code, body := get(t, h, "GET", "/readyz")
-	if code != 503 || !strings.Contains(body["reason"], "schema is at version 0, this binary needs 7") {
+	migrations, err := store.LoadMigrations(store.Migrations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("schema is at version 0, this binary needs %d", len(migrations))
+	if code != 503 || !strings.Contains(body["reason"], want) {
 		t.Fatalf("unmigrated schema: got %d %v", code, body)
 	}
 }

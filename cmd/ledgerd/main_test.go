@@ -5,11 +5,13 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 )
 
@@ -65,7 +67,15 @@ func TestAnUnreachableDatabaseFailsWithoutShowingThePassword(t *testing.T) {
 
 func TestMigrateAppliesOnceThenNothing(t *testing.T) {
 	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t))}
-	for i, want := range []string{`"applied":[1,2,3,4,5,6,7]`, `"applied":[]`} {
+	migrations, err := store.LoadMigrations(store.Migrations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := make([]string, len(migrations))
+	for i, m := range migrations {
+		all[i] = strconv.Itoa(m.Version)
+	}
+	for i, want := range []string{`"applied":[` + strings.Join(all, ",") + `]`, `"applied":[]`} {
 		var out bytes.Buffer
 		if code := run(context.Background(), []string{"migrate"}, env(vars), &out, nil); code != 0 ||
 			!strings.Contains(out.String(), want) {
