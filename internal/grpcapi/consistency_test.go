@@ -22,7 +22,8 @@ import (
 )
 
 // TestBothAPIsGiveTheSameReason sends the same failing requests through REST and gRPC, over one store, and requires
-// the same reason and the same posting from both. DESIGN.md says the two APIs can't disagree; this checks it.
+// the same reason and the same posting from both. A transport's own refusals (an oversized request, a body that
+// isn't JSON) are each API's own and not compared. DESIGN.md says the two APIs can't disagree; this checks it.
 func TestBothAPIsGiveTheSameReason(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
@@ -131,6 +132,8 @@ func TestBothAPIsGiveTheSameReason(t *testing.T) {
 	history("history of a missing account", "", 999999, 0, 0)
 	history("page too big", "?limit=1001", alice, 0, 1001)
 	history("history of account zero", "", 0, 0, 0)
+	history("a negative page size", "?limit=-1", alice, 0, -1)
+	history("a negative version", "?after_version=-1", alice, -1, 0)
 	newAccount := func(name, body string, req *ledgerv1.CreateAccountRequest) {
 		cases = append(cases, struct {
 			name string
@@ -151,6 +154,9 @@ func TestBothAPIsGiveTheSameReason(t *testing.T) {
 
 	for _, tc := range cases {
 		req := httptest.NewRequest(tc.rest.method, tc.rest.path, strings.NewReader(tc.rest.body))
+		if tc.rest.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		if tc.rest.key != "" {
 			req.Header.Set("Idempotency-Key", tc.rest.key)
 		}

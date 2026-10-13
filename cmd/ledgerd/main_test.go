@@ -168,9 +168,16 @@ func TestServeFailsIfAPortIsTaken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer taken.Close()
+	// A port that is free now, for HTTP: after the failed start it must be free again.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpAddr := probe.Addr().String()
+	probe.Close()
 	vars := map[string]string{
 		"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
-		"LEDGER_HTTP_ADDR":    "127.0.0.1:0",
+		"LEDGER_HTTP_ADDR":    httpAddr,
 		"LEDGER_GRPC_ADDR":    taken.Addr().String(),
 	}
 	var logs syncBuffer
@@ -178,6 +185,11 @@ func TestServeFailsIfAPortIsTaken(t *testing.T) {
 		!strings.Contains(logs.String(), "address already in use") {
 		t.Fatalf("exit %d, log %s", code, logs.String())
 	}
+	again, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		t.Fatalf("the HTTP port is still held after the failed start: %v", err)
+	}
+	again.Close()
 }
 
 // inFlight starts serve with the given shutdown grace, opens two accounts, and holds both rows in a transaction of

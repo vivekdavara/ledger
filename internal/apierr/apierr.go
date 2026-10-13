@@ -27,8 +27,13 @@ type Kind struct {
 	Redact bool
 }
 
-// ErrMalformed is wrapped by an API's errors about a request it couldn't read at all (bad JSON, a missing header).
-var ErrMalformed = errors.New("malformed request")
+// The transport's own refusals: a request the API couldn't read at all (bad JSON, a missing header), one too large
+// to read, and a body that isn't JSON.
+var (
+	ErrMalformed = errors.New("malformed request")
+	ErrTooLarge  = errors.New("request too large")
+	ErrMediaType = errors.New("unsupported media type")
+)
 
 // The request alone is wrong: the same request would fail against any ledger.
 var invalid = Kind{"invalid_argument", http.StatusBadRequest, codes.InvalidArgument, false}
@@ -53,6 +58,9 @@ var table = []struct {
 	kind Kind
 }{
 	{ErrMalformed, Kind{"malformed_request", http.StatusBadRequest, codes.InvalidArgument, false}},
+	// gRPC refuses an oversized message itself, with RESOURCE_EXHAUSTED and no ErrorInfo; this row is REST's.
+	{ErrTooLarge, Kind{"request_too_large", http.StatusRequestEntityTooLarge, codes.ResourceExhausted, false}},
+	{ErrMediaType, Kind{"unsupported_media_type", http.StatusUnsupportedMediaType, codes.InvalidArgument, false}},
 	{ledger.ErrUnbalanced, Kind{"unbalanced", http.StatusBadRequest, codes.InvalidArgument, false}},
 	{ledger.ErrPostingCount, invalid},
 	{ledger.ErrDescription, invalid},

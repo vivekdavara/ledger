@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -45,8 +46,38 @@ func newHandler(ready ReadyFunc, svc ledger.Service, log *slog.Logger, timeout t
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
-	return mux
+	return jsonErrors(mux)
 }
+
+// jsonErrors answers the router's own 404 and 405 with the API's error JSON instead of its text/plain (found in
+// review). A request no route takes goes to the mux into a recorder, which keeps its status and Allow header.
+func jsonErrors(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		rec := &recorder{header: http.Header{}, status: http.StatusOK}
+		mux.ServeHTTP(rec, r)
+		body := errorBody{Reason: "not_found", Message: "no such route: " + r.URL.Path}
+		if rec.status == http.StatusMethodNotAllowed {
+			w.Header().Set("Allow", rec.header.Get("Allow"))
+			body = errorBody{Reason: "method_not_allowed",
+				Message: fmt.Sprintf("%s is not allowed here; allowed: %s", r.Method, rec.header.Get("Allow"))}
+		}
+		writeJSON(w, rec.status, errorJSON{body})
+	})
+}
+
+// recorder keeps what the mux's built-in handlers write, so jsonErrors can answer in their place.
+type recorder struct {
+	header http.Header
+	status int
+}
+
+func (r *recorder) Header() http.Header         { return r.header }
+func (r *recorder) Write(p []byte) (int, error) { return len(p), nil }
+func (r *recorder) WriteHeader(status int)      { r.status = status }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")

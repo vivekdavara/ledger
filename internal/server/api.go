@@ -1,15 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vivekdavara/ledger/internal/apierr"
 	"github.com/vivekdavara/ledger/internal/ledger"
@@ -161,7 +166,7 @@ func (a api) bounded(h http.HandlerFunc) http.HandlerFunc {
 // one has the name already, so a client can retry it freely.
 func (a api) createAccount(w http.ResponseWriter, r *http.Request) {
 	var req newAccountJSON
-	if err := decode(w, r, &req); err != nil {
+	if err := decode(w, r, &req, accountNames); err != nil {
 		a.fail(w, r, err)
 		return
 	}
@@ -243,7 +248,7 @@ func (a api) postEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req entryJSON
-	if err := decode(w, r, &req); err != nil {
+	if err := decode(w, r, &req, entryNames); err != nil {
 		a.fail(w, r, err)
 		return
 	}
@@ -279,16 +284,37 @@ func (a api) postEntry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, toPostedEntryJSON(posted))
 }
 
-// decode reads one JSON object into v, refusing unknown fields, trailing data and bodies over maxBody.
-func decode(w http.ResponseWriter, r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+// The JSON field names each request body may use, exactly as spelled.
+var (
+	accountNames = jsonNames(reflect.TypeFor[newAccountJSON]())
+	entryNames   = jsonNames(reflect.TypeFor[entryJSON]())
+)
+
+// decode reads one JSON object into v. Beyond what encoding/json checks, it refuses what that package quietly
+// accepts (found in review): a body that isn't UTF-8 (it would turn each bad byte into U+FFFD, so two different
+// names became one account), a key that appears twice in an object (the last one won), and a key that matches a
+// field only when case is ignored ("Name", "AMOUNT"). It also requires a JSON content type, which a cross-site form
+// can't send, and answers a body over maxBody with 413.
+func decode(w http.ResponseWriter, r *http.Request, v any, names map[string]bool) error {
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		return fmt.Errorf("%w: send the body as Content-Type: application/json", apierr.ErrMediaType)
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+		return fmt.Errorf("%w: a body is at most %d bytes", apierr.ErrTooLarge, maxBody)
+	} else if err != nil {
+		return fmt.Errorf("%w: reading the body: %v", apierr.ErrMalformed, err)
+	}
+	if !utf8.Valid(body) {
+		return fmt.Errorf("%w: the body is not valid UTF-8", apierr.ErrMalformed)
+	}
+	if err := strictKeys(body, names); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		var typeErr *json.UnmarshalTypeError
-		if errors.As(err, &typeErr) && typeErr.Field != "" {
-			return fmt.Errorf("%w: %s must be a JSON %s", apierr.ErrMalformed, typeErr.Field, jsonType(typeErr))
-		}
-		return fmt.Errorf("%w: %v", apierr.ErrMalformed, err)
+		return fmt.Errorf("%w: %s", apierr.ErrMalformed, describe(err))
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("%w: more than one JSON value in the body", apierr.ErrMalformed)
@@ -296,18 +322,102 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	return nil
 }
 
-func jsonType(e *json.UnmarshalTypeError) string {
-	switch e.Type.Kind().String() {
-	case "string":
-		return "string (amounts are decimal strings such as \"12.34\")"
-	case "int64", "int":
-		return "integer"
-	case "bool":
-		return "boolean"
-	case "slice":
-		return "array"
+// strictKeys walks the body's tokens and refuses a key repeated within one object, or one that isn't a field name
+// as spelled. Syntax errors are left for the decoder to report.
+func strictKeys(body []byte, names map[string]bool) error {
+	type frame struct {
+		object    bool
+		keys      map[string]bool
+		expectKey bool
 	}
-	return e.Type.String()
+	var stack []*frame
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].object {
+			stack[n-1].expectKey = true
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil // the end, or a syntax error the decoder will report
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, &frame{object: true, keys: map[string]bool{}, expectKey: true})
+			case '[':
+				stack = append(stack, &frame{})
+			default: // '}' or ']'
+				stack = stack[:len(stack)-1]
+				valueDone()
+			}
+		case string:
+			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].expectKey {
+				top := stack[n-1]
+				switch {
+				case top.keys[t]:
+					return fmt.Errorf("%w: %q appears twice in one object", apierr.ErrMalformed, t)
+				case !names[t]:
+					return fmt.Errorf("%w: unknown field %q (names are case-sensitive)", apierr.ErrMalformed, t)
+				}
+				top.keys[t], top.expectKey = true, false
+				continue
+			}
+			valueDone()
+		default:
+			valueDone()
+		}
+	}
+}
+
+// jsonNames collects the JSON names of a struct type's fields, and of the structs inside it.
+func jsonNames(t reflect.Type) map[string]bool {
+	names := map[string]bool{}
+	var walk func(reflect.Type)
+	walk = func(t reflect.Type) {
+		for t.Kind() == reflect.Slice || t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return
+		}
+		for f := range t.Fields() {
+			if name, _, _ := strings.Cut(f.Tag.Get("json"), ","); name != "" && name != "-" {
+				names[name] = true
+			}
+			walk(f.Type)
+		}
+	}
+	walk(t)
+	return names
+}
+
+// describe says what was wrong with a body that encoding/json refused, in the API's words rather than Go's.
+func describe(err error) string {
+	if typeErr, ok := errors.AsType[*json.UnmarshalTypeError](err); ok {
+		if typeErr.Field == "" {
+			return "the body must be a JSON object"
+		}
+		switch typeErr.Type.Kind() {
+		case reflect.String:
+			return typeErr.Field + " must be a JSON string (amounts are decimal strings such as \"12.34\")"
+		case reflect.Int64, reflect.Int:
+			return typeErr.Field + " must be a whole number that fits in 64 bits"
+		case reflect.Bool:
+			return typeErr.Field + " must be true or false"
+		case reflect.Slice:
+			return typeErr.Field + " must be a JSON array"
+		case reflect.Struct:
+			return typeErr.Field + " must be a JSON object"
+		}
+		return typeErr.Field + " has the wrong type"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "the body is empty or cut short"
+	}
+	return strings.TrimPrefix(err.Error(), "json: ")
 }
 
 // pathID reads the account id in the path. Only a non-integer is malformed here; the service refuses an id that
@@ -320,15 +430,16 @@ func pathID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
-// queryInt reads an optional non-negative integer parameter; absent is 0.
+// queryInt reads an optional integer parameter; absent is 0. Only a non-integer is malformed here: the service
+// refuses a negative or too large value, the same way for both APIs.
 func queryInt(r *http.Request, name string) (int64, error) {
 	s := r.URL.Query().Get(name)
 	if s == "" {
 		return 0, nil
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("%w: %s=%q is not a non-negative integer", apierr.ErrMalformed, name, s)
+	n, err := strconv.ParseInt(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %s=%q is not a whole number", apierr.ErrMalformed, name, s)
 	}
 	return n, nil
 }

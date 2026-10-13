@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
@@ -25,6 +26,9 @@ type response struct {
 func call(t *testing.T, h http.Handler, method, path, key, body string) response {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
 	}
@@ -223,8 +227,130 @@ func TestRESTErrors(t *testing.T) {
 	if r := call(t, h, "GET", "/v1/accounts/1/postings?limit=1001", "", ""); r.code != 400 || !strings.Contains(r.message(), "1 to 1000") {
 		t.Errorf("limit 1001: %d %v", r.code, r.body)
 	}
-	if r := call(t, h, "POST", "/v1/entries", "big", `{"description":"`+strings.Repeat("x", 70<<10)+`"}`); r.code != 400 {
-		t.Errorf("a 70 KB body: %d %v", r.code, r.body)
+}
+
+// raw sends a request with exactly the given headers and body.
+func raw(t *testing.T, h http.Handler, method, path string, header map[string][]string, body string) response {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("%s %s: body %q is not JSON: %v", method, path, rec.Body.String(), err)
+	}
+	return response{rec.Code, rec.Header(), out}
+}
+
+// encoding/json quietly accepts things the API must not: bytes that aren't UTF-8 (turned into U+FFFD, so two names
+// became one account), a key given twice (the last wins), and keys that match a field only when case is ignored.
+// The API also wants a JSON content type and a body under 64 KB.
+func TestRESTRefusesWhatEncodingJSONWouldAccept(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	cash := createAccount(t, h, "cash:bank", "asset", "USD")
+	alice := createAccount(t, h, "wallet:alice", "liability", "USD")
+	jsonType := map[string][]string{"Content-Type": {"application/json"}}
+	keyed := func(keys ...string) map[string][]string {
+		return map[string][]string{"Content-Type": {"application/json"}, "Idempotency-Key": keys}
+	}
+	valid := fmt.Sprintf(`{"postings":[{"account_id":%d,"currency":"USD","amount":"1.00"},
+		{"account_id":%d,"currency":"USD","amount":"-1.00"}]}`, cash, alice)
+	cases := []struct {
+		name, path string
+		header     map[string][]string
+		body       string
+		code       int
+		reason     string
+		message    string
+	}{
+		{"not UTF-8", "/v1/accounts", jsonType, "{\"name\":\"caf\xe9\",\"type\":\"asset\",\"currency\":\"USD\"}", 400,
+			"malformed_request", "not valid UTF-8"},
+		{"a key twice", "/v1/accounts", jsonType, `{"name":"x","type":"asset","currency":"USD","name":"y"}`, 400,
+			"malformed_request", `"name" appears twice`},
+		{"a key in another case", "/v1/accounts", jsonType, `{"Name":"y","type":"asset","currency":"USD"}`, 400,
+			"malformed_request", `unknown field "Name"`},
+		{"an amount twice", "/v1/entries", keyed("k1"), fmt.Sprintf(`{"postings":[{"account_id":%d,"currency":"USD",
+			"amount":"1.00","amount":"2.00"},{"account_id":%d,"currency":"USD","amount":"-2.00"}]}`, cash, alice), 400,
+			"malformed_request", `"amount" appears twice`},
+		{"a capitalised field in a posting", "/v1/entries", keyed("k2"), fmt.Sprintf(`{"postings":[{"ACCOUNT_ID":%d,
+			"currency":"USD","amount":"1.00"},{"account_id":%d,"currency":"USD","amount":"-1.00"}]}`, cash, alice), 400,
+			"malformed_request", `unknown field "ACCOUNT_ID"`},
+		{"no content type", "/v1/entries", map[string][]string{"Idempotency-Key": {"k3"}}, valid, 415,
+			"unsupported_media_type", "application/json"},
+		{"text/plain", "/v1/entries", map[string][]string{"Content-Type": {"text/plain"}, "Idempotency-Key": {"k4"}},
+			valid, 415, "unsupported_media_type", ""},
+		{"two keys", "/v1/entries", keyed("k5", "k6"), valid, 400, "malformed_request", "exactly one Idempotency-Key"},
+		// A valid entry, padded past 64 KB: without the cap it would post.
+		{"over 64 KB", "/v1/entries", keyed("k7"), valid + strings.Repeat(" ", 64<<10), 413, "request_too_large",
+			"at most 65536 bytes"},
+		{"an array", "/v1/entries", keyed("k8"), `[]`, 400, "malformed_request", "the body must be a JSON object"},
+		{"a huge account id", "/v1/entries", keyed("k9"), `{"postings":[{"account_id":99999999999999999999,
+			"currency":"USD","amount":"1.00"}]}`, 400, "malformed_request", "fits in 64 bits"},
+		{"an empty body", "/v1/entries", keyed("k10"), ``, 400, "malformed_request", "empty or cut short"},
+	}
+	for _, tc := range cases {
+		r := raw(t, h, "POST", tc.path, tc.header, tc.body)
+		if reason, _ := r.reason(); r.code != tc.code || reason != tc.reason || !strings.Contains(r.message(), tc.message) {
+			t.Errorf("%s: %d %s %q; want %d %s mentioning %q", tc.name, r.code, reason, r.message(), tc.code,
+				tc.reason, tc.message)
+		}
+		if strings.Contains(r.message(), "Go value") || strings.Contains(r.message(), "server.") {
+			t.Errorf("%s: the message names Go types: %q", tc.name, r.message())
+		}
+	}
+	// A charset parameter is fine, and so is the same valid entry under the cap.
+	if r := raw(t, h, "POST", "/v1/entries", map[string][]string{"Content-Type": {"application/json; charset=utf-8"},
+		"Idempotency-Key": {"ok"}}, valid); r.code != http.StatusCreated {
+		t.Fatalf("the valid entry: %d %v", r.code, r.body)
+	}
+	if r := call(t, h, "GET", fmt.Sprintf("/v1/accounts/%d/postings", alice), "", ""); len(r.body["postings"].([]any)) != 1 {
+		t.Fatalf("a refused request posted something: %v", r.body)
+	}
+}
+
+func TestRouterErrorsAreJSON(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	if r := call(t, h, "GET", "/v1/nope", "", ""); r.code != 404 {
+		t.Errorf("an unknown path: %d %v", r.code, r.body)
+	} else if reason, _ := r.reason(); reason != "not_found" {
+		t.Errorf("an unknown path: reason %q", reason)
+	}
+	r := call(t, h, "DELETE", "/v1/accounts/1", "", "")
+	if reason, _ := r.reason(); r.code != 405 || reason != "method_not_allowed" || !strings.Contains(r.header.Get("Allow"), "GET") {
+		t.Errorf("DELETE an account: %d %v, Allow %q", r.code, r.body, r.header.Get("Allow"))
+	}
+}
+
+func TestADefaultPageSaysWhereTheNextStarts(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	s := store.New(db)
+	h := server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, s, quiet)
+	ctx := context.Background()
+	open := func(name string, typ ledger.AccountType) int64 {
+		a, _, err := s.CreateAccount(ctx, ledger.NewAccount{Name: name, Type: typ, Currency: "USD", AllowNegative: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a.ID
+	}
+	a, b := open("a", ledger.Asset), open("b", ledger.Asset)
+	for i := range store.DefaultPageSize + 1 {
+		if _, _, err := s.PostEntry(ctx, fmt.Sprintf("p%d", i), ledger.Entry{Postings: []ledger.Posting{
+			{AccountID: a, Currency: "USD", Amount: 1}, {AccountID: b, Currency: "USD", Amount: -1}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := call(t, h, "GET", fmt.Sprintf("/v1/accounts/%d/postings", a), "", "")
+	if n := len(r.body["postings"].([]any)); n != store.DefaultPageSize || r.body["next_after_version"] != float64(store.DefaultPageSize) {
+		t.Fatalf("default page: %d lines, next_after_version %v", n, r.body["next_after_version"])
 	}
 }
 
@@ -252,6 +378,7 @@ func TestARequestStuckOnALockGivesUpAtItsDeadline(t *testing.T) {
 	backstop, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req := httptest.NewRequest("POST", "/v1/entries", strings.NewReader(pay)).WithContext(backstop)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "pay-1")
 	rec := httptest.NewRecorder()
 	start := time.Now()

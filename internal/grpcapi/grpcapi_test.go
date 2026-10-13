@@ -3,6 +3,7 @@ package grpcapi_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -281,3 +282,41 @@ func TestGRPCRedactsUnplannedErrors(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestGRPCDefaultPageAndMessageCap(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	s := store.New(db)
+	lis := bufconn.Listen(1 << 20)
+	srv := grpcapi.New(s, quiet)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	conn, err := grpc.NewClient("passthrough:///ledger",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := ledgerv1.NewLedgerServiceClient(conn)
+	ctx := context.Background()
+	a, b := open(t, c, "a", ledgerv1.AccountType_ACCOUNT_TYPE_ASSET, "USD"),
+		open(t, c, "b", ledgerv1.AccountType_ACCOUNT_TYPE_LIABILITY, "USD")
+	for i := range store.DefaultPageSize + 1 {
+		if _, err := c.PostEntry(ctx, &ledgerv1.PostEntryRequest{IdempotencyKey: fmt.Sprintf("p%d", i),
+			Postings: []*ledgerv1.Posting{posting(a, 1), posting(b, -1)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := c.ListPostings(ctx, &ledgerv1.ListPostingsRequest{AccountId: a})
+	if err != nil || len(page.GetPostings()) != store.DefaultPageSize || page.NextAfterVersion == nil ||
+		page.GetNextAfterVersion() != int64(store.DefaultPageSize) {
+		t.Fatalf("default page: %d lines, next %v, %v", len(page.GetPostings()), page.NextAfterVersion, err)
+	}
+	// Over the 64 KB cap gRPC refuses the message itself, before the service sees it.
+	_, err = c.PostEntry(ctx, &ledgerv1.PostEntryRequest{IdempotencyKey: "big", Description: strings.Repeat("d", 70<<10),
+		Postings: []*ledgerv1.Posting{posting(a, 1), posting(b, -1)}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("a 70 KB message: %v, want ResourceExhausted", err)
+	}
+}
