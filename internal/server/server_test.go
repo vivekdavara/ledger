@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
@@ -108,5 +109,19 @@ func TestReadyzAgainstARealDatabase(t *testing.T) {
 	want := fmt.Sprintf("schema is at version 0, this binary needs %d", len(migrations))
 	if code != 503 || !strings.Contains(body["reason"], want) {
 		t.Fatalf("unmigrated schema: got %d %v", code, body)
+	}
+}
+
+func TestReadyzDoesNotShowConnectionDetails(t *testing.T) {
+	// A pool whose database is nowhere: nothing listens on port 1. pgxpool connects lazily, so New succeeds.
+	down, err := pgxpool.New(context.Background(), "postgres://ledger_admin@127.0.0.1:1/ledger_prod?connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer down.Close()
+	h := server.New(func(ctx context.Context) error { return store.Ready(ctx, down) }, nil, quiet)
+	code, body := get(t, h, "GET", "/readyz")
+	if code != 503 || body["reason"] != "database unavailable" {
+		t.Fatalf("got %d %v, want 503 and only \"database unavailable\"", code, body)
 	}
 }

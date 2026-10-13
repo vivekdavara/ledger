@@ -4,12 +4,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/vivekdavara/ledger/internal/ledger"
+	"github.com/vivekdavara/ledger/internal/store"
 )
 
 // ReadyFunc reports whether the service can do its job right now: nil if it can, an error saying why not if not.
@@ -41,7 +43,13 @@ func newHandler(ready ReadyFunc, svc ledger.Service, log *slog.Logger, timeout t
 		defer cancel()
 		if err := ready(ctx); err != nil {
 			log.Warn("not ready", "err", err)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready", "reason": err.Error()})
+			// /readyz shares the API's port: a database that doesn't answer is reported without its connection
+			// details (user, database, host), which go to the log (found in review).
+			reason := err.Error()
+			if errors.Is(err, store.ErrUnavailable) {
+				reason = store.ErrUnavailable.Error()
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready", "reason": reason})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})

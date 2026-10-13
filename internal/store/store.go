@@ -53,6 +53,10 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// ErrUnavailable is wrapped by Ready's error when the database doesn't answer. The rest of that error names the
+// user, database and host, so /readyz shows only this part.
+var ErrUnavailable = errors.New("database unavailable")
+
 // Ready reports whether the database answers and its schema is at this binary's newest migration. A server
 // that isn't ready shouldn't get traffic: it would fail every request, or run against a schema it doesn't match.
 func Ready(ctx context.Context, db Querier) error {
@@ -67,7 +71,7 @@ func Ready(ctx context.Context, db Querier) error {
 	case errors.As(err, &pgErr) && pgErr.Code == "42P01": // undefined_table: never migrated
 		version = 0
 	case err != nil:
-		return fmt.Errorf("database unavailable: %w", err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	if latest := len(migrations); version != latest {
 		return fmt.Errorf("schema is at version %d, this binary needs %d: run ledgerd migrate", version, latest)

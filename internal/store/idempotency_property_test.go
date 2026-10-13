@@ -22,7 +22,8 @@ import (
 func TestPropertyEachKeyPostsOnce(t *testing.T) {
 	t.Parallel()
 	db := storetest.Migrated(t)
-	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 50, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
+	// Generous attempts: this tests exactly-once, not the retry budget, and every send here collides with others.
+	s := store.NewWithRetry(db, store.RetryPolicy{Attempts: 1000, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond})
 	ctx := context.Background()
 	// Accounts that may go negative, so every valid entry posts whatever order the sends land in.
 	var accounts []int64
