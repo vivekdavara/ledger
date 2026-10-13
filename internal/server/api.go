@@ -310,9 +310,11 @@ func jsonType(e *json.UnmarshalTypeError) string {
 	return e.Type.String()
 }
 
+// pathID reads the account id in the path. Only a non-integer is malformed here; the service refuses an id that
+// can't exist (zero or negative) the same way for both APIs.
 func pathID(r *http.Request) (int64, error) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
+	if err != nil {
 		return 0, fmt.Errorf("%w: %q is not an account id", apierr.ErrMalformed, r.PathValue("id"))
 	}
 	return id, nil

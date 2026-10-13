@@ -105,8 +105,21 @@ func (s *Store) CreateAccount(ctx context.Context, a ledger.NewAccount) (_ ledge
 	return acct, false, nil
 }
 
+// validID refuses an account id that no account can have, as a request error rather than "not found": in gRPC an
+// unset id arrives as 0.
+func validID(id int64) error {
+	if id <= 0 {
+		return &ledger.ValidationError{Rule: ledger.ErrAccountID, Posting: -1,
+			Detail: fmt.Sprintf("account id %d is not positive", id)}
+	}
+	return nil
+}
+
 // Account returns one account, with its balance as of now.
 func (s *Store) Account(ctx context.Context, id int64) (ledger.Account, error) {
+	if err := validID(id); err != nil {
+		return ledger.Account{}, err
+	}
 	acct, err := scanAccount(s.db.QueryRow(ctx, `SELECT `+accountColumns+` FROM accounts WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Account{}, fmt.Errorf("%w: there is no account %d", ledger.ErrAccountNotFound, id)
@@ -128,6 +141,9 @@ var ErrPage = errors.New("invalid page")
 // and have no gaps, so a page is stable however many postings arrive while a client pages. A limit of 0 means
 // DefaultPageSize.
 func (s *Store) History(ctx context.Context, accountID, afterVersion int64, limit int) ([]ledger.HistoryLine, error) {
+	if err := validID(accountID); err != nil {
+		return nil, err
+	}
 	if limit == 0 {
 		limit = DefaultPageSize
 	}
