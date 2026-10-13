@@ -137,3 +137,52 @@ func balanceOf(t *testing.T, db *pgxpool.Pool, account int64) (balance, version 
 	}
 	return balance, version
 }
+
+// pad adds accounts unused accounts and entries two-posting entries between them (each padding account in at most
+// one), then runs ANALYZE, so that Postgres plans the ledger's queries as it would for tables of that size: through
+// their indexes rather than by scanning a page or two.
+func pad(tb testing.TB, db *pgxpool.Pool, accounts, entries int) {
+	tb.Helper()
+	if 2*entries > accounts {
+		tb.Fatalf("%d entries need %d padding accounts, not %d", entries, 2*entries, accounts)
+	}
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, step := range []struct {
+		sql string
+		n   int
+	}{
+		{`INSERT INTO accounts (name, type, currency, allow_negative)
+		  SELECT 'padding:' || n, 'liability', 'USD', true FROM generate_series(1, $1::int) n`, accounts},
+		{`INSERT INTO journal_entries (description, posting_count) SELECT 'padding', 2 FROM generate_series(1, $1::int)`,
+			entries},
+		// Entry k gets padding accounts 2k-1 and 2k, so no account is in two postings of this one statement.
+		{`WITH pads AS (SELECT id, row_number() OVER (ORDER BY id) AS n FROM accounts WHERE name LIKE 'padding:%'),
+		       padded AS (SELECT id, row_number() OVER (ORDER BY id) AS n FROM journal_entries
+		                   WHERE description = 'padding' LIMIT $1::int)
+		  INSERT INTO postings (entry_id, account_id, currency, amount, balance_after, account_version)
+		  SELECT e.id, p.id, 'USD', CASE WHEN p.n % 2 = 0 THEN 1 ELSE -1 END, 0, 1
+		    FROM pads p JOIN padded e ON e.n = (p.n + 1) / 2`, entries},
+	} {
+		if _, err := tx.Exec(ctx, step.sql, step.n); err != nil {
+			tb.Fatalf("pad: %v", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		tb.Fatalf("pad: %v", err)
+	}
+	analyze(tb, db)
+}
+
+// analyze refreshes the planner's statistics for the ledger's tables in db's schema only: a bare ANALYZE would do
+// every schema in the test database, other tests' included.
+func analyze(tb testing.TB, db *pgxpool.Pool) {
+	tb.Helper()
+	if _, err := db.Exec(context.Background(), `ANALYZE accounts, journal_entries, postings, idempotency_keys`); err != nil {
+		tb.Fatal(err)
+	}
+}

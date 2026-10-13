@@ -92,8 +92,10 @@ type Store struct {
 	isolation Isolation
 	retries   atomic.Int64
 
-	// hook, when set by a test, runs at named points of a PostEntry attempt.
-	hook func(point string, attempt int)
+	// hook, when set by a test, runs at named points of a PostEntry attempt; commitHook runs just before the commit,
+	// inside the attempt's transaction.
+	hook       func(point string, attempt int)
+	commitHook func(tx pgx.Tx) error
 }
 
 // New returns a Store that posts with DefaultRetry at DefaultIsolation.
@@ -420,6 +422,11 @@ func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.
 		return ledger.PostedEntry{}, translate(err)
 	}
 	s.at("commit", attempt)
+	if s.commitHook != nil {
+		if err := s.commitHook(tx); err != nil {
+			return ledger.PostedEntry{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ledger.PostedEntry{}, translate(err)
 	}
