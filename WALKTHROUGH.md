@@ -9,7 +9,8 @@ retries, idempotency keys). Read DESIGN.md first for the full picture.
 `internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
 `internal/store/migrate.go` → `internal/store/differential_test.go`. For day 2: `internal/store/ledger.go`
 (`PostEntry` and `postOnce`) → `internal/ledger/posted.go` (`Entry.Hash`) → `internal/apierr/apierr.go` →
-`internal/server/api.go` → `internal/grpcapi/grpcapi.go` → `internal/store/service_test.go`.
+`internal/server/api.go` → `internal/grpcapi/grpcapi.go` → `internal/store/service_test.go` and
+`internal/store/concurrency_test.go` → `cmd/ledgerd/main.go` (`serve`).
 
 ## The model
 

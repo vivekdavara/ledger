@@ -441,6 +441,14 @@ response, then retries it with the same idempotency key, and checks that the eff
   matches its postings, and every account's history is an unbroken chain.
 - **Tests that are checked against a broken build.** The concurrency and commit-time tests were each run once
   with the mechanism they test removed (the advisory lock, either deferred trigger), to see them fail.
+- **Day 2: the service.** A second differential property test checks the service's account checks against the
+  database's constraints, for every account type, overdraft setting and balance out to the edges of `bigint`. A
+  property test sends random concurrent requests with repeated and conflicting keys and checks that each key posts
+  exactly once. Concurrency is tested deterministically, not by hoping for a race: a test transaction holds an
+  account's row and commits once an attempt waits for it (`pg_blocking_pids`), which gives a real `40001`; a
+  deadlock is built on purpose, with the test's session given a long `deadlock_timeout` so the attempt is the one
+  aborted; `NOWAIT` probes show which rows a waiting attempt holds. Every one of these was run against a build
+  without the mechanism it tests, and the review agents' list of tests that couldn't fail drove most of them.
 
 ## Limitations
 

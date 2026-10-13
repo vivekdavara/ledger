@@ -222,8 +222,7 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	}
 	hash := e.Hash()
 	for attempt := 1; ; attempt++ {
-		posted, found, err := s.lookUp(ctx, key, hash[:])
-		if err != nil || found {
+		if posted, found, err := s.lookUp(ctx, key, hash[:]); err != nil || found {
 			return posted, found, err
 		}
 		s.at("looked up", attempt)
