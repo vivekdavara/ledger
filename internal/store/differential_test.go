@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/money"
+	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 	"pgregory.net/rapid"
 )
@@ -176,9 +177,15 @@ func TestPropertyDatabaseAgreesWithTheValidator(t *testing.T) {
 }
 
 // checkBooks recomputes the ledger from its postings and fails on any difference: every currency's balances sum to
-// zero, each balance is the sum of its account's postings, and each account's history is a gapless chain.
+// zero, each balance is the sum of its account's postings, and each account's history is a gapless chain. It also
+// requires a clean store.Reconcile, so every test that writes and then checks its books also checks that each entry
+// has exactly one outbox event and no row is orphaned, whatever write path it used (COPY, a writable CTE, ON
+// CONFLICT, savepoints, ...).
 func checkBooks(t *testing.T, db *pgxpool.Pool) {
 	t.Helper()
+	if r, err := store.Reconcile(context.Background(), db); err != nil || !r.Clean() {
+		t.Errorf("reconcile: %v, found %v", err, found(r))
+	}
 	checks := map[string]string{
 		"currencies whose balances don't sum to zero": `
 			SELECT count(*) FROM (SELECT currency FROM accounts GROUP BY currency HAVING sum(balance) <> 0) c`,
