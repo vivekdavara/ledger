@@ -177,6 +177,7 @@ Three migrations, one per kind of rule, then the fixes and the API's additions:
 - `0007_pin_search_path.sql`: every ledger function resolves names in its own schema (see "Limitations").
 - `0008_api.sql` (day 2): the `idempotency_keys` table, and `accounts_balance_negatable`, which keeps every balance
   above -2^63 so the API's shown balance always fits.
+- `0009_outbox.sql` (day 3): the `outbox` table and the trigger that gives every entry its event (see "Outbox").
 
 ```
 currencies       code PK, exponent
@@ -187,6 +188,8 @@ postings         id PK, entry_id → journal_entries, (account_id, currency) →
                  amount, balance_after, account_version,
                  UNIQUE (entry_id, account_id), UNIQUE (account_id, account_version)
 idempotency_keys key PK, request_hash (32 bytes), entry_id → journal_entries UNIQUE, created_at
+outbox           id PK, entry_id → journal_entries UNIQUE, created_at, published_at, attempts, last_error;
+                 partial index on id WHERE published_at IS NULL
 ```
 
 Ids are `BIGINT GENERATED ALWAYS AS IDENTITY`: small, ordered, and easy to lock in a fixed order. This is an
@@ -233,16 +236,85 @@ path, which nothing here needs yet.
 
 ## Concurrency (days 2 and 3)
 
-- **Day 2: serializable transactions with retries.** Each attempt at posting an entry is one `SERIALIZABLE`
-  transaction. It locks the entry's accounts in id order (`SELECT ... WHERE id = ANY($1) ORDER BY id FOR UPDATE`;
-  the lock is taken row by row as the sorted rows come out), so two entries never wait for each other in a cycle.
-  Under `SERIALIZABLE`, an attempt that finds an account row changed since its snapshot fails with `40001` instead
-  of waiting, and is retried: see "Posting an entry, step by step" below.
-- **Day 3: row locking compared with optimistic concurrency.** The same transfer under `READ COMMITTED`, where
-  concurrent updates of an account row wait for each other, against `SERIALIZABLE`, where one of them fails and
-  retries. The comparison measures throughput and retries on a hot account and on spread-out accounts. A property
-  test runs random concurrent transfers and checks that every currency still sums to zero and every account's
-  chain is intact.
+Each attempt at posting an entry is one transaction. It locks the entry's accounts in id order (`SELECT ... WHERE
+id = ANY($1) ORDER BY id FOR UPDATE`; the rows are locked one by one as the sorted rows come out), so two entries
+never wait for each other in a cycle, and checks the rules that need the accounts while it holds them. Day 2 ran
+it at `SERIALIZABLE`, retrying `40001`. Day 3 made the level a setting (`store.Options.Isolation`,
+`LEDGER_ISOLATION`), compared the two, and made `READ COMMITTED` the default.
+
+### Why both levels keep every rule
+
+A posting attempt decides only on:
+
+1. **rows it has locked:** the accounts, locked `FOR UPDATE` before any check, and locked again (already held) by the
+   posting trigger, which computes each `balance_after` from the row it locked;
+2. **rows it wrote itself:** the commit-time check reads the entry's own postings;
+3. **the idempotency key,** read outside the transaction (both levels) and backed by its primary key: a request
+   that loses a race for a key fails on it with `23505`, retries, and replays.
+
+The two levels differ in what a concurrent change to a locked account does. At `READ COMMITTED` a `FOR UPDATE` that
+waited for another transaction returns the row as that transaction committed it (Postgres re-reads the newest
+version), so the check that follows sees the committed balance. At `SERIALIZABLE` the same wait ends in `40001`,
+because the row changed after the attempt's snapshot, and the retry reads the new row.
+`TestAWaitingAttemptDecidesOnTheCommittedBalance` shows both: another transaction spends Alice's money while an
+attempt waits for her row, and the overdraft is refused by the service's own check, naming the posting, at both
+levels, after 0 retries at `READ COMMITTED` and 1 at `SERIALIZABLE`. The concurrency tests and the property tests
+(below) run at each level.
+
+What `SERIALIZABLE` would add is protection for code that decides on rows it hasn't locked: a velocity limit that
+sums an account's last hour of postings, say, where two concurrent payments could each see room for one more (write
+skew). At `READ COMMITTED` such a check must lock what it reads, or be a constraint. That is the price of the
+default, and why the level is still a setting.
+
+### Why serializable aborts transfers that share nothing
+
+At `SERIALIZABLE` Postgres records what each transaction has read (SIRead locks), and of two concurrent transactions
+that each wrote something the other read, it aborts one. `TestWhatASerializablePostingHasRead` lists what one
+posting has read just before it commits, with the commit-time checks run early so that their reads are included:
+
+| Ledger | What one posting has read |
+|---|---|
+| a few accounts and entries | the whole of `accounts`, `journal_entries` and `postings` (sequential scans) |
+| 10,000 accounts | two index pages of `accounts`, and still the whole of `journal_entries` and `postings` |
+| 20,000 accounts, 10,000 entries | index pages only: `accounts_pkey`, `accounts_id_currency`, and the last leaf pages of `journal_entries_pkey` and `postings_one_per_account` |
+
+Every posting writes an entry and its postings. A transaction that read the whole table, or the index page where
+new rows land, therefore has a read-write dependency on every concurrent posting, both ways: a cycle, and one of the
+two is aborted, though they share no account. As the ledger grows the reads narrow to index pages, but new entry
+ids all go to the same last leaf page, so concurrent postings still collide there. The reads that cause it are the
+commit-time check's reads of the entry's own rows, which no other transaction can change; Postgres can't know that.
+
+### Measured
+
+`make bench-contention` (`BenchmarkContention`): 16 workers post 3,000 two-posting transfers, one connection each;
+medians of 3 runs at `38041c6`, Apple M3, Postgres 14 at default settings, on power. Layouts: **disjoint** (each
+worker moves money between two wallets of its own), **random** (two of 100 wallets), **hot** (100 wallets paying one
+merchant account). "Padded" adds 20,000 accounts and 10,000 entries first (`-padding 20000`), so reads are planned as
+for tables of that size.
+
+| Ledger | Layout | Read committed: transfers/s, retries, gave up, p99 | Serializable: transfers/s, retries/transfer, gave up, p99 |
+|---|---|---|---|
+| padded | disjoint | 6,231, 0, 0, 24 ms | 4,042, 0.55, 0, 35 ms |
+| padded | random | 6,370, 0, 0, 12 ms | 3,787, 0.73, 0–1, 35 ms |
+| padded | hot | 2,113, 0, 0, 52 ms | 1,755, 0.80, 66–78, 195 ms |
+| small | disjoint | 4,365, 0, 0, 38 ms | 1,790, 0.59, 99–113, 208 ms |
+| small | random | 1,629, 0, 0, 87 ms | 1,512, 0.56, 137–144, 210 ms |
+| small | hot | 541, 0, 0, 110 ms | 801, 1.14, 191–294, 234 ms |
+
+"Gave up" is a transfer that ran out of its 10 attempts and returned `conflict` to its client. Transfers/s counts
+every transfer that finished, those that gave up included.
+
+- On the padded ledger `READ COMMITTED` posts 1.2 to 1.7 times as many transfers a second and never retries.
+  `SERIALIZABLE` retries 0.55 to 0.80 times a transfer, and on the hot account 2 to 3% of transfers give up.
+- On small tables `SERIALIZABLE` gives up on 3.3 to 3.8% of the disjoint transfers, which share nothing, from the
+  whole-table reads above (4.6 to 4.8% of the random ones). Its higher raw rate on the small hot account comes with
+  6 to 10% of transfers failing; counting only those that posted, it is 597 to 956 a second against 445 to 556.
+- The small-table runs are slower overall. A likely cause, not measured: their statistics were taken while the
+  tables were tiny, so the commit-time check may go on scanning `postings` as it grows through the run. The padded
+  runs are the comparison that matters.
+- `READ COMMITTED`'s hot account is one queue: every transfer holds the merchant's row from its first statement to
+  its commit (the merchant has the lowest id, so it is locked first), so about 0.47 ms of each transfer is serial.
+  "Limitations" lists the known fixes.
 
 ## API (day 2)
 
@@ -316,7 +388,7 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
 1. Look up the key, outside any transaction. The same hash: load the entry and return it as a replay. A different
    hash: `ErrKeyReused`. A replay needs no transaction: the key commits with its entry and postings, and history is
    append-only.
-2. `BEGIN ISOLATION LEVEL SERIALIZABLE`.
+2. `BEGIN` at the store's isolation level: `READ COMMITTED` by default since day 3, or `SERIALIZABLE`.
 3. Lock the entry's accounts in id order with `FOR UPDATE`, and check what needs them, naming the posting at fault.
    This first statement also fixes the transaction's snapshot. The checks:
    the account exists (`unknown_account`), is in the posting's currency (`currency_mismatch`), isn't overdrawn by it
@@ -340,8 +412,9 @@ inserting a key there then counted as a conflict:
 transfers with no account and no key in common made each other retry. With 16 workers each moving money between
 its own two wallets (25 transfers each, three runs), 215 to 324 attempts were retried and 1 or 2 requests ran out
 of attempts. With the lookup outside, 68 to 142 were retried and none ran out (`TestDisjointTransfersRetries`; the
-README has the runs). The rest are left for day 3: the commit-time check reads postings and entries, and their
-index pages are shared too. After 10 attempts the result is `ErrConflict`
+README has the runs). Day 3 found where the rest come from: the commit-time check reads the entries and postings tables
+whole while they are small, and their last index pages after that (and on small tables the account lock reads all
+of `accounts`); see "Why serializable aborts transfers that share nothing". After 10 attempts the result is `ErrConflict`
 (`conflict`, HTTP 409, gRPC `ABORTED`): safe to retry with the same key. Nothing else is retried; a lost
 connection is reported as `unavailable` (503), and the client's retry with its key is what makes that safe.
 
@@ -410,14 +483,85 @@ There is no `protoc` or `buf` on this Mac, so the generators are Go tools pinned
 proto file with buf's `STANDARD` rules and regenerates `internal/gen`; the generated code is committed, so a build
 never needs the generators.
 
-## Outbox and reconciliation (day 3)
+## Outbox (day 3)
 
-- **Transactional outbox.** Each posted entry writes an `entry_posted` event row in the same transaction. A
-  publisher reads unpublished rows in order (`FOR UPDATE SKIP LOCKED`), delivers them, and marks them sent. Events
-  are delivered at least once, so consumers dedupe by event id.
-- **Reconciliation job.** It recomputes everything from postings and compares it with the stored state: each
-  balance against the sum of its postings and against the last `balance_after`, version gaps, every entry's sums,
-  and each currency's total. It reports any difference; it never fixes data silently.
+Other systems need to hear about every entry: notifications, analytics, a data warehouse. Writing to a broker from
+`PostEntry` after the commit would lose events when the process dies in between, and writing before it would
+announce entries that then roll back. So the event is written to a table in the entry's own transaction (a
+transactional outbox), and a separate publisher delivers it.
+
+- **One event per entry, written by a trigger** (migration 0009). An `AFTER INSERT` trigger on `journal_entries`
+  inserts the entry's `outbox` row, so an entry and its event commit together or not at all, whichever client wrote
+  the entry: the service, a hand-written `psql` session, a future batch job. `outbox_one_per_entry` makes it at
+  most one, and the reconciliation's `entry_events` check makes sure it is at least one. The migration backfills
+  events for earlier entries; `CREATE TRIGGER` waits for transactions inserting entries and holds off new ones
+  until the migration commits, so no entry falls between the backfill and the trigger.
+- **The row holds only the entry's id.** Entries and postings are append-only, so the publisher builds the event
+  (`outbox.Event`: the entry, its description and time, and each posting with its `balance_after` and
+  `account_version`) from them when it delivers, and the event is the same whenever that is. No payload is
+  duplicated in the table.
+- **The publisher** (`internal/outbox`, `ledgerd publish`): one transaction per batch, at `READ COMMITTED` whatever
+  the session's default.
+  1. `SELECT id, entry_id FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`: the
+     oldest unpublished events, skipping any another publisher holds. A partial index over the unpublished rows
+     keeps this cheap however many have been published.
+  2. Build the events from the entries and postings, in one query.
+  3. Hand them to the `Sink`, with a 10 s deadline.
+  4. On success, `published_at = now()` and commit. On failure, record `attempts` and `last_error`, commit, and
+     leave them unpublished.
+  `Run` repeats this: at once after a full batch, after 200 ms after a short one, and with doubling waits up to 10 s
+  after failures.
+- **At least once, so consumers dedupe by event id.** If the sink took the events but the commit that marks them
+  is lost (a crash, a dropped connection), they are delivered again.
+  `TestEventsWhoseMarkIsLostAreDeliveredAgain` cancels the publisher's context the moment the sink returns: the
+  three events are delivered twice, and `outbox.Dedupe` leaves each once. Exactly-once delivery would need the
+  sink to take part in the transaction, which a broker or a pipe can't.
+- **Order.** Events are claimed in id order, but ids are handed out when a transaction inserts its entry, not when
+  it commits, so the stream isn't in commit order across accounts. What does hold, with one publisher, is **each
+  account's order**: the service locks an entry's accounts before it inserts the entry, so a later posting's event
+  is created only after the earlier posting's transaction committed, and a publisher that can see the later event
+  can see the earlier one. `TestOnePublisherKeepsEachAccountsOrder` checks it under six concurrent posters at both
+  isolation levels (`outbox.CheckOrder`: each account's versions 1, 2, 3, ... with none missing). Two publishers
+  can deliver an account's events out of order (each holds a different batch), and an entry written by hand that
+  inserts its entry before locking its accounts could too; a consumer that needs order uses `account_version`.
+- **Why poll, and not LISTEN/NOTIFY.** A `NOTIFY` in every posting's transaction would wake the publisher at once,
+  but Postgres serialises the commits of notifying transactions on one global lock, which would put every posting
+  in one queue. A 200 ms poll on a partial index costs little.
+
+`ledgerd publish` writes each event as a line of JSON on stdout, so it can feed any consumer through a pipe; a
+broker sink (Kafka, a webhook) would implement the same `Sink` interface.
+
+## Reconciliation (day 3)
+
+`store.Reconcile` (and `ledgerd reconcile`) recomputes the ledger from its postings and compares the result with
+what is stored. The rules above should make it find nothing; it is how anyone would find out that something got
+past them: a trigger switched off, a hand-made fix, a bug in a migration.
+
+| Check | Compares |
+|---|---|
+| `currency_totals` | each currency's balances sum to zero |
+| `account_balances` | each account's balance and version against the sum and count of its postings |
+| `last_balance_after` | each account's balance against its last posting's `balance_after` |
+| `account_chains` | each account's postings are versions 1, 2, 3, ..., each leaving the balance before plus its amount |
+| `entry_balances` | each entry's postings sum to zero in each currency |
+| `entry_posting_counts` | each entry has as many postings as it declares |
+| `entry_events` | each entry has its outbox event |
+| `protected_accounts` | no protected account is below zero on its normal side |
+
+- **One snapshot.** All of it runs in one read-only `REPEATABLE READ` transaction, so entries posted meanwhile are in
+  all of the report or none of it. `TestReconcilingWhilePostingSeesOneMoment` takes reports while four workers post:
+  every one is clean and its counts agree (two postings and one event per entry). At `READ COMMITTED` the counts are
+  taken at different moments, and the test fails (13 entries, 28 postings, 15 events in one report).
+- **It reports, never repairs.** Each check counts its differences and describes the first 10 in a stable order
+  ("entry 1 declares 2 postings and has 1"). A wrong balance is a question for a person: was a posting lost, or was
+  the balance changed by hand? Fixing it silently would destroy the evidence.
+- **Exit codes** for `ledgerd reconcile`: 0 clean, 3 differences found (the log names the checks), 1 it couldn't
+  run. It changes nothing, so it doesn't migrate either: on an old schema it stops and says to run `ledgerd
+  migrate`.
+- **Tested against real damage.** `TestEachKindOfDamageIsReported` damages a ledger in six ways its rules forbid,
+  as the tables' owner can (switching a guard trigger off, dropping a constraint): a balance moved by hand, a
+  posting deleted from a history, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft
+  let through. Each must be reported by exactly the checks that compare what it broke, and by no other.
 
 ## Load and failure injection (day 4)
 
@@ -449,6 +593,15 @@ response, then retries it with the same idempotency key, and checks that the eff
   deadlock is built on purpose, with the test's session given a long `deadlock_timeout` so the attempt is the one
   aborted; `NOWAIT` probes show which rows a waiting attempt holds. Every one of these was run against a build
   without the mechanism it tests, and the review agents' list of tests that couldn't fail drove most of them.
+- **Day 3: both levels, the outbox, reconciliation.** The concurrency tests and both service property tests run at
+  each isolation level (`atEachLevel`). A new property test sends batches of up to 24 random entries at once, in two
+  currencies and some converting between them, over protected and unprotected accounts: every entry is accepted or
+  refused for funds and nothing else, each balance is its old one plus the accepted postings, the postings returned
+  number each account's versions on with no gap or repeat, and no protected account is overdrawn at any version.
+  The outbox's tests cover each delivery outcome (published once, a failure recorded and retried, a lost mark
+  redelivered, a second publisher skipping the first's rows, one publisher keeping each account's order), and the
+  reconciliation's cover six kinds of damage made on purpose (see "Reconciliation"). Each mechanism was removed
+  once to see its test fail.
 
 ## Limitations
 
@@ -475,9 +628,19 @@ response, then retries it with the same idempotency key, and checks that the eff
   of the first's entry if the entries are identical). A multi-tenant API would scope keys by client.
 - **Idempotency keys never expire.** The table grows with every entry. A retention job would bound it, at the
   price that a retry later than the retention period posts again.
-- **Retries cost more than waits on a hot account.** Under `SERIALIZABLE`, concurrent entries on one account abort
-  and retry instead of queueing on the row lock. With enough contention the 10 attempts run out (`conflict`). Day 3
-  compares this with `READ COMMITTED`, where they wait instead.
+- **The default level relies on locking what it decides on.** At `READ COMMITTED` (the default since day 3), a new
+  check inside the posting transaction must lock the rows it reads, or be a constraint, or it can be fooled by a
+  concurrent posting (write skew). `SERIALIZABLE` catches that, at the cost measured under "Concurrency".
+- **A hot account is one queue.** At `READ COMMITTED` every transfer to the merchant in the benchmark held its row
+  for about 0.47 ms, so one account tops out near 2,100 transfers a second here; at `SERIALIZABLE` 2 to 3% of
+  them gave up instead.
+- **Outbox order and retention.** Events are in each account's order only with one publisher, and only for entries
+  posted through the service. Published rows are kept; a retention job could delete old ones, and the
+  reconciliation's `entry_events` check would then cover only entries newer than the retention period. A poison
+  event (one the sink always refuses) holds back everything behind it, since a batch is delivered whole; its
+  `attempts` and `last_error` show it.
+- **Reconciliation reads everything.** Each run scans every posting (546–571 ms for 200,000 here). A large ledger
+  would reconcile incrementally, from a checkpoint of balances already checked.
 - **A request's outcome can be unknown to its client.** If the connection drops during the commit, the client can't
   tell whether the entry posted; retrying with the same key is the answer, which is why the key is required.
 - **`created_at` is the transaction's start.** Postgres's `now()` is fixed at `BEGIN`, so an entry whose attempt
