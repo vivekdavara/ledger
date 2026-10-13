@@ -7,10 +7,12 @@ to zero in each currency, so money is moved, never created or destroyed. The rul
 validator, for clear errors, and by the database at commit, so no bug, second writer or hand-typed `psql` session
 can break it.
 
-> **Status: day 2 of 5.** Day 1: the money type, the entry validator, the schema with its database-enforced
+> **Status: day 3 of 5.** Day 1: the money type, the entry validator, the schema with its database-enforced
 > invariants, the migration runner, health endpoints and CI. Day 2: the API, REST on :8103 and gRPC on :9103 over
-> one service: accounts, balances, paged history, and posting entries atomically under `SERIALIZABLE` with
-> retries and idempotency keys. Next: concurrency strategies compared, an outbox and reconciliation (day 3).
+> one service: accounts, balances, paged history, and posting entries atomically with retries and idempotency keys.
+> Day 3: the two isolation levels compared under contention (`READ COMMITTED` is now the default), a property test
+> of random concurrent transfers, a transactional outbox with a publisher (`ledgerd publish`), and a reconciliation
+> job (`ledgerd reconcile`). Next: a load generator and failure injection (day 4).
 > [DESIGN.md](DESIGN.md) is the full design and the plan for the remaining days.
 
 ## Architecture
@@ -24,16 +26,20 @@ flowchart LR
     S["store.Store: validate, lock accounts in id order, check, post, store the key"]
     E[[internal/apierr: one error table]] -.- H
     E -.- P
-    S -- "SERIALIZABLE, retried on 40001 / 40P01" --> TBL
+    S -- "READ COMMITTED (or SERIALIZABLE), retried on 40001 / 40P01 / key 23505" --> TBL
     subgraph PG [PostgreSQL 14]
         TBL[("accounts, journal_entries, postings")]
         T1["posting triggers: lock and compute before the insert, write the balance after it"]
         T2["deferred check at commit: sums to zero per currency"]
         T3["append-only triggers, account guard"]
+        OB[("outbox: one event per entry, by trigger")]
         TBL --- T1
         TBL --- T2
         TBL --- T3
+        TBL -- "same transaction" --> OB
     end
+    OB -- "FOR UPDATE SKIP LOCKED, batches" --> PUB["ledgerd publish: events as JSON lines, at least once"]
+    TBL -. "one REPEATABLE READ snapshot" .-> REC["ledgerd reconcile: recompute from postings, report"]
 ```
 
 Amounts are `int64` minor units (cents, yen, fils); positive is a debit, negative a credit. An account's stored
@@ -87,6 +93,29 @@ curl -s localhost:8103/readyz
 
 `/livez` checks nothing and answers while the process runs. `/readyz` answers 200 only when the database responds
 within 2 s and its schema is at the binary's newest migration, and 503 with the reason otherwise.
+
+`LEDGER_ISOLATION` picks the posting transactions' level: `read-committed` (the default) or `serializable`. DESIGN.md,
+"Concurrency", says why both keep every rule and what each costs.
+
+```bash
+LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./cmd/ledgerd publish
+```
+
+`publish` delivers the outbox's events (one per entry, written in the entry's own transaction) as JSON lines on
+stdout, at least once each, until SIGTERM, so a consumer dedupes by `id`. The first line from the hand check, on the
+`ledger` database after migration 0009 backfilled its three entries' events:
+
+```json
+{"id":1,"type":"entry_posted","entry_id":1,"description":"Alice tops up $50","posted_at":"2026-10-12T11:24:20.435749-04:00","postings":[{"posting_id":1,"account_id":1,"currency":"USD","amount":5000,"balance_after":5000,"account_version":1},{"posting_id":2,"account_id":2,"currency":"USD","amount":-5000,"balance_after":-5000,"account_version":1}]}
+```
+
+```bash
+LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./cmd/ledgerd reconcile
+```
+
+`reconcile` recomputes the books from the postings in one snapshot and prints a JSON report of eight checks. It
+exits 0 when they all agree, 3 when any found a difference (the log names which), 1 when it couldn't run. It
+changes nothing, so it doesn't migrate: run it against a current schema.
 
 ## The API
 
@@ -143,7 +172,8 @@ were sent over gRPC.
 
 ## Tests
 
-122 test functions (several table-driven or property-based), all green locally and in CI:
+145 test functions (122 at the end of day 2; several table-driven or property-based, and the concurrency tests run
+at both isolation levels), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -184,9 +214,27 @@ were sent over gRPC.
 - `internal/grpcapi`: the gRPC API over an in-memory connection (bufconn) on a real schema: the same walkthrough,
   each error's code, `ErrorInfo` reason and posting, and the call deadline. `TestBothAPIsGiveTheSameReason` sends
   22 failing requests through both APIs and requires the same reason and posting from each.
+- `internal/store`, day 3: the concurrency tests and both service property tests run at each isolation level. An
+  attempt that waits for an account another transaction is changing decides on the balance as committed, at both
+  levels (0 retries at `READ COMMITTED`, 1 at `SERIALIZABLE`). A property test sends batches of up to 24 random
+  entries at once, in USD and EUR and some converting between them, over protected and unprotected accounts: each
+  is accepted or refused for funds and nothing else, each balance is its old one plus the accepted postings, the
+  returned postings number each account's versions with no gap or repeat, and no protected account is overdrawn at
+  any version. `TestWhatASerializablePostingHasRead` lists one posting's SIRead locks at three ledger sizes. Every
+  entry gets one outbox event, whatever writes it, and the migration backfills older entries. Reconciliation: a
+  healthy ledger is clean; six kinds of damage (made by switching a guard trigger off or dropping a constraint) are
+  each reported by exactly the checks they should trip; reports taken while entries are posted are all clean and
+  self-consistent, and that test fails if the report doesn't read one snapshot.
+- `internal/outbox`: each event published once, in order, with the postings `PostEntry` returned; a failed delivery
+  recorded and retried; a delivery whose mark is lost delivered again and deduped; a second publisher skipping the
+  first's rows without waiting; one publisher keeping each account's versions in order under six concurrent posters,
+  at both levels; `Run`'s backoff; JSON lines. Each mechanism (`SKIP LOCKED`, the mark, the failure record) was
+  removed once to see its test fail.
 - `cmd/ledgerd`: the real binary's `run`: migrations, an account created over REST and read back over gRPC from
   real ports, a clean shutdown of both, a taken port failing startup and releasing the other port, in-flight work
-  finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0.
+  finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0. Day 3: an unknown
+  `LEDGER_ISOLATION` refused, the level the store posts at shown in the log; `publish` writing the events of entries
+  posted before and while it runs; `reconcile`'s three exit codes, and that it leaves an old schema as it is.
 
 ## Results
 
@@ -264,6 +312,61 @@ LEDGER_TEST_DATABASE_URL="postgres://localhost:5432/ledger_test?sslmode=disable"
 
 For the "before" row, run that test (copied in) at `bc5e6f6`. The retries that remain are day 3's subject.
 
+### Day 3: the isolation levels under contention
+
+`make bench-contention` runs `BenchmarkContention` (`internal/store/contention_bench_test.go`): 16 workers, one
+connection each, post 3,000 two-posting transfers at each level, three times. **Disjoint**: each worker moves money
+between two wallets of its own. **Random**: between two of 100 wallets. **Hot**: 100 wallets pay one merchant
+account. The second half of the target pads the ledger with 20,000 accounts and 10,000 entries first, so Postgres
+plans its reads as for tables of that size. Medians of the three runs at `38041c6` (the posting path as it is now,
+outbox trigger included), Apple M3, Postgres 14.20 at default settings, on power, nothing else running:
+
+| Ledger | Layout | Read committed: transfers/s, retries/transfer, gave up, p99 | Serializable: transfers/s, retries/transfer, gave up, p99 |
+|---|---|---|---|
+| padded | disjoint | 6,231, 0, 0, 24 ms | 4,042, 0.55, 0, 35 ms |
+| padded | random | 6,370, 0, 0, 12 ms | 3,787, 0.73, 0–1, 35 ms |
+| padded | hot | 2,113, 0, 0, 52 ms | 1,755, 0.80, 66–78, 195 ms |
+| small | disjoint | 4,365, 0, 0, 38 ms | 1,790, 0.59, 99–113, 208 ms |
+| small | random | 1,629, 0, 0, 87 ms | 1,512, 0.56, 137–144, 210 ms |
+| small | hot | 541, 0, 0, 110 ms | 801, 1.14, 191–294, 234 ms |
+
+```bash
+make bench-contention
+```
+
+- **Read committed is faster on every padded layout, 1.2 to 1.7 times, and never retries.** Serializable retries
+  0.55 to 0.80 times a transfer, and 2 to 3% of the hot account's transfers run out of attempts and return
+  `conflict` to their client. That decided the default: `READ COMMITTED` since day 3 (`ec83ff1`).
+- **Serializable gives up on transfers that share nothing.** On small tables, 3.3 to 3.8% of the disjoint transfers
+  gave up. `TestWhatASerializablePostingHasRead` shows why: one posting has read the whole of `journal_entries` and
+  `postings` (and of `accounts`), and every concurrent posting writes there, so Postgres sees a read-write cycle.
+  On the padded ledger the reads shrink to index pages, but new entries all land on the same last page, and the
+  retries remain. DESIGN.md, "Why serializable aborts transfers that share nothing", has the lock lists.
+- On the small hot account serializable's raw rate is higher, but 6 to 10% of its transfers fail; counting only
+  those that posted, 597 to 956 a second against 445 to 556.
+- "Gave up" counts as finished in transfers/s. The p99s include serializable's backoff, up to 100 ms a retry.
+
+The day-2 test of disjoint transfers now runs at both levels: `TestDisjointTransfersRetries` (the command above)
+logged 0 retries at read committed and 198 retries, 2 gave up, at serializable in today's first run alongside the
+other tests.
+
+### Day 3: the outbox and reconciliation
+
+`make bench-outbox`, at `38041c6`, three runs each, same machine:
+
+| What | Result |
+|---|---|
+| One publisher draining 10,000 events into a JSON encoder, batch 100 (`BenchmarkPublish`) | 63,963–71,266 events/s |
+| The same, batch 1,000 | 107,173–107,830 events/s |
+| One reconciliation of 100,000 entries, 200,000 postings, 200,000 accounts (`BenchmarkReconcile`) | 546–571 ms |
+
+```bash
+make bench-outbox
+```
+
+The publisher's numbers are an upper bound for one process: the sink discards what it encodes. A real broker's
+acknowledgement would add its round trip per batch.
+
 ## Review of day 2
 
 After the API was built, two review agents read it, one for the store's posting logic and one for the REST and gRPC
@@ -323,13 +426,14 @@ it:
 ## Layout
 
 ```
-cmd/ledgerd/              the binary: migrate, and serve REST + gRPC
+cmd/ledgerd/              the binary: migrate, serve REST + gRPC, publish the outbox, reconcile
 proto/ledger/v1/          the gRPC API's definition
 internal/money/           currencies, amounts, exact parsing
 internal/ledger/          Entry, Posting, Validate; Account, its type and shown balance; the Service interface
-internal/store/           Open, the migration runner, Ready; Store, the service (ledger.go)
-internal/store/migrations 0001 to 0008 (DESIGN.md, "Schema", says what each does)
+internal/store/           Open, the migration runner, Ready; Store, the service (ledger.go); Reconcile
+internal/store/migrations 0001 to 0009 (DESIGN.md, "Schema", says what each does)
 internal/store/storetest/ a fresh schema per test
+internal/outbox/          the outbox's publisher, its sinks, Dedupe and CheckOrder
 internal/apierr/          the one table from errors to reasons, HTTP statuses and gRPC codes
 internal/server/          HTTP: health endpoints and the REST API (api.go)
 internal/grpcapi/         gRPC: LedgerService
