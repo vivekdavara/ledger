@@ -333,6 +333,17 @@ retried 0.55 to 0.80 times a transfer and gave up on 2 to 3% of the transfers to
 is a payment a customer sees fail. With the safety argument above and the tests at both levels, the measurement
 decided it (`ec83ff1`). The level stays a setting (`LEDGER_ISOLATION`).
 
+**Both modes take `FOR UPDATE`. Is this really row locking against optimistic concurrency?**
+Partly, and it's worth saying so. Postgres's `SERIALIZABLE` is optimistic (serializable snapshot isolation: run
+freely, abort one transaction when a dangerous pattern of reads and writes appears), but the ledger keeps its row
+locks in both modes, and couldn't drop them: the posting trigger locks the account to compute `balance_after`
+whatever the level. So at `SERIALIZABLE` two transfers on one account still queue on the row, and the waiter then
+fails with `40001` instead of carrying on: it pays for both the wait and the retry. What the comparison measures is
+whether serializable's extra checking is worth its aborts, on a design whose rules are already enforced by locks
+and constraints. A truly lock-free scheme (read a version, write only if it is unchanged, retry otherwise) would
+need the balance written by the application rather than a trigger, which day 1 rejected because the database
+would no longer guarantee the balance.
+
 **Why would `SERIALIZABLE` abort two transfers that share no account?**
 Because of what they read. Postgres's serializable mode records every read (SIRead locks), and of two concurrent
 transactions that each wrote something the other had read, it aborts one. `TestWhatASerializablePostingHasRead`
