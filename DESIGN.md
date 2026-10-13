@@ -515,7 +515,9 @@ transactional outbox), and a separate publisher delivers it.
   4. On success, `published_at = now()` and commit. On failure, record `attempts` and `last_error`, commit, and
      leave them unpublished.
   `Run` repeats this: at once after a full batch, after 200 ms after a short one, and with doubling waits up to 10 s
-  after failures.
+  after failures. A stop lets the batch in flight finish, delivered and marked (within the delivery timeout and 5 s
+  more), so a restart doesn't deliver it again. At first a stop could cancel the mark of a batch just delivered;
+  `ledgerd publish`'s test caught it now and then, with an event left unpublished.
 - **At least once, so consumers dedupe by event id.** If the sink took the events but the commit that marks them
   is lost (a crash, a dropped connection), they are delivered again.
   `TestEventsWhoseMarkIsLostAreDeliveredAgain` cancels the publisher's context the moment the sink returns: the

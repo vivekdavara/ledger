@@ -247,22 +247,30 @@ func load(ctx context.Context, tx pgx.Tx, ids, entryIDs []int64) ([]Event, error
 	return events, nil
 }
 
-// Run publishes until ctx is cancelled, and then returns ctx's error. After a full batch it publishes the next one
-// at once; after a short one it waits PollInterval. After a failure it waits too, twice as long each time in a row
-// up to MaxBackoff, and logs the failure through onError if that isn't nil.
+// markTimeout bounds how long marking a delivered batch may take, once a stop has been asked for.
+const markTimeout = 5 * time.Second
+
+// Run publishes until ctx is cancelled, and then returns ctx's error. A stop lets the batch in flight finish,
+// delivered and marked, so that a restart doesn't deliver it again; that takes at most DeliverTimeout and 5 s more.
+// (Before, a stop between a delivery and its mark cancelled the mark, and ledgerd publish's test failed now and then
+// with an event left unpublished.) After a full batch Run publishes the next one at once; after a short one it waits
+// PollInterval. After a failure it waits too (nextBackoff), and logs the failure through onError if that isn't nil.
 func (p *Publisher) Run(ctx context.Context, onError func(error)) error {
 	backoff := time.Duration(0)
-	for {
-		n, err := p.PublishOnce(ctx)
+	for ctx.Err() == nil {
+		batch, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.opts.DeliverTimeout+markTimeout)
+		n, err := p.PublishOnce(batch)
+		cancel()
+		if err != nil && onError != nil {
+			onError(err)
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		var wait time.Duration
 		switch {
-		case ctx.Err() != nil:
-			return ctx.Err()
 		case err != nil:
-			if onError != nil {
-				onError(err)
-			}
-			backoff = min(max(2*backoff, p.opts.PollInterval), p.opts.MaxBackoff)
+			backoff = p.opts.nextBackoff(backoff)
 			wait = backoff
 		case n == p.opts.BatchSize:
 			backoff = 0
@@ -275,10 +283,16 @@ func (p *Publisher) Run(ctx context.Context, onError func(error)) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
 		case <-timer.C:
 		}
 	}
+	return ctx.Err()
+}
+
+// nextBackoff is Run's wait after another failure in a row, given the wait after the one before (0 for the first):
+// PollInterval, then twice as long each time, up to MaxBackoff.
+func (o Options) nextBackoff(last time.Duration) time.Duration {
+	return min(max(2*last, o.PollInterval), o.MaxBackoff)
 }
 
 // Dedupe returns events without the ones whose id seen already holds, and adds the rest to seen: what a consumer

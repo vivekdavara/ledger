@@ -490,3 +490,44 @@ func TestALineCutOffByAFailedWriteLosesNoEvent(t *testing.T) {
 		}
 	}
 }
+
+// A stop lets the batch in flight finish, delivered and marked: here the stop comes while the sink holds the batch.
+func TestAStopLetsTheBatchInFlightFinish(t *testing.T) {
+	t.Parallel()
+	db, _, _ := ledgerWith(t, 3)
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	inDelivery := make(chan struct{})
+	sk := &sink{deliver: func(context.Context, []outbox.Event) error {
+		close(inDelivery) // the 3 events are one batch, so this runs once
+		<-ctx.Done()      // the stop arrives during the delivery
+		return nil
+	}}
+	running := make(chan error, 1)
+	go func() { running <- outbox.New(db, sk, outbox.Options{}).Run(ctx, nil) }()
+	<-inDelivery
+	stop()
+	if err := <-running; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v", err)
+	}
+	if n := unpublished(t, db); n != 0 || len(sk.events()) != 3 {
+		t.Fatalf("%d of %d delivered events left unpublished by the stop", n, len(sk.events()))
+	}
+}
+
+func TestTheBackoffDoublesUpToItsCap(t *testing.T) {
+	t.Parallel()
+	o := outbox.Options{PollInterval: 10 * time.Millisecond, MaxBackoff: 50 * time.Millisecond}
+	var waits []time.Duration
+	for wait, i := time.Duration(0), 0; i < 5; i++ {
+		wait = outbox.NextBackoff(o, wait)
+		waits = append(waits, wait)
+	}
+	want := []time.Duration{10, 20, 40, 50, 50}
+	for i := range want {
+		want[i] *= time.Millisecond
+	}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		t.Fatalf("waits %v, want %v", waits, want)
+	}
+}
