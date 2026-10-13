@@ -5,7 +5,10 @@ package apierr
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vivekdavara/ledger/internal/ledger"
@@ -92,11 +95,24 @@ func Classify(err error) Kind {
 			return row.kind
 		}
 	}
-	var connectErr *pgconn.ConnectError
-	if errors.As(err, &connectErr) || pgconn.Timeout(err) {
+	if databaseDown(err) {
 		return unavailable
 	}
 	return Internal
+}
+
+// databaseDown reports whether err means the database couldn't be reached or dropped the connection: a failed
+// connect, a connection exception (SQLSTATE class 08), an operator intervention such as a terminated backend or a
+// shutdown (class 57P), or the connection breaking mid-query. A retry with the same key is safe after any of them.
+func databaseDown(err error) bool {
+	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok || pgconn.Timeout(err) {
+		return true
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return strings.HasPrefix(pgErr.Code, "08") || strings.HasPrefix(pgErr.Code, "57P")
+	}
+	_, netErr := errors.AsType[net.Error](err)
+	return netErr || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // Posting returns the index of the posting an error is about, or -1 if it is about the request as a whole.

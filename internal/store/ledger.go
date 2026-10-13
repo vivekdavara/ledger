@@ -221,8 +221,7 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 			return posted, replayed, err
 		}
 		if attempt >= s.retry.Attempts {
-			return ledger.PostedEntry{}, false, fmt.Errorf("%w: gave up after %d attempts: %w",
-				ledger.ErrConflict, attempt, err)
+			return ledger.PostedEntry{}, false, &conflictError{attempts: attempt, last: err}
 		}
 		s.retries.Add(1)
 		timer := time.NewTimer(s.retry.delay(attempt))
@@ -234,6 +233,30 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 		}
 	}
 }
+
+// conflictError is ErrConflict once the attempts ran out. The last attempt's error stays reachable through
+// errors.Is and errors.As, but out of the message, which the APIs show to clients: Postgres's own text has no place
+// there.
+type conflictError struct {
+	attempts int
+	last     error
+}
+
+func (e *conflictError) Error() string {
+	why := "a serialization failure"
+	var pgErr *pgconn.PgError
+	if errors.As(e.last, &pgErr) {
+		switch pgErr.Code {
+		case "40P01":
+			why = "a deadlock"
+		case "23505":
+			why = "a concurrent request with the same key"
+		}
+	}
+	return fmt.Sprintf("%v: gave up after %d attempts, the last ended by %s", ledger.ErrConflict, e.attempts, why)
+}
+
+func (e *conflictError) Unwrap() []error { return []error{ledger.ErrConflict, e.last} }
 
 func (s *Store) at(point string, attempt int) {
 	if s.hook != nil {
@@ -419,11 +442,13 @@ func translate(err error) error {
 		"accounts_name_unique":           ledger.ErrNameTaken,
 		"idempotency_keys_key_format":    ledger.ErrIdempotencyKey,
 	}[pgErr.ConstraintName]
+	detail := "refused by the database's " + pgErr.ConstraintName + " check"
 	if pgErr.Code == "22003" { // numeric_value_out_of_range: a balance past bigint
-		rule = ledger.ErrBalanceRange
+		rule, detail = ledger.ErrBalanceRange, "a balance would pass the range of a bigint"
 	}
 	if rule == nil {
 		return err
 	}
-	return &ledger.ValidationError{Rule: rule, Posting: -1, Detail: "the database's check: " + pgErr.Message}
+	// The detail names the constraint (DESIGN.md lists them), not Postgres's message, which the APIs would show.
+	return &ledger.ValidationError{Rule: rule, Posting: -1, Detail: detail}
 }

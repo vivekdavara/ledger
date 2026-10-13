@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"testing"
 
@@ -88,5 +90,23 @@ func TestOnlyUnplannedAndUnavailableErrorsAreRedacted(t *testing.T) {
 		if row.kind.Redact {
 			t.Errorf("%v is redacted, but its message is the ledger's own", row.err)
 		}
+	}
+}
+
+func TestALostDatabaseIsUnavailableNotInternal(t *testing.T) {
+	for _, err := range []error{
+		&pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"},
+		&pgconn.PgError{Code: "57P02", Message: "terminating connection due to crash of another server process"},
+		&pgconn.PgError{Code: "08006", Message: "connection failure"},
+		io.ErrUnexpectedEOF,
+		&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")},
+	} {
+		if k := Classify(fmt.Errorf("post: %w", err)); k.Reason != "unavailable" || k.HTTP != 503 || !k.Redact {
+			t.Errorf("%v: %+v, want unavailable", err, k)
+		}
+	}
+	// A constraint violation is the ledger's business, not the database being down.
+	if k := Classify(&pgconn.PgError{Code: "23514", ConstraintName: "some_check"}); k.Reason != "internal" {
+		t.Errorf("an unmapped constraint: %+v", k)
 	}
 }

@@ -2,15 +2,18 @@ package grpcapi_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
 	"github.com/vivekdavara/ledger/internal/grpcapi"
+	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -227,3 +230,54 @@ func TestACallStuckOnALockGivesUpAtTheServersBound(t *testing.T) {
 		t.Fatalf("gave up after %v, not at the server's 300 ms bound", took)
 	}
 }
+
+// failing is a ledger.Service whose every call fails with err.
+type failing struct{ err error }
+
+func (f failing) CreateAccount(context.Context, ledger.NewAccount) (ledger.Account, bool, error) {
+	return ledger.Account{}, false, f.err
+}
+func (f failing) Account(context.Context, int64) (ledger.Account, error) {
+	return ledger.Account{}, f.err
+}
+func (f failing) History(context.Context, int64, int64, int) ([]ledger.HistoryLine, error) {
+	return nil, f.err
+}
+func (f failing) PostEntry(context.Context, string, ledger.Entry) (ledger.PostedEntry, bool, error) {
+	return ledger.PostedEntry{}, false, f.err
+}
+
+func TestGRPCRedactsUnplannedErrors(t *testing.T) {
+	var logs strings.Builder
+	var mu sync.Mutex
+	log := slog.New(slog.NewJSONHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	lis := bufconn.Listen(1 << 20)
+	srv := grpcapi.New(failing{errors.New("dial tcp 10.1.2.3:5432: query SELECT secret FROM vault")}, log)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	conn, err := grpc.NewClient("passthrough:///ledger",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = ledgerv1.NewLedgerServiceClient(conn).GetAccount(context.Background(), &ledgerv1.GetAccountRequest{Id: 1})
+	st := status.Convert(err)
+	if st.Code() != codes.Internal || st.Message() != codes.Internal.String() || strings.Contains(st.Message(), "10.1.2.3") {
+		t.Fatalf("got %v %q, want Internal with no details", st.Code(), st.Message())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(logs.String(), "10.1.2.3") {
+		t.Fatalf("the log doesn't have the whole error: %s", logs.String())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

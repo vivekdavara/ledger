@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
@@ -387,8 +388,13 @@ func TestRetriesRunOut(t *testing.T) {
 		}
 	})
 	_, _, err := s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
-	if !errors.Is(err, ledger.ErrConflict) || !strings.Contains(err.Error(), "after 3 attempts") {
-		t.Fatalf("got %v, want ErrConflict after 3 attempts", err)
+	if !errors.Is(err, ledger.ErrConflict) || err.Error() != ledger.ErrConflict.Error()+
+		": gave up after 3 attempts, the last ended by a serialization failure" {
+		t.Fatalf("got %q, want ErrConflict after 3 attempts and no Postgres text", err)
+	}
+	// The cause is still there for code that looks for it.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); !ok || pgErr.Code != "40001" {
+		t.Fatalf("the last attempt's 40001 isn't reachable: %v", err)
 	}
 	if s.Retries() != 2 {
 		t.Fatalf("%d retries, want 2", s.Retries())
