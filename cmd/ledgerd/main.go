@@ -4,8 +4,9 @@
 //	ledgerd serve     apply pending migrations, then serve REST and gRPC until SIGINT or SIGTERM
 //
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
-// endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103) and LEDGER_SHUTDOWN_GRACE (how long in-flight work
-// gets after a stop signal, default 10s). Logs are JSON lines on stderr.
+// endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103), LEDGER_SHUTDOWN_GRACE (how long in-flight work
+// gets after a stop signal, default 10s) and LEDGER_ISOLATION (the posting transactions' isolation level,
+// read-committed or serializable; see DESIGN.md, "Concurrency (day 3)"). Logs are JSON lines on stderr.
 package main
 
 import (
@@ -90,15 +91,22 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 			return 1
 		}
 	}
-	return serve(ctx, db, httpAddr, grpcAddr, grace, log, listening)
+	isolation := store.DefaultIsolation
+	if v := getenv("LEDGER_ISOLATION"); v != "" {
+		if isolation, err = store.ParseIsolation(v); err != nil {
+			log.Error("LEDGER_ISOLATION", "err", err)
+			return 1
+		}
+	}
+	return serve(ctx, db, store.NewWithOptions(db, store.Options{Isolation: isolation}), httpAddr, grpcAddr, grace,
+		log, listening)
 }
 
 // serve runs the REST and gRPC servers over one store until ctx is cancelled, then stops both gracefully: no new
 // connections, and in-flight requests and calls get the grace period to finish. Whatever is still running after
 // it is cut off: its context is cancelled, which cancels its database work, and its connection is closed.
-func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, grace time.Duration, log *slog.Logger,
-	listening chan<- addrs) int {
-	svc := store.New(db)
+func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, grpcAddr string, grace time.Duration,
+	log *slog.Logger, listening chan<- addrs) int {
 	// Every REST request's context derives from base. At the end of the grace period cutOff cancels them all, which
 	// stops the database work still running under them, and Close closes their connections (which by itself also
 	// cancels a request's context). With neither, the handlers would run on until their own deadline and the pool's
@@ -125,7 +133,7 @@ func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, gra
 		log.Error("listen", "addr", grpcAddr, "err", err)
 		return 1
 	}
-	log.Info("serving", "http", httpLn.Addr().String(), "grpc", grpcLn.Addr().String())
+	log.Info("serving", "http", httpLn.Addr().String(), "grpc", grpcLn.Addr().String(), "isolation", svc.Isolation())
 	if listening != nil {
 		listening <- addrs{HTTP: httpLn.Addr().String(), GRPC: grpcLn.Addr().String()}
 	}

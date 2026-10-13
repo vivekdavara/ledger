@@ -62,6 +62,16 @@ func TestADatabaseURLIsRequired(t *testing.T) {
 	}
 }
 
+func TestAnUnknownIsolationLevelIsRefused(t *testing.T) {
+	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
+		"LEDGER_ISOLATION": "repeatable-read"}
+	var out bytes.Buffer
+	if code := run(context.Background(), []string{"serve"}, env(vars), &out, nil); code != 1 ||
+		!strings.Contains(out.String(), `unknown isolation level \"repeatable-read\"`) {
+		t.Fatalf("got %d, %q", code, out.String())
+	}
+}
+
 func TestAnUnreachableDatabaseFailsWithoutShowingThePassword(t *testing.T) {
 	var out bytes.Buffer
 	vars := map[string]string{"LEDGER_DATABASE_URL": "postgres://ledger:s3cret-pw@127.0.0.1:1/ledger?connect_timeout=2"}
@@ -97,6 +107,7 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 		"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
 		"LEDGER_HTTP_ADDR":    "127.0.0.1:0", // any free port
 		"LEDGER_GRPC_ADDR":    "127.0.0.1:0",
+		"LEDGER_ISOLATION":    "read-committed",
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
@@ -143,6 +154,10 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 	got, err := ledgerv1.NewLedgerServiceClient(conn).GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: created.ID})
 	if err != nil || got.GetAccount().GetName() != "wallet:alice" {
 		t.Fatalf("read over gRPC: %v, %v", got, err)
+	}
+
+	if !strings.Contains(logs.String(), `"isolation":"read-committed"}`) {
+		t.Errorf("the log doesn't show LEDGER_ISOLATION's level: %s", logs.String())
 	}
 
 	stop() // what SIGTERM does in main
@@ -355,7 +370,7 @@ func TestAStopAsServeStartsIsClean(t *testing.T) {
 		cancel()
 		var logs syncBuffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		if code := serve(ctx, db, "127.0.0.1:0", "127.0.0.1:0", 10*time.Second, log, nil); code != 0 {
+		if code := serve(ctx, db, store.New(db), "127.0.0.1:0", "127.0.0.1:0", 10*time.Second, log, nil); code != 0 {
 			t.Fatalf("run %d: exit %d: %s", i, code, logs.String())
 		}
 	}
