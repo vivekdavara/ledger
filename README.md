@@ -143,7 +143,7 @@ were sent over gRPC.
 
 ## Tests
 
-97 test functions (several table-driven or property-based), all green locally and in CI:
+119 test functions (several table-driven or property-based), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -159,22 +159,34 @@ were sent over gRPC.
 - `internal/store`, the service (day 2): idempotent account creation (eight concurrent creates make one account);
   history pages; every rejection names its posting and leaves nothing behind, its key included; a retried request
   posts once, even with its postings reordered; twelve requests with one key, held at a barrier until all have read
-  the key as unused, post one entry and replay eleven times; a serialization failure forced with a test hook
-  (another payment commits between the attempt's snapshot and its lock) is retried and posts against the new
-  balance; retries that run out give `ErrConflict` and store no key; a retry's wait ends with its context; eight
-  workers making 80 colliding transfers keep the books balanced. A property test sends random requests at once,
-  each several times and some with a different entry under the same key: each key posts exactly once, every
-  send of that entry gets it back field for field, and the others are refused (100 cases; it fails against a
-  build that skips the hash comparison, and one that doesn't store the key).
-- `internal/apierr`: every error's reason, HTTP status and gRPC code, and which ones are redacted.
+  the key as unused, post one entry and replay eleven times; a real serialization failure (another transaction
+  holds the account's row and commits once the attempt waits for it) is retried and posts against the new balance;
+  retries that run out give `ErrConflict` and store no key; a retry's wait ends with its context; eight workers
+  making 80 colliding transfers keep the books balanced. A property test sends random requests at once, each
+  several times and some with a different entry under the same key: each key posts exactly once, every send of that
+  entry gets it back field for field, and the others are refused (100 cases; it fails against a build that skips the
+  hash comparison, and one that doesn't store the key).
+- `internal/store`, from the day-2 review: unrelated entries don't make each other retry; two entries racing for one
+  key (`23505`, retried, then refused); a deadlock with another session (`40P01`, retried); accounts locked in id
+  order whatever the request's order (`NOWAIT` probes while an attempt waits); the key checked before the entry;
+  default and largest history pages; the retry delay's bounds for eight policies; and a differential property test
+  where the service's account checks and the database's constraints must agree on a posting, for every type,
+  overdraft setting and balance out to the edges of `bigint` (1,000 cases). Each was checked against a build without
+  its mechanism.
+- `internal/apierr`: every error's reason, HTTP status and gRPC code, which ones are redacted, and a lost database
+  (SQLSTATE 08 and 57P, a broken connection) as unavailable.
 - `internal/server`: the REST API over a real schema, including 14 malformed or refused requests, each checked for
   its status, reason, posting and message, and the health endpoints. A request stuck behind a row lock gives up at
-  its deadline with 504, uses up no key, and posts once the lock is gone.
+  its deadline with 504, uses up no key, and posts once the lock is gone. Twelve bodies `encoding/json` would accept
+  (not UTF-8, a key twice, a key in another case, no content type, over 64 KB, and more) are refused; the router's
+  404 and 405 are JSON; unplanned errors and a database that is down are redacted; `/readyz` hides connection
+  details.
 - `internal/grpcapi`: the gRPC API over an in-memory connection (bufconn) on a real schema: the same walkthrough,
   each error's code, `ErrorInfo` reason and posting, and the call deadline. `TestBothAPIsGiveTheSameReason` sends
   22 failing requests through both APIs and requires the same reason and posting from each.
 - `cmd/ledgerd`: the real binary's `run`: migrations, an account created over REST and read back over gRPC from
-  real ports, a clean shutdown of both, and a taken port failing startup.
+  real ports, a clean shutdown of both, a taken port failing startup and releasing the other port, in-flight work
+  finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0.
 
 ## Results
 
