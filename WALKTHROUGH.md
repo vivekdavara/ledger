@@ -2,15 +2,20 @@
 
 The questions an interviewer is likely to ask about Ledger, with short answers that point at the code. This file
 grows each day; this version covers day 1 (the money type, the validator, the schema and its invariants, the
-migration runner, the binary) and day 2 (the API: REST and gRPC over one service, serializable posting with
-retries, idempotency keys). Read DESIGN.md first for the full picture.
+migration runner, the binary), day 2 (the API: REST and gRPC over one service, posting with retries, idempotency
+keys) and day 3 (the isolation levels compared, the outbox, reconciliation). Read DESIGN.md first for the full
+picture.
 
 **Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the migrations in
 `internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
 `internal/store/migrate.go` → `internal/store/differential_test.go`. For day 2: `internal/store/ledger.go`
 (`PostEntry` and `postOnce`) → `internal/ledger/posted.go` (`Entry.Hash`) → `internal/apierr/apierr.go` →
 `internal/server/api.go` → `internal/grpcapi/grpcapi.go` → `internal/store/service_test.go` and
-`internal/store/concurrency_test.go` → `cmd/ledgerd/main.go` (`serve`).
+`internal/store/concurrency_test.go` → `cmd/ledgerd/main.go` (`serve`). For day 3: DESIGN.md "Concurrency" →
+`internal/store/isolation_test.go` → `internal/store/predicate_locks_test.go` →
+`internal/store/transfers_property_test.go` → `internal/store/migrations/0009_outbox.sql` →
+`internal/outbox/outbox.go` (`PublishOnce`, `Run`) and its tests → `internal/store/reconcile.go` →
+`internal/store/reconcile_test.go`.
 
 ## The model
 
@@ -308,3 +313,100 @@ dense and never change. A posting that arrives between two pages gets a higher v
 later page, once; nothing shifts the way it would under `OFFSET`. `TestPagingIsStableWhilePostingsArrive` posts
 between pages and sees versions 1 to 7 once each, in order. The query is one statement (a `LEFT JOIN LATERAL` from
 the account), so "no such account" and "no postings yet" come from the same snapshot.
+
+## Concurrency, the outbox and reconciliation (day 3)
+
+**The service posts at `READ COMMITTED`. Isn't that unsafe for a ledger?**
+Not for this code path, because every decision it makes reads either a row it has locked or a row it wrote. The
+accounts are locked `FOR UPDATE` in id order before any check; at `READ COMMITTED` a `FOR UPDATE` that waited for
+another transaction hands back the row as that transaction committed it, so the overdraft check sees the real
+balance. The posting trigger computes `balance_after` from the row it locked. The commit-time check reads only the
+entry's own postings. The idempotency key is backed by its primary key. `TestAWaitingAttemptDecidesOnTheCommittedBalance`
+changes Alice's balance while an attempt waits for her row and gets the right answer at both levels; the
+concurrency tests and both property tests run at both levels. What `READ COMMITTED` gives up is protection for a
+future check that reads rows without locking them: that check would have to lock them, or be a constraint.
+
+**So why did you start with `SERIALIZABLE`, and why change?**
+It is the safe default when you haven't proved anything about the code. Day 3 measured it: on a ledger of 20,000
+accounts, `READ COMMITTED` posted 1.2 to 1.7 times as many transfers a second with no retries, while `SERIALIZABLE`
+retried 0.55 to 0.80 times a transfer and gave up on 2 to 3% of the transfers to one hot account. A `conflict`
+is a payment a customer sees fail. With the safety argument above and the tests at both levels, the measurement
+decided it (`ec83ff1`). The level stays a setting (`LEDGER_ISOLATION`).
+
+**Why would `SERIALIZABLE` abort two transfers that share no account?**
+Because of what they read. Postgres's serializable mode records every read (SIRead locks), and of two concurrent
+transactions that each wrote something the other had read, it aborts one. `TestWhatASerializablePostingHasRead`
+lists them: on small tables a posting has read the whole of `journal_entries` and `postings` (sequential scans in
+the commit-time check), and every other posting inserts into those tables, so any two concurrent postings form a
+cycle. On a padded ledger the reads are index pages, but every new entry lands on the same last leaf page of
+`journal_entries_pkey` and `postings_one_per_account`, so they still collide. The reads are of the entry's own
+rows, which nobody else can change, but Postgres can't know that. Measured: 3.3 to 3.8% of transfers that shared
+nothing gave up on small tables.
+
+**How do you test concurrency without flaky races?**
+Three ways. Deterministic schedules: a test transaction holds a row and commits only once the attempt is seen
+waiting for it (`pg_blocking_pids`), which gives a real `40001`, or a real wait-then-proceed at `READ COMMITTED`.
+Property tests that don't depend on the schedule: `TestPropertyConcurrentTransfersMatchAModel` sends random batches
+at once and checks the result against a model in which only the set of accepted entries matters (addition
+commutes), plus the version chain each account's returned postings must form. And the reconciliation run at the
+end of the concurrency tests (`checkBooks`).
+
+**Explain the outbox. Why a trigger and not the service?**
+Every journal entry needs an event for downstream systems. Publishing to a broker after the commit loses events if
+the process dies in between; before the commit announces entries that roll back. So the event is a row written in
+the entry's own transaction, by an `AFTER INSERT` trigger on `journal_entries` (migration 0009), and a publisher
+delivers it later. A trigger, so an entry written any way (a `psql` fix, a batch job) gets its event too, which
+fits the rest of the design: the database enforces what must always be true. The row holds only the entry id;
+entries and postings are append-only, so the publisher builds the event at delivery and it is always the same.
+
+**How does the publisher avoid losing or duplicating events?**
+It can't avoid duplicates, so it doesn't lose anything: claim a batch (`FOR UPDATE SKIP LOCKED`), deliver it, mark
+it published, commit, all in one transaction. A delivery failure leaves the events unpublished (with `attempts`
+and `last_error`). If the delivery succeeded but the mark didn't commit, the events go out again: at least once.
+Consumers dedupe by event id. `TestEventsWhoseMarkIsLostAreDeliveredAgain` cancels the context the moment the sink
+returns, as a crash would, and sees each event twice. Exactly-once would need the sink in the same transaction.
+
+**Are events in order?**
+Per account, with one publisher, for entries the service posted. The service locks an entry's accounts before it
+inserts the entry, so the event of an account's next posting is created only after the previous posting's
+transaction committed; a publisher that can see the later event can see the earlier one. Across accounts there
+is no order (ids are assigned at insert, not commit), and two publishers can each hold a batch and deliver an
+account's events out of order. Consumers that care use `account_version`. `TestOnePublisherKeepsEachAccountsOrder`
+runs six concurrent posters at both levels and checks every account's versions arrive 1, 2, 3, ... with none
+missing.
+
+**Why `SKIP LOCKED`, and why poll instead of `LISTEN/NOTIFY`?**
+`SKIP LOCKED` lets several publishers run without waiting for each other's batches;
+`TestTwoPublishersShareTheWork` fails within 5 s without it, because the second publisher would block. Polling:
+`NOTIFY` in every posting's transaction would wake the publisher instantly, but Postgres serialises the commits of
+notifying transactions on a single lock, which would put every posting in one queue. A 200 ms poll on a partial
+index of the unpublished rows costs almost nothing.
+
+**What does the reconciliation check, and why one snapshot?**
+Eight things, recomputed from the postings: each currency sums to zero; each balance and version match the sum and
+count of the account's postings; each balance matches the last `balance_after`; each history is a chain; each
+entry balances per currency and has the postings it declares; each entry has its event; no protected account is
+overdrawn. One `REPEATABLE READ` read-only transaction, so an entry posted mid-run is in all of the report or none.
+`TestReconcilingWhilePostingSeesOneMoment` takes reports while four workers post; at `READ COMMITTED` one report
+said 13 entries, 28 postings and 15 events, which is no state the ledger was ever in.
+
+**How do you test a check for corruption the database won't let you create?**
+As the tables' owner, inside the test's own schema: switch a guard trigger off, or drop a constraint, make the
+damage, and switch it back. `TestEachKindOfDamageIsReported` does six kinds (a balance moved by hand, a posting
+deleted, an amount changed, a `balance_after` rewritten, an event deleted, an overdraft let through) and requires
+exactly the checks that compare what was broken to report it, and no others. That also shows why the application
+should connect as a role that owns nothing (DESIGN.md, "Limitations").
+
+**Why doesn't the reconciliation fix what it finds?**
+Because a difference is evidence. A balance that doesn't match its postings could be a lost posting or a hand-made
+balance change, and the fix is different for each. `ledgerd reconcile` exits 3 so monitoring can page someone, and
+the report says what and where.
+
+**Tell me about something that went wrong on day 3.**
+Two things. Running every concurrency test at both levels doubled the parallel tests, and eight tests with 16
+connections each went past Postgres's 100-connection limit: "too many clients already". CI's Postgres has the same
+limit, so test pools now open 8 connections, and only the two measurements that need one per worker ask for 16.
+And one commit went in with a failing test, because my command ran the commit after `make check` regardless of its
+result: the outbox-order test used the default retry budget at `SERIALIZABLE`, and under the full suite's load some
+transfers gave up. It wasn't pushed; I fixed the test (it tests order, so it gets a generous budget, and runs at both
+levels) and amended the commit, and every commit after that ran only if `make check` passed.
