@@ -95,7 +95,7 @@ curl -s localhost:8103/readyz
 within 2 s and its schema is at the binary's newest migration, and 503 with the reason otherwise.
 
 `LEDGER_ISOLATION` picks the posting transactions' level: `read-committed` (the default) or `serializable`. DESIGN.md,
-"Concurrency", says why both keep every rule and what each costs.
+"Concurrency (days 2 and 3)", says why both keep every rule and what each costs.
 
 ```bash
 LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./cmd/ledgerd publish
