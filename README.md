@@ -172,7 +172,7 @@ were sent over gRPC.
 
 ## Tests
 
-145 test functions (122 at the end of day 2; several table-driven or property-based, and the concurrency tests run
+159 test functions (122 at the end of day 2; several table-driven or property-based, and the concurrency tests run
 at both isolation levels), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
@@ -224,12 +224,16 @@ at both isolation levels), all green locally and in CI:
   entry gets one outbox event, whatever writes it, and the migration backfills older entries. Reconciliation: a
   healthy ledger is clean, at the edges of `bigint` too; eleven kinds of damage (made by switching a guard trigger off or dropping a constraint) are
   each reported by exactly the checks they should trip; reports taken while entries are posted are all clean and
-  self-consistent, and that test fails if the report doesn't read one snapshot.
+  self-consistent, and that test fails if the report doesn't read one snapshot. From the review: a retry that waits
+  for the original, or begins just after it commits, replays it even when its own check would refuse it, at both
+  levels, and twelve concurrent copies of a payment only one can afford all get the one entry; every test that
+  checks its books also reconciles them; an entry committed during migration 0009 gets its event.
 - `internal/outbox`: each event published once, in order, with the postings `PostEntry` returned; a failed delivery
   recorded and retried; a delivery whose mark is lost delivered again and deduped; a second publisher skipping the
   first's rows without waiting; one publisher keeping each account's versions in order under six concurrent posters,
-  at both levels; `Run`'s backoff; JSON lines. Each mechanism (`SKIP LOCKED`, the mark, the failure record) was
-  removed once to see its test fail.
+  at both levels, with the stream rebuilding every balance; `Run`'s backoff and its cap; a stop during a delivery
+  that lets the batch finish; a connection lost during a delivery; an error that isn't storable as it is; a write
+  cut off mid-line; JSON lines. Each mechanism was removed once to see its test fail.
 - `cmd/ledgerd`: the real binary's `run`: migrations, an account created over REST and read back over gRPC from
   real ports, a clean shutdown of both, a taken port failing startup and releasing the other port, in-flight work
   finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0. Day 3: an unknown

@@ -593,6 +593,16 @@ A Go load generator posts transfers over the API with configurable contention (h
 choice is), and reports throughput and latency percentiles. Failure injection kills a request between commit and
 response, then retries it with the same idempotency key, and checks that the effect happened exactly once.
 
+What day 3 adds to the plan:
+
+- Use `BenchmarkContention`'s layouts (disjoint, random, hot) over REST and gRPC, on a padded ledger, so the API's
+  cost shows against the in-process numbers above.
+- Kill `ledgerd publish` mid-batch (SIGKILL) and restart it: every event arrives at least once, and a consumer that
+  dedupes sees each once (the tests do this with a cancelled context and a terminated backend; the binary hasn't
+  been killed for real yet).
+- End every failure run with `ledgerd reconcile`, which must exit 0.
+- Retries of refused requests while the original commits, over the API: the day-3 review's bug, end to end.
+
 ## Testing
 
 - **Unit and property tests** (`testing` and [rapid](https://pkg.go.dev/pgregory.net/rapid)) for money and the

@@ -16,7 +16,9 @@ import (
 
 // Two entries with no account and no key in common must not make each other retry. One posts in full while the
 // other holds its locks. When the key lookup ran inside the SERIALIZABLE transaction, both read the key index's
-// one page and both wrote to it, Postgres saw a cycle, and the held entry had to retry (found in review).
+// one page and both wrote to it, Postgres saw a cycle, and the held entry had to retry (found in review). At read
+// committed there are no predicate locks, so what that subtest shows is only that the unrelated entry doesn't wait
+// for the held one's locks: if it did, the hook would never return.
 func TestUnrelatedEntriesDontMakeEachOtherRetry(t *testing.T) {
 	t.Parallel()
 	atEachLevel(t, func(t *testing.T, level store.Isolation) {
