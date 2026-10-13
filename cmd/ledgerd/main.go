@@ -8,6 +8,8 @@
 //	                  found no difference, 3 if it found some, 1 if it couldn't run. It changes nothing, migrations
 //	                  included: the schema must be current.
 //
+// A usage error exits 2, whatever the subcommand.
+//
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
 // endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103), LEDGER_SHUTDOWN_GRACE (how long in-flight work
 // gets after a stop signal, default 10s) and LEDGER_ISOLATION (the posting transactions' isolation level,

@@ -386,6 +386,14 @@ account's events out of order. Consumers that care use `account_version`. `TestO
 runs six concurrent posters at both levels and checks every account's versions arrive 1, 2, 3, ... with none
 missing.
 
+**One publisher keeps each account's order. How would you scale it past one?**
+Measured, one publisher drains 107,000 events a second at batch 1,000 into a JSON encoder, far above what the
+ledger posts (about 6,000 a second here), so the first answer is that it doesn't need to. If a slow sink made it
+necessary: partition the events by a hash of the account and give each publisher its own partitions, so each
+account's events still pass through one publisher in order. An entry touches several accounts, though, so it would
+be delivered once per partition it touches, and consumers would dedupe by event id, as they already do. More
+publishers with `SKIP LOCKED` alone, as now, would add throughput and lose the per-account order.
+
 **Why `SKIP LOCKED`, and why poll instead of `LISTEN/NOTIFY`?**
 `SKIP LOCKED` lets several publishers run without waiting for each other's batches;
 `TestTwoPublishersShareTheWork` fails within 5 s without it, because the second publisher would block. Polling:
