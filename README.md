@@ -93,17 +93,18 @@ within 2 s and its schema is at the binary's newest migration, and 503 with the 
 Start the server as above, then (the `id`s are what a fresh `ledger` database gives):
 
 ```bash
-curl -s -X POST localhost:8103/v1/accounts -d '{"name":"cash:bank","type":"asset","currency":"USD"}'
+curl -s -X POST localhost:8103/v1/accounts -H 'Content-Type: application/json' -d '{"name":"cash:bank","type":"asset","currency":"USD"}'
 ```
 
 ```bash
-curl -s -X POST localhost:8103/v1/accounts -d '{"name":"wallet:alice","type":"liability","currency":"USD"}'
+curl -s -X POST localhost:8103/v1/accounts -H 'Content-Type: application/json' -d '{"name":"wallet:alice","type":"liability","currency":"USD"}'
 ```
 
-Post an entry. The `Idempotency-Key` header is required; send the same one when you retry:
+Bodies are JSON, sent as `application/json`. Post an entry; the `Idempotency-Key` header is required, and a retry
+sends the same one:
 
 ```bash
-curl -s -X POST localhost:8103/v1/entries -H 'Idempotency-Key: top-up-1' -d '{"description":"Alice tops up $50","postings":[{"account_id":1,"currency":"USD","amount":"50.00"},{"account_id":2,"currency":"USD","amount":"-50.00"}]}'
+curl -s -X POST localhost:8103/v1/entries -H 'Content-Type: application/json' -H 'Idempotency-Key: top-up-1' -d '{"description":"Alice tops up $50","postings":[{"account_id":1,"currency":"USD","amount":"50.00"},{"account_id":2,"currency":"USD","amount":"-50.00"}]}'
 ```
 
 The answer is 201 with the entry as posted, each posting with the balance after it and its place in the account's
@@ -177,7 +178,9 @@ were sent over gRPC.
 
 ## Results
 
-What the database's rules cost, from `BenchmarkPostEntry` (`internal/store/bench_test.go`). One client posts one
+### Day 1: what the database's rules cost
+
+From `BenchmarkPostEntry` (`internal/store/bench_test.go`). One client posts one
 balanced entry per transaction: begin, insert the entry, insert its postings in one statement, commit. So each
 number is the latency of one entry, mostly the commit's write to disk. "Check off" disables the commit-time check's
 two constraint triggers; the balance triggers stay on.
@@ -205,13 +208,81 @@ What the numbers say:
 
 - **The commit-time check costs about a fifth of a small entry**: 54 µs of 302 µs at 2 postings. At 64 postings
   it is 1.7 ms, 65%, because each posting checks the whole entry again: N + 1 checks of N rows each. The attempt
-  to check once per entry (0004) was unsound and was undone (see "Review of the day's work").
+  to check once per entry (0004) was unsound and was undone (see "Review of day 1").
 - **The review fixes cost 10% at 2 postings and 18–23% at 8 and 64.** Each posting now runs two balance triggers
   instead of one (lock and compute before the insert, write after it), and every trigger function runs with a
   pinned `search_path`. The two causes weren't measured separately.
 - These are single-client latencies, not throughput. Day 4 measures throughput and contention.
 - An earlier run, made while the review agents were using the same Postgres, was up to three times slower on the
   large cases in one round; it isn't reported.
+
+### Day 2: what the service adds
+
+`BenchmarkServicePostEntry` posts the same entries through `Store.PostEntry`, the API's path: validate and hash in
+Go, look the key up, then one `SERIALIZABLE` transaction that locks the accounts, inserts the entry, its postings
+and the key, and commits. "Replay" sends one key again and again: the cost of answering a retry. One client, Apple
+M3, Postgres 14.20 at default settings, at `5fb9557` (migrations 0001–0008). Median of 6 runs, two rounds of
+`-count 3` (`make bench`), with nothing else running:
+
+| Postings per entry | Plain insert (check on) | Through the service | Replay |
+|---|---|---|---|
+| 2 | 300 µs | 434 µs | 80 µs |
+| 8 | 849 µs | 1,124 µs | 85 µs |
+| 64 | 4,256 µs | 5,001 µs | 116 µs |
+
+- **The service adds 134 µs at 2 postings (45%), 274 µs at 8 and 745 µs at 64.** It sends three more statements
+  (the key lookup, the locking `SELECT`, the key insert) and runs at `SERIALIZABLE`, whose predicate locks cost
+  more as the entry grows. Their shares weren't measured separately.
+- **A replay costs about a fifth of a post** at 2 postings and a fortieth at 64: three reads and no commit to disk.
+- The plain-insert column is day 1's "Now" column re-measured with migration 0008: 300, 849 and 4,256 µs against
+  302, 859 and 4,426. 0008's CHECK on balances costs nothing these runs can see.
+
+Transfers that share nothing, before and after moving the key lookup out of the transaction (DESIGN.md, "Why the
+key lookup is outside the transaction"). 16 workers, each moving $0.10 back and forth between its own two wallets 25
+times, all at once, with the default retry policy; three runs each:
+
+| Build | Retries | Requests that ran out of attempts |
+|---|---|---|
+| Before (`bc5e6f6`) | 285, 215, 324 | 2, 1, 1 |
+| After (`2155237`) | 68, 78, 142 | 0, 0, 0 |
+
+```bash
+LEDGER_TEST_DATABASE_URL="postgres://localhost:5432/ledger_test?sslmode=disable" go test -count=1 -v -run TestDisjointTransfersRetries ./internal/store
+```
+
+For the "before" row, run that test (copied in) at `bc5e6f6`. The retries that remain are day 3's subject.
+
+## Review of day 2
+
+After the API was built, two review agents read it, one for the store's posting logic and one for the REST and gRPC
+layers, each in its own git worktree and test schemas. They reported only what they had reproduced; I reproduced
+each finding again before fixing it, and each fix has a test that fails without it. Three of the API agent's
+findings were already fixed by then (account id 0 disagreeing between the APIs, no request deadline, a stale
+README line); I had found the first while writing the cross-API test.
+
+1. **Unrelated transfers made each other retry.** The idempotency-key lookup ran inside the `SERIALIZABLE`
+   transaction, where a read that finds nothing takes a predicate lock on where the key would be (the index page,
+   or the whole small table); every concurrent request writing a key there then counted as a conflict. 16 workers on their own wallets: 215–324 retries and 1–2 requests out
+   of attempts, three runs. The lookup now runs before the transaction: 68–142 retries, none out of attempts
+   (`TestDisjointTransfersRetries`, `TestUnrelatedEntriesDontMakeEachOtherRetry`).
+2. **The retry delay panicked** for a `MaxDelay` near `MaxInt64` (`rand.N(MaxInt64 + 1)`), overflowed its shift for
+   a large `BaseDelay`, and misread zero values (`TestRetryDelayStaysWithinItsBounds`).
+3. **REST requests weren't cut off at the end of the shutdown grace,** and the pool's `Close` waited for them; a
+   stop as the server started could exit 1 (`TestShutdownCutsOffWorkStillRunningAfterTheGrace`,
+   `TestAStopAsServeStartsIsClean`).
+4. **Postgres's text reached clients**, in the conflict message and in the database fallback's detail, and a
+   backend killed mid-request was a 500 instead of a 503. Redaction itself had no test that could fail
+   (`TestUnplannedAndUnavailableErrorsAreRedacted`, `TestTranslateNamesTheConstraintNotPostgresText`).
+5. **REST accepted what the ledger refuses:** invalid UTF-8 (two names became one account), repeated keys (the last
+   won), field names in any case; also no content-type check, 400 for an oversized body, text/plain 404s and 405s,
+   and messages naming Go types (`TestRESTRefusesWhatEncodingJSONWouldAccept`, `TestRouterErrorsAreJSON`).
+6. **The APIs disagreed on negative paging values** (`TestBothAPIsGiveTheSameReason` has them now).
+
+They also listed tests that still passed with their mechanism removed: the key check, the `23505` and `40P01`
+retries, id-order locking, history page sizes, the -2^63 rule, the body cap, the default page's cursor, gRPC's
+message cap, and a listener left open on a failed start. Each now has a test that fails without it, checked by
+removing the mechanism. Judgement calls that stayed as they are, with the reason, are in DESIGN.md's
+"Limitations".
 
 ## Review of day 1
 

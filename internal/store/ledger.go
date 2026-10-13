@@ -247,8 +247,8 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 
 // lookUp finds a key that was used before: the same request gets its entry back (found), a different one is
 // ErrKeyReused. It reads outside the posting transaction on purpose. Inside a SERIALIZABLE transaction the read
-// locks the key's index page against writers, so every concurrent request whose key landed on that page conflicted
-// with it, even with no account in common (found in review: 16 workers on separate wallets gave 456 retries and 4
+// takes a predicate lock on where the key would be (its index page, or the whole table while it is small), so every
+// concurrent request whose key landed there conflicted with it, even with no account in common (found in review: 16 workers on separate wallets gave 456 retries and 4
 // ErrConflicts). Outside, a request racing on the same key is caught by the key's primary key instead (23505) and
 // retried. A key commits with its entry and postings and history is append-only, so the entry read here is whole.
 func (s *Store) lookUp(ctx context.Context, key string, hash []byte) (ledger.PostedEntry, bool, error) {

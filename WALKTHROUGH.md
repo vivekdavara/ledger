@@ -170,10 +170,11 @@ answer within 2 s and the schema must be at the binary's newest migration (`stor
 
 **Walk me through posting a payment.**
 `Store.PostEntry` (`internal/store/ledger.go`) validates the key and the entry, hashes the entry, and runs an
-attempt: one `SERIALIZABLE` transaction that looks up the key, locks the entry's accounts in id order with
-`SELECT ... ORDER BY id FOR UPDATE`, checks the rules that need the accounts (exists, currency, overdraft, balance
-range), inserts the entry, its postings in one statement and the key, and commits; the deferred checks run at the
-commit. An attempt aborted with `40001` or `40P01` is retried with backoff. DESIGN.md has it step by step.
+attempt: look the key up (outside any transaction), then one `SERIALIZABLE` transaction that locks the entry's
+accounts in id order with `SELECT ... ORDER BY id FOR UPDATE`, checks the rules that need the accounts (exists,
+currency, overdraft, balance range), inserts the entry, its postings in one statement and the key, and commits; the
+deferred checks run at the commit. An attempt aborted with `40001`, `40P01`, or `23505` on the key is retried with
+backoff. DESIGN.md has it step by step.
 
 **What does the idempotency key protect against, exactly?**
 A client that doesn't know whether its request worked: a timeout, a dropped connection, a crash before it read the
@@ -183,12 +184,13 @@ posts. Either way the money moves once. `TestARetriedRequestPostsOnce` covers th
 `TestConcurrentRetriesOfOneRequestPostOnce` the concurrent one.
 
 **What if two retries with the same key arrive at the same moment?**
-Both read the key as unused. Both try to lock the same accounts; one gets the locks, posts and commits. The other
-was waiting on a row the winner changed, and under `SERIALIZABLE` that is a serialization failure (`40001`), not a
-wait-and-continue. It retries, now finds the key, and replays. If they collide on the key's primary key instead
-(`23505`), that is retried the same way. The test holds twelve requests at a barrier (a test hook after the key
-lookup) until all have read the key, so the race really happens: one posts, eleven retry and replay, and the
-test asserts at least eleven retries.
+Both find the key unused. Both try to lock the same accounts; one gets the locks, posts and commits. The other was
+waiting on a row the winner changed, and under `SERIALIZABLE` that is a serialization failure (`40001`), not a
+wait-and-continue. It retries, now finds the key, and replays. Two different entries under one key, with no account
+in common, collide on the key's primary key instead (`23505`); that is retried the same way and refused as a
+different entry (`TestTwoEntriesRacingForOneKey`). The concurrent test holds twelve requests at a barrier (a test
+hook after the lookup) until all have found the key unused, so the race really happens: one posts, eleven retry and
+replay, and the test asserts at least eleven retries.
 
 **Why hash the request at all? Isn't the key enough?**
 The key says "this is the same operation"; the hash checks that it really is. A client bug that reuses a key for
@@ -213,7 +215,11 @@ measures the two strategies against each other.
 **How do you avoid deadlocks?**
 Every attempt locks its accounts in ascending id order before touching them, in one statement, and `EXPLAIN`
 shows the plan is `LockRows` over a `Sort` on id, so rows are locked as they come out sorted. Two entries that
-share accounts wait in the same order and can't form a cycle. If one still happened, `40P01` is retried.
+share accounts wait in the same order and can't form a cycle. `TestAccountsAreLockedInIDOrder` checks it with
+`NOWAIT` probes while an attempt waits: waiting for the lower account it holds nothing, waiting for the higher it
+holds the lower. Another client can still deadlock with the service; `40P01` is retried
+(`TestADeadlockIsRetried`, where the test's session sets a long `deadlock_timeout` so the attempt is the one
+Postgres aborts).
 
 **What does the service check, and what does the database check?**
 Both check everything. The service checks first so the error can name the rule and the posting ("posting 0:
@@ -244,10 +250,11 @@ same key safely (`TestRetriesRunOut`). The policy is 10 attempts, waits uniform 
 2^(n−1))]: "full jitter", so colliding transactions spread out instead of colliding again in step.
 
 **How do you test a serialization failure deterministically?**
-A test hook (`export_test.go`) runs code at named points of an attempt. `TestASerializationFailureIsRetried`
-commits another payment from the same wallet right after the attempt's snapshot. The attempt's `FOR UPDATE` then
-meets a row changed since its snapshot, fails with `40001`, and the second attempt posts against the new balance:
-exactly one retry, and Alice's posting lands at version 3 with the right balance.
+A test hook (`export_test.go`) runs code at named points of an attempt. At "begin", `TestASerializationFailureIsRetried`
+has another transaction post from the same wallet and hold its row, and commit as soon as the attempt waits for
+that row (it watches `pg_blocking_pids`). The attempt's snapshot predates the commit, so the row it gets is one
+changed since: `40001`. The second attempt posts against the new balance: exactly one retry, and Alice's posting
+lands at version 3 with the right balance.
 
 **Why is account creation idempotent by name, and not by key?**
 Names are already unique, so the name is a natural key: a retry finds its account. `INSERT ... ON CONFLICT DO
@@ -270,3 +277,26 @@ of the service's `go.mod`. `make proto` lints and regenerates; the output is com
 Both listeners open before either serves, so a taken port fails startup instead of leaving half a service
 (`TestServeFailsIfAPortIsTaken`). On SIGTERM, `http.Server.Shutdown` and gRPC's `GracefulStop` run together with a
 10 s grace; then `Stop` cuts off whatever is still running.
+
+**Tell me about a bug in your design that a review found (day 2).**
+The idempotency-key lookup was the first statement of the `SERIALIZABLE` transaction. A read that finds nothing
+takes a predicate lock on where the key would be (the index page, or the whole table while it is small), so every
+concurrent request that wrote a key there looked like a conflict: two transfers with nothing in common made each other retry, and under load some
+ran out of attempts. With 16 workers each on its own two wallets, three runs gave 215–324 retries and 1–2 requests
+gave up. A replay needs no transaction (a key commits with its entry, and history is append-only), so the lookup
+moved before the transaction: 68–142 retries, none gave up. `TestUnrelatedEntriesDontMakeEachOtherRetry` holds one
+entry at its locks while an unrelated one posts, and fails with the lookup back inside. The lesson: under
+`SERIALIZABLE`, every read is a promise Postgres has to keep, so read only what the decision needs.
+
+**What happens to a request still running when the server shuts down?**
+It gets the grace period (`LEDGER_SHUTDOWN_GRACE`, 10 s). After that, every REST request's context, which derives
+from one base context, is cancelled and the connections closed, and gRPC's `Stop` cancels the calls; cancelled
+database work rolls back, so nothing half-posts, and the client retries with its key. Before the review, REST
+requests ran on and the pool's `Close` waited for them. `TestShutdownCutsOffWorkStillRunningAfterTheGrace` holds the
+accounts' rows: run returns within 5 s of a 500 ms grace, and nothing posts when the lock goes.
+
+**What does the REST layer refuse that `encoding/json` would accept?**
+Invalid UTF-8 (the package turns each bad byte into U+FFFD, so two different names became one account), a key given
+twice (the last wins), and field names in another case (it matches case-insensitively, even with
+`DisallowUnknownFields`). A token pre-pass (`strictKeys`) refuses the last two; `utf8.Valid` the first. A body must
+also be `application/json`, which a cross-site form can't send, and at most 64 KB (413 above).

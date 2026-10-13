@@ -301,10 +301,11 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
   the accounts at the time, and its transaction rolls back. A client that retries after "insufficient funds" gets
   whatever the accounts say now. The effect still happens at most once per key. Stripe stores rejections too; that
   needs a second transaction per failure and was left out.
-- **Concurrent requests with one key:** each reads the key as unused, the first to lock the accounts posts, and the
-  others fail on the locked rows with `40001` (or on the key's primary key with `23505`), retry, find the key and
-  replay. `TestConcurrentRetriesOfOneRequestPostOnce` makes twelve requests read the key before any proceeds:
-  one posts and eleven replay.
+- **Concurrent requests with one key:** each finds the key unused. If their entries share an account, the first to
+  lock it posts and the others fail on the locked row with `40001`; if not, the second to insert the key fails on
+  its primary key with `23505`. Either way they retry, find the key, and replay (or, for a different entry, are
+  refused). `TestConcurrentRetriesOfOneRequestPostOnce` makes twelve requests find the key unused before any
+  proceeds: one posts and eleven replay. `TestTwoEntriesRacingForOneKey` covers the `23505` path.
 - **Keys never expire yet.** A retention job (delete keys older than, say, 30 days) would bound the table; a retry
   after that would post again.
 
@@ -312,10 +313,12 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
 
 `Store.PostEntry` validates the key and the entry (`Entry.Validate`), hashes the entry, then runs attempts:
 
-1. `BEGIN ISOLATION LEVEL SERIALIZABLE`.
-2. Look up the key. The same hash: load the entry, commit, return it as a replay. A different hash:
-   `ErrKeyReused`. This first statement also fixes the transaction's snapshot.
-3. Lock the entry's accounts in id order with `FOR UPDATE`, and check what needs them, naming the posting at fault:
+1. Look up the key, outside any transaction. The same hash: load the entry and return it as a replay. A different
+   hash: `ErrKeyReused`. A replay needs no transaction: the key commits with its entry and postings, and history is
+   append-only.
+2. `BEGIN ISOLATION LEVEL SERIALIZABLE`.
+3. Lock the entry's accounts in id order with `FOR UPDATE`, and check what needs them, naming the posting at fault.
+   This first statement also fixes the transaction's snapshot. The checks:
    the account exists (`unknown_account`), is in the posting's currency (`currency_mismatch`), isn't overdrawn by it
    (`insufficient_funds`, the same rule as the `accounts_no_overdraft` CHECK, in `Account.Overdraws`), and keeps a
    balance the ledger can store (`balance_out_of_range`).
@@ -326,8 +329,19 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
 6. Commit: the deferred checks run here.
 
 When an attempt fails with `40001` (serialization failure), `40P01` (deadlock) or a unique violation on the key,
-the whole attempt is retried after a "full jitter" wait: uniform between zero and min(100 ms, 1 ms × 2^(n−1)),
-so transactions that collided don't collide again in step. After 10 attempts the result is `ErrConflict`
+the whole attempt is retried after a "full jitter" wait: uniform in [0, min(100 ms, 1 ms × 2^(n−1))), so
+transactions that collided don't collide again in step. The cap doubles from `BaseDelay` and stops at `MaxDelay`,
+so no policy can overflow it.
+
+**Why the key lookup is outside the transaction (found in review on day 2).** At first the lookup was the
+transaction's first statement. Under `SERIALIZABLE`, a read that finds nothing takes a predicate lock on where the key
+would be (the index page, or the whole table while it is small enough to scan), and every concurrent request
+inserting a key there then counted as a conflict:
+transfers with no account and no key in common made each other retry. With 16 workers each moving money between
+its own two wallets (25 transfers each, three runs), 215 to 324 attempts were retried and 1 or 2 requests ran out
+of attempts. With the lookup outside, 68 to 142 were retried and none ran out (`TestDisjointTransfersRetries`; the
+README has the runs). The rest are left for day 3: the commit-time check reads postings and entries, and their
+index pages are shared too. After 10 attempts the result is `ErrConflict`
 (`conflict`, HTTP 409, gRPC `ABORTED`): safe to retry with the same key. Nothing else is retried; a lost
 connection is reported as `unavailable` (503), and the client's retry with its key is what makes that safe.
 
@@ -343,7 +357,9 @@ fault (its index in the request).
 
 | Reason | Meaning | HTTP | gRPC |
 |---|---|---|---|
-| `malformed_request` | not one JSON object, an unknown field, a missing `Idempotency-Key` | 400 | `INVALID_ARGUMENT` |
+| `malformed_request` | not one JSON object, not UTF-8, a key twice, an unknown field, a missing `Idempotency-Key` | 400 | `INVALID_ARGUMENT` |
+| `unsupported_media_type` | a body that isn't `Content-Type: application/json` | 415 | (REST only) |
+| `request_too_large` | a body over 64 KB | 413 | `RESOURCE_EXHAUSTED`, from gRPC itself |
 | `invalid_argument` | a rule the request alone breaks: counts, amounts, currencies, names, types, keys, pages | 400 | `INVALID_ARGUMENT` |
 | `unbalanced` | postings don't sum to zero in some currency | 400 | `INVALID_ARGUMENT` |
 | `not_found` | the account in the request's path | 404 | `NOT_FOUND` |
@@ -354,11 +370,22 @@ fault (its index in the request).
 | `idempotency_key_reused` | the key posted a different entry | 422 | `FAILED_PRECONDITION` |
 | `account_name_taken` | the name belongs to a different account | 409 | `ALREADY_EXISTS` |
 | `conflict` | the retries ran out under contention; retry with the same key | 409 | `ABORTED` |
-| `unavailable` | the database didn't answer | 503 | `UNAVAILABLE` |
+| `deadline_exceeded` | the request's 10 s ran out; retry with the same key | 504 | `DEADLINE_EXCEEDED` |
+| `canceled` | the client went away | 499 | `CANCELLED` |
+| `not_found`, `method_not_allowed` | no such route, or the wrong method for one (REST's router) | 404, 405 | (REST only) |
+| `unavailable` | the database didn't answer or dropped the connection (SQLSTATE classes 08 and 57P) | 503 | `UNAVAILABLE` |
 | `internal` | anything else | 500 | `INTERNAL` |
 
 400 means the same request would fail against any ledger; 422 means it is well formed but this ledger's state
-refuses it. `unknown_account` is 422 and not 404 because a 404 from `POST /v1/entries` would read as "no such
+refuses it. Messages are the ledger's own words: a conflict says how many attempts ran and what ended the last one,
+and a database fallback names the constraint, never Postgres's message (found in review).
+
+**REST bodies.** One JSON object of at most 64 KB, sent as `application/json`. Beyond `encoding/json`'s checks, the
+body must be UTF-8 (the package would turn each bad byte into U+FFFD, so two different names became one account),
+no key may appear twice in an object (the last one would win), and keys must match the field names exactly (the
+package matches them case-insensitively, so `"Name"` and `"AMOUNT"` were accepted). A token pre-pass enforces the
+last two; all three were found in review. A gRPC message is protobuf, whose strings are UTF-8 by definition: a
+client that sends invalid UTF-8 anyway gets gRPC's own `INTERNAL` error, not the ledger's. `unknown_account` is 422 and not 404 because a 404 from `POST /v1/entries` would read as "no such
 endpoint". `unavailable` and `internal` errors are logged in full and the client sees only the status text, since
 their messages can name hosts or queries.
 
@@ -369,6 +396,11 @@ client's own sooner deadline wins. When it passes, pgx cancels the database work
 `deadline_exceeded` (504, gRPC `DEADLINE_EXCEEDED`). Without it, a request stuck behind a lock (a `psql` session
 holding an account's row, say) would hold a connection and a database session for as long as its client waited.
 A deadline during the commit leaves the outcome unknown to the client; retrying with the same key settles it.
+
+On SIGTERM, `ledgerd` stops accepting, and in-flight requests and calls get `LEDGER_SHUTDOWN_GRACE` (default 10 s)
+to finish. Then whatever still runs is cut off: every REST request's context derives from one base context, which
+is cancelled (stopping its database work), and the connections are closed; gRPC's `Stop` cancels the calls. Before
+the review, REST requests weren't cut off, and the pool's `Close` waited for them.
 
 ### Generated code
 
@@ -440,3 +472,10 @@ response, then retries it with the same idempotency key, and checks that the eff
   compares this with `READ COMMITTED`, where they wait instead.
 - **A request's outcome can be unknown to its client.** If the connection drops during the commit, the client can't
   tell whether the entry posted; retrying with the same key is the answer, which is why the key is required.
+- **`created_at` is the transaction's start.** Postgres's `now()` is fixed at `BEGIN`, so an entry whose attempt
+  began a moment before another's but locked the account after it gets the later version and the earlier time.
+  Versions order an account's history; timestamps don't (pointed out in review, not reproduced).
+- **A deleted key allows a double post.** `idempotency_keys` isn't append-only, because a retention job would
+  delete old keys. Deleting a key by hand makes its retry post again.
+- **The database fallback can't tell a missing account from a currency mismatch.** Both break the same composite
+  foreign key. The service's own check, made under the row locks, always tells them apart first.
