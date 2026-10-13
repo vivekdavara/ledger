@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -49,11 +51,26 @@ type Sink interface {
 	Deliver(ctx context.Context, events []Event) error
 }
 
-// JSONLines is a Sink that writes each event as one line of JSON.
-type JSONLines struct{ W io.Writer }
+// JSONLines is a Sink that writes each event as one line of JSON. It is not safe for concurrent use.
+//
+// A write that fails partway through a line leaves the line cut off, and the publisher delivers its events again.
+// So the next delivery first ends the cut-off line: a consumer reading lines then sees it on its own, as a line that
+// doesn't parse, followed by the events again, whole. Without that, the first event of the retry was glued onto the
+// fragment and lost to the consumer, though marked published (found in review on day 3). Consumers skip lines that
+// don't parse.
+type JSONLines struct {
+	W    io.Writer
+	torn bool // the last write stopped partway through a line
+}
 
 // Deliver writes the events, and stops at the first error.
-func (j JSONLines) Deliver(ctx context.Context, events []Event) error {
+func (j *JSONLines) Deliver(ctx context.Context, events []Event) error {
+	if j.torn {
+		if _, err := j.W.Write([]byte{'\n'}); err != nil {
+			return err
+		}
+		j.torn = false
+	}
 	for _, e := range events {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -62,7 +79,9 @@ func (j JSONLines) Deliver(ctx context.Context, events []Event) error {
 		if err != nil {
 			return err
 		}
-		if _, err := j.W.Write(append(line, '\n')); err != nil {
+		line = append(line, '\n')
+		if n, err := j.W.Write(line); err != nil {
+			j.torn = n > 0 && n < len(line)
 			return err
 		}
 	}
@@ -105,8 +124,23 @@ func New(db *pgxpool.Pool, sink Sink, opts Options) *Publisher {
 	return &Publisher{db: db, sink: sink, opts: opts.withDefaults()}
 }
 
-// maxErrorLength bounds the delivery error kept on an event.
+// maxErrorLength bounds the delivery error kept on an event, in bytes.
 const maxErrorLength = 500
+
+// recordable makes a delivery error storable as text: valid UTF-8 with no NUL bytes, which Postgres refuses, and at
+// most maxErrorLength bytes, cut where a character starts. Cut at byte 500 alone, an error with a multi-byte
+// character across it, or a NUL anywhere, made the record fail, and the attempt went unrecorded (found in review).
+func recordable(message string) string {
+	message = strings.ReplaceAll(strings.ToValidUTF8(message, "\uFFFD"), "\x00", "")
+	if len(message) <= maxErrorLength {
+		return message
+	}
+	cut := maxErrorLength
+	for !utf8.RuneStart(message[cut]) {
+		cut--
+	}
+	return message[:cut]
+}
 
 // PublishOnce delivers one batch: it claims up to BatchSize unpublished events, oldest first, skipping events
 // another publisher has claimed; delivers them; and marks them published, all in one transaction. It returns how
@@ -148,15 +182,16 @@ func (p *Publisher) PublishOnce(ctx context.Context) (int, error) {
 	deliverErr := p.sink.Deliver(deliverCtx, events)
 	cancel()
 	if deliverErr != nil {
-		message := deliverErr.Error()
-		if len(message) > maxErrorLength {
-			message = message[:maxErrorLength]
+		// Record the attempt. If that fails too, the events are unpublished all the same, and both errors are
+		// reported.
+		_, err := tx.Exec(ctx, `UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = ANY($1)`,
+			ids, recordable(deliverErr.Error()))
+		if err == nil {
+			err = tx.Commit(ctx)
 		}
-		// Record the attempt. If that fails too, the events are unpublished all the same, and the delivery's error
-		// is the one to report.
-		if _, err := tx.Exec(ctx, `UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = ANY($1)`,
-			ids, message); err == nil {
-			_ = tx.Commit(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("deliver %d events from %d: %w (and recording the attempt failed: %v)", len(ids),
+				ids[0], deliverErr, err)
 		}
 		return 0, fmt.Errorf("deliver %d events from %d: %w", len(ids), ids[0], deliverErr)
 	}

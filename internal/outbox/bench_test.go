@@ -43,7 +43,7 @@ func BenchmarkPublish(b *testing.B) {
 			if _, err := db.Exec(ctx, `ANALYZE accounts, journal_entries, postings, outbox`); err != nil {
 				b.Fatal(err)
 			}
-			p := outbox.New(db, outbox.JSONLines{W: io.Discard}, outbox.Options{BatchSize: batch})
+			p := outbox.New(db, &outbox.JSONLines{W: io.Discard}, outbox.Options{BatchSize: batch})
 			b.ResetTimer()
 			for range b.N {
 				b.StopTimer()

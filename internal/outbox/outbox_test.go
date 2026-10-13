@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/ledger"
@@ -359,7 +360,7 @@ func TestJSONLinesWritesOneEventALine(t *testing.T) {
 				AccountVersion: 1}}},
 		{ID: 2, Type: outbox.EntryPosted, EntryID: 8},
 	}
-	if err := (outbox.JSONLines{W: &buf}).Deliver(context.Background(), events); err != nil {
+	if err := (&outbox.JSONLines{W: &buf}).Deliver(context.Background(), events); err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
@@ -396,6 +397,96 @@ func TestCheckOrder(t *testing.T) {
 	} {
 		if err := outbox.CheckOrder(tc.events); (err == nil) != tc.ok || (err != nil && !errors.Is(err, outbox.ErrOutOfOrder)) {
 			t.Errorf("%s: %v", tc.name, err)
+		}
+	}
+}
+
+func TestADeliveryErrorIsMadeStorable(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", 499) + "é and more" // the é is bytes 499 and 500
+	for _, tc := range []struct{ in, want string }{
+		{"the broker is down", "the broker is down"},
+		{long, strings.Repeat("x", 499)},
+		{"bad frame \x00\x01", "bad frame \x01"},
+		{"not UTF-8: \xff", "not UTF-8: �"},
+	} {
+		got := outbox.Recordable(tc.in)
+		if got != tc.want || !utf8.ValidString(got) || len(got) > 500 {
+			t.Errorf("Recordable(%.40q) = %.40q, want %.40q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A failed delivery is recorded whatever its error says: cut at byte 500 alone, a character across the cut or a NUL
+// anywhere made Postgres refuse the record (22021), and the attempt went unrecorded without a word.
+func TestAnyDeliveryErrorIsRecorded(t *testing.T) {
+	t.Parallel()
+	for _, message := range []string{strings.Repeat("x", 499) + "é and more", "bad frame \x00\x01"} {
+		db, _, _ := ledgerWith(t, 2)
+		ctx := context.Background()
+		failure := errors.New(message)
+		sk := &sink{deliver: func(context.Context, []outbox.Event) error { return failure }}
+		if _, err := outbox.New(db, sk, outbox.Options{}).PublishOnce(ctx); !errors.Is(err, failure) ||
+			strings.Contains(err.Error(), "recording the attempt failed") {
+			t.Fatalf("%.30q: got %v, want the delivery's error alone", message, err)
+		}
+		var attempts int
+		var lastError string
+		if err := db.QueryRow(ctx, `SELECT min(attempts), min(last_error) FROM outbox`).Scan(&attempts, &lastError); err != nil ||
+			attempts != 1 || lastError != outbox.Recordable(message) {
+			t.Fatalf("%.30q: attempts %d, last_error %.30q, %v", message, attempts, lastError, err)
+		}
+	}
+}
+
+// shortWriter takes only the first budget bytes of the write that would pass them, fails it, and takes everything
+// after that (a full disk that was then cleared).
+type shortWriter struct {
+	buf    bytes.Buffer
+	budget int
+	failed bool
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if !w.failed && len(p) > w.budget {
+		w.failed = true
+		w.buf.Write(p[:w.budget])
+		return w.budget, errors.New("no space left on device")
+	}
+	if !w.failed {
+		w.budget -= len(p)
+	}
+	return w.buf.Write(p)
+}
+
+// A write cut off partway through a line: the events are delivered again, and a consumer that reads lines and skips
+// those that don't parse gets every one of them. Before the fix, the retry's first line was glued onto the fragment,
+// and that event never reached the consumer, though it was marked published.
+func TestALineCutOffByAFailedWriteLosesNoEvent(t *testing.T) {
+	t.Parallel()
+	for _, budget := range []int{20, 300} { // inside the first event's line, and inside the second's
+		db, _, _ := ledgerWith(t, 3)
+		ctx := context.Background()
+		w := &shortWriter{budget: budget}
+		p := outbox.New(db, &outbox.JSONLines{W: w}, outbox.Options{})
+		if _, err := p.PublishOnce(ctx); err == nil {
+			t.Fatal("the short write didn't fail the delivery")
+		}
+		if n, err := p.PublishOnce(ctx); n != 3 || err != nil {
+			t.Fatalf("budget %d: published %d, %v; want 3", budget, n, err)
+		}
+		seen, unparsed := map[int64]bool{}, 0
+		for _, line := range strings.Split(strings.TrimSuffix(w.buf.String(), "\n"), "\n") {
+			var e outbox.Event
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				unparsed++
+				continue
+			}
+			seen[e.ID] = true
+		}
+		if len(seen) != 3 || unparsed != 1 {
+			t.Fatalf("budget %d: a line consumer read %d of 3 events and skipped %d lines; output %q", budget,
+				len(seen), unparsed, w.buf.String())
 		}
 	}
 }

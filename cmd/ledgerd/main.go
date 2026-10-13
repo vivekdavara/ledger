@@ -159,7 +159,7 @@ func reconcile(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.L
 // (day 3)"). A failed write leaves the events unpublished, to be written again.
 func publish(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.Logger) int {
 	log.Info("publishing")
-	err := outbox.New(db, outbox.JSONLines{W: out}, outbox.Options{}).Run(ctx, func(err error) {
+	err := outbox.New(db, &outbox.JSONLines{W: out}, outbox.Options{}).Run(ctx, func(err error) {
 		log.Error("publish", "err", err)
 	})
 	if !errors.Is(err, context.Canceled) {
