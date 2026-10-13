@@ -552,8 +552,9 @@ past them: a trigger switched off, a hand-made fix, a bug in a migration.
   all of the report or none of it. `TestReconcilingWhilePostingSeesOneMoment` takes reports while four workers post:
   every one is clean and its counts agree (two postings and one event per entry). At `READ COMMITTED` the counts are
   taken at different moments, and the test fails (13 entries, 28 postings, 15 events in one report).
-- **It reports, never repairs.** Each check counts its differences and describes the first 10 in a stable order
-  ("entry 1 declares 2 postings and has 1"). A wrong balance is a question for a person: was a posting lost, or was
+- **It reports, never repairs.** Each check counts its differences and describes the first 10, in order of the ids
+  they name ("entry 1 declares 2 postings and has 1"). The order is the same on every platform: sorted as text, CI's
+  Linux collation put "entry 10" before "entry 1" and the first push of this check failed there. A wrong balance is a question for a person: was a posting lost, or was
   the balance changed by hand? Fixing it silently would destroy the evidence.
 - **Exit codes** for `ledgerd reconcile`: 0 clean, 3 differences found (the log names the checks), 1 it couldn't
   run. It changes nothing, so it doesn't migrate either: on an old schema it stops and says to run `ledgerd

@@ -155,9 +155,14 @@ func TestAReportCountsEveryDifference(t *testing.T) {
 	if i < 0 {
 		t.Fatalf("no entry_events check: %+v", r.Checks)
 	}
-	if c := r.Checks[i]; c.Differences != 12 || len(c.Examples) != store.MaxExamples || c.Examples[0] != "entry 1 has no event" {
-		t.Fatalf("%d differences with examples %q; want 12, the first %d of them", c.Differences, c.Examples,
-			store.MaxExamples)
+	// In order of the entries' ids, the same on every platform: ordered as text, Linux's collation put "entry 10"
+	// first in CI, and macOS put it after "entry 1".
+	var want []string
+	for id := 1; id <= store.MaxExamples; id++ {
+		want = append(want, fmt.Sprintf("entry %d has no event", id))
+	}
+	if c := r.Checks[i]; c.Differences != 12 || !slices.Equal(c.Examples, want) {
+		t.Fatalf("%d differences with examples %q; want 12, with examples %q", c.Differences, c.Examples, want)
 	}
 }
 
