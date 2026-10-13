@@ -4,7 +4,8 @@
 //	ledgerd serve     apply pending migrations, then serve REST and gRPC until SIGINT or SIGTERM
 //
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
-// endpoints, default :8103) and LEDGER_GRPC_ADDR (default :9103). Logs are JSON lines on stderr.
+// endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103) and LEDGER_SHUTDOWN_GRACE (how long in-flight work
+// gets after a stop signal, default 10s). Logs are JSON lines on stderr.
 package main
 
 import (
@@ -24,13 +25,14 @@ import (
 	"github.com/vivekdavara/ledger/internal/grpcapi"
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
+	"google.golang.org/grpc"
 )
 
 const (
 	defaultHTTPAddr = ":8103"
 	defaultGRPCAddr = ":9103"
-	// shutdownGrace is how long in-flight requests get to finish after a stop signal.
-	shutdownGrace = 10 * time.Second
+	// defaultShutdownGrace is how long in-flight requests get to finish after a stop signal.
+	defaultShutdownGrace = 10 * time.Second
 )
 
 func main() {
@@ -81,20 +83,35 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return 0
 	}
 
-	return serve(ctx, db, httpAddr, grpcAddr, log, listening)
+	grace := defaultShutdownGrace
+	if v := getenv("LEDGER_SHUTDOWN_GRACE"); v != "" {
+		if grace, err = time.ParseDuration(v); err != nil || grace < 0 {
+			log.Error("LEDGER_SHUTDOWN_GRACE is not a duration such as 10s", "value", v)
+			return 1
+		}
+	}
+	return serve(ctx, db, httpAddr, grpcAddr, grace, log, listening)
 }
 
 // serve runs the REST and gRPC servers over one store until ctx is cancelled, then stops both gracefully: no new
-// connections, in-flight requests and calls get shutdownGrace to finish, and whatever is left after that is cut.
-func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, log *slog.Logger,
+// connections, and in-flight requests and calls get the grace period to finish. Whatever is still running after
+// it is cut off: its context is cancelled, which cancels its database work, and its connection is closed.
+func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, grace time.Duration, log *slog.Logger,
 	listening chan<- addrs) int {
 	svc := store.New(db)
+	// Every REST request's context derives from base. At the end of the grace period cutOff cancels them all, which
+	// stops the database work still running under them, and Close closes their connections (which by itself also
+	// cancels a request's context). With neither, the handlers would run on until their own deadline and the pool's
+	// Close would wait for them: TestShutdownCutsOffWorkStillRunningAfterTheGrace fails only with both removed.
+	base, cutOff := context.WithCancel(context.Background())
+	defer cutOff()
 	httpSrv := &http.Server{
 		Handler:           server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, svc, log),
 		ReadHeaderTimeout: 5 * time.Second, // a client that trickles headers can't hold a connection open
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		BaseContext:       func(net.Listener) context.Context { return base },
 	}
 	grpcSrv := grpcapi.New(svc, log)
 	httpLn, err := net.Listen("tcp", httpAddr)
@@ -129,13 +146,16 @@ func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, log
 	case <-ctx.Done():
 	}
 
-	// Stop both at once. GracefulStop has no deadline of its own, so Stop cuts it off at the grace period.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	// Stop both at once. Shutdown and GracefulStop wait for in-flight work; at the end of the grace period it is cut
+	// off: cutOff and Close for REST, Stop (which cancels the calls' contexts) for gRPC.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	grpcStopped := make(chan struct{})
 	go func() { grpcSrv.GracefulStop(); close(grpcStopped) }()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shut down http", "err", err)
+		log.Error("shut down http", "err", "requests still running after the grace period; cutting them off")
+		cutOff()
+		_ = httpSrv.Close()
 		code = 1
 	}
 	select {
@@ -150,7 +170,8 @@ func serve(ctx context.Context, db *pgxpool.Pool, httpAddr, grpcAddr string, log
 		log.Error("serve http", "err", err)
 		code = 1
 	}
-	if err := <-grpcDone; err != nil && code == 0 {
+	// ErrServerStopped means the stop came before Serve began: a stop as the server starts, which is clean.
+	if err := <-grpcDone; err != nil && !errors.Is(err, grpc.ErrServerStopped) && code == 0 {
 		log.Error("serve grpc", "err", err)
 		code = 1
 	}

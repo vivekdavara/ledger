@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
@@ -174,5 +177,174 @@ func TestServeFailsIfAPortIsTaken(t *testing.T) {
 	if code := run(context.Background(), []string{"serve"}, env(vars), &logs, nil); code != 1 ||
 		!strings.Contains(logs.String(), "address already in use") {
 		t.Fatalf("exit %d, log %s", code, logs.String())
+	}
+}
+
+// inFlight starts serve with the given shutdown grace, opens two accounts, and holds both rows in a transaction of
+// its own while one REST request and one gRPC call try to post against them. It returns once both are waiting.
+type inFlight struct {
+	stop       context.CancelFunc
+	exit       chan int
+	logs       *syncBuffer
+	rest, grpc chan error
+	release    func()
+	db         *pgxpool.Pool
+}
+
+func startInFlight(t *testing.T, grace string) inFlight {
+	t.Helper()
+	db := storetest.EmptySchema(t)
+	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, db), "LEDGER_HTTP_ADDR": "127.0.0.1:0",
+		"LEDGER_GRPC_ADDR": "127.0.0.1:0", "LEDGER_SHUTDOWN_GRACE": grace}
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	f := inFlight{stop: stop, exit: make(chan int, 1), logs: &syncBuffer{}, rest: make(chan error, 1),
+		grpc: make(chan error, 1), db: db}
+	listening := make(chan addrs, 1)
+	go func() { f.exit <- run(ctx, []string{"serve"}, env(vars), f.logs, listening) }()
+	var at addrs
+	select {
+	case at = <-listening:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("not listening: %s", f.logs.String())
+	}
+	for _, body := range []string{`{"name":"cash:bank","type":"asset","currency":"USD"}`,
+		`{"name":"wallet:alice","type":"liability","currency":"USD"}`} {
+		resp, err := http.Post("http://"+at.HTTP+"/v1/accounts", "application/json", strings.NewReader(body))
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create: %v %v", resp, err)
+		}
+		resp.Body.Close()
+	}
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM accounts FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	var holder int
+	if err := tx.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	f.release = func() { once.Do(func() { _ = tx.Rollback(context.Background()) }) }
+	t.Cleanup(f.release)
+	go func() {
+		req, _ := http.NewRequest("POST", "http://"+at.HTTP+"/v1/entries", strings.NewReader(
+			`{"postings":[{"account_id":1,"currency":"USD","amount":"1.00"},{"account_id":2,"currency":"USD","amount":"-1.00"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "in-flight-rest")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			if resp.StatusCode != http.StatusCreated {
+				err = fmt.Errorf("status %d", resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+		f.rest <- err
+	}()
+	conn, err := grpc.NewClient(at.GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		_, err := ledgerv1.NewLedgerServiceClient(conn).PostEntry(context.Background(), &ledgerv1.PostEntryRequest{
+			IdempotencyKey: "in-flight-grpc", Postings: []*ledgerv1.Posting{
+				{AccountId: 1, Currency: "USD", Amount: 100}, {AccountId: 2, Currency: "USD", Amount: -100}}})
+		f.grpc <- err
+	}()
+	// Both are waiting once two sessions are blocked by the test's transaction. The second waits in the row's lock
+	// queue behind the first, so it is blocked by the first, not by the test: count the whole chain.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := db.QueryRow(context.Background(), `
+			WITH RECURSIVE blocked (pid) AS (
+			    SELECT pid FROM pg_stat_activity WHERE $1::integer = ANY (pg_blocking_pids(pid))
+			    UNION
+			    SELECT a.pid FROM pg_stat_activity a JOIN blocked b ON b.pid = ANY (pg_blocking_pids(a.pid)))
+			SELECT count(*) FROM blocked`, holder).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= 2 {
+			return f
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions waiting on the locks after 10 s", waiting)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestShutdownLetsInFlightWorkFinishWithinTheGrace(t *testing.T) {
+	f := startInFlight(t, "10s")
+	f.stop()
+	time.Sleep(300 * time.Millisecond) // shutting down, with both still waiting
+	f.release()
+	for name, ch := range map[string]chan error{"REST": f.rest, "gRPC": f.grpc} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Errorf("%s: %v, want the entry posted", name, err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%s: no answer", name)
+		}
+	}
+	select {
+	case code := <-f.exit:
+		if code != 0 {
+			t.Fatalf("exit %d after a clean shutdown: %s", code, f.logs.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("still running")
+	}
+}
+
+func TestShutdownCutsOffWorkStillRunningAfterTheGrace(t *testing.T) {
+	f := startInFlight(t, "500ms")
+	start := time.Now()
+	f.stop()
+	select {
+	case code := <-f.exit:
+		if took := time.Since(start); code != 1 || took > 5*time.Second {
+			t.Fatalf("exit %d after %v; want 1 soon after the 500 ms grace", code, took)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("still running 20 s after the stop, with a 500 ms grace: %s", f.logs.String())
+	}
+	for name, ch := range map[string]chan error{"REST": f.rest, "gRPC": f.grpc} {
+		select {
+		case err := <-ch:
+			if err == nil {
+				t.Errorf("%s: posted after being cut off", name)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s: the client got no answer", name)
+		}
+	}
+	// The work that was cut off is gone: releasing the lock posts nothing.
+	f.release()
+	var entries int
+	if err := f.db.QueryRow(context.Background(), `SELECT count(*) FROM journal_entries`).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if entries != 0 {
+		t.Fatalf("%d entries posted by requests that were cut off", entries)
+	}
+}
+
+func TestAStopAsServeStartsIsClean(t *testing.T) {
+	db := storetest.Migrated(t)
+	for i := range 50 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var logs syncBuffer
+		log := slog.New(slog.NewJSONHandler(&logs, nil))
+		if code := serve(ctx, db, "127.0.0.1:0", "127.0.0.1:0", 10*time.Second, log, nil); code != 0 {
+			t.Fatalf("run %d: exit %d: %s", i, code, logs.String())
+		}
 	}
 }
