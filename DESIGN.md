@@ -536,7 +536,12 @@ transactional outbox), and a separate publisher delivers it.
   in one queue. A 200 ms poll on a partial index costs little.
 
 `ledgerd publish` writes each event as a line of JSON on stdout, so it can feed any consumer through a pipe; a
-broker sink (Kafka, a webhook) would implement the same `Sink` interface.
+broker sink (Kafka, a webhook) would implement the same `Sink` interface. A write cut off partway through a line
+leaves a fragment; `JSONLines` ends it with a newline before the batch is written again, so the fragment is a line
+of its own and every event follows it whole. Consumers skip lines that don't parse. (Found in review: the retry's
+first line used to be glued onto the fragment, and that event never reached a line-reading consumer, though it was
+marked published.) A delivery error is stored cut to 500 bytes where a character starts, as valid UTF-8 without
+NULs, which Postgres would refuse.
 
 ## Reconciliation (day 3)
 
@@ -658,6 +663,20 @@ response, then retries it with the same idempotency key, and checks that the eff
   reconciliation's `entry_events` check would then cover only entries newer than the retention period. A poison
   event (one the sink always refuses) holds back everything behind it, since a batch is delivered whole; its
   `attempts` and `last_error` show it.
+- **The publisher's delivery timeout bounds only a sink that watches its context.** `JSONLines` checks between
+  events, so a write blocked on a full pipe holds the batch's transaction and row locks until it returns. Writing to
+  a pipe whose reader has gone, `ledgerd publish` is killed by `SIGPIPE` (Go's default on stdout); what it wrote but
+  hadn't marked goes out again on the next start. A server whose `idle_in_transaction_session_timeout` is shorter
+  than the delivery timeout would end a publisher's transaction mid-delivery and free its rows, so a second
+  publisher could deliver the same batch at the same time (from the review; not reproduced).
+- **The outbox isn't protected like history.** A role that may update it can mark events published without
+  delivering them; the reconciliation sees a deleted event, not a false mark. The answer is the same as for the
+  triggers: the application connects as a role with only the grants it needs.
+- **Event numbers are JSON numbers.** Amounts are at most 10^15, exact in JavaScript; balances aren't bounded, so a
+  JavaScript consumer reads `balance_after` as a `BigInt` (the REST API's decimal strings don't have this problem).
+- **What the reconciliation can't see:** an entry's description or time rewritten, a key pointed at another entry,
+  an unused account deleted. None changes a balance. History's triggers stop the first for any role that doesn't own
+  the tables; keys aren't append-only (see "A deleted key allows a double post"), so nothing stops the second.
 - **Reconciliation reads everything.** Each run scans every posting (546–571 ms for 200,000 here). A large ledger
   would reconcile incrementally, from a checkpoint of balances already checked.
 - **A request's outcome can be unknown to its client.** If the connection drops during the commit, the client can't

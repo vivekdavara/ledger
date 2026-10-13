@@ -318,8 +318,9 @@ For the "before" row, run that test (copied in) at `bc5e6f6`. The retries that r
 connection each, post 3,000 two-posting transfers at each level, three times. **Disjoint**: each worker moves money
 between two wallets of its own. **Random**: between two of 100 wallets. **Hot**: 100 wallets pay one merchant
 account. The second half of the target pads the ledger with 20,000 accounts and 10,000 entries first, so Postgres
-plans its reads as for tables of that size. Medians of the three runs at `38041c6` (the posting path as it is now,
-outbox trigger included), Apple M3, Postgres 14.20 at default settings, on power, nothing else running:
+plans its reads as for tables of that size. Medians of the three runs at `38041c6`, outbox trigger included,
+Apple M3, Postgres 14.20 at default settings, on power, nothing else running. (The review's fix that came after
+adds a key lookup to rejected requests only, and none of these transfers is rejected.)
 
 | Ledger | Layout | Read committed: transfers/s, retries/transfer, gave up, p99 | Serializable: transfers/s, retries/transfer, gave up, p99 |
 |---|---|---|---|
@@ -366,6 +367,38 @@ make bench-outbox
 
 The publisher's numbers are an upper bound for one process: the sink discards what it encodes. A real broker's
 acknowledgement would add its round trip per batch.
+
+## Review of day 3
+
+Once the day's work was in (`ec83ff1`), two review agents read it: one the isolation levels and the
+reconciliation, one the outbox and the new subcommands, each in its own git worktree and test schemas. They
+reported only what they had reproduced, and I reproduced each finding again before fixing it; each fix has a test
+that fails without it.
+
+1. **A retry of a request that had posted could be refused.** A retry finds its key unused, then waits for the
+   accounts while the original commits; at `READ COMMITTED` the wait hands over the balance the original left, and
+   a $40 payment from Alice's $50 was refused for insufficient funds: the client was told the payment failed, though
+   it posted. A rejection is now checked against the key once more: the same entry replays, a different one is
+   `idempotency_key_reused`. Twelve concurrent copies of that payment failed at both levels without the fix
+   (`TestARetryThatWaitedForTheOriginalReplaysIt`, `TestConcurrentCopiesOfAPaymentOnlyOneCanAffordAllGetIt`).
+   Day 2's version of the test paid $20, which every copy's own check allowed, so it couldn't see this.
+2. **A failed delivery could go unrecorded.** The error was cut at byte 500, so a multi-byte character across the
+   cut, or a NUL anywhere, made Postgres refuse the record, and that error was dropped
+   (`TestAnyDeliveryErrorIsRecorded`).
+3. **A write cut off mid-line lost an event to line-reading consumers,** though it was marked published: the retry's
+   first line was glued onto the fragment. `JSONLines` now ends a cut-off line before its next delivery
+   (`TestALineCutOffByAFailedWriteLosesNoEvent`).
+4. **Reconcile failed instead of reporting** a `balance_after` at the end of `bigint` (its chain sum overflowed),
+   and **reported nothing** for postings relabelled to another currency or for an entry deleted with its rows left
+   behind. It sums as `numeric` now and has two more checks, `posting_currencies` and `orphan_rows`.
+
+Tests that still passed with their mechanism removed, now fixed: the transfer property accepted the database's
+fallback refusals, so it passed without the service's row lock (refusals must now name their posting); no test
+moved a version, so the version comparisons could go; the outbox write paths beyond the service were checked only
+by hand (`checkBooks` now reconciles after the 22 tests that call it); the backfill's `ORDER BY` and its read
+committed snapshot; the backoff's cap. Running the suite for the fixes also turned up a flaky test: a stop between
+a delivery and its mark left an event to be sent again, and `Run` now lets the batch in flight finish. Judgement
+calls are in DESIGN.md's "Limitations".
 
 ## Review of day 2
 

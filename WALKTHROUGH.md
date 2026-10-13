@@ -417,6 +417,18 @@ Because a difference is evidence. A balance that doesn't match its postings coul
 balance change, and the fix is different for each. `ledgerd reconcile` exits 3 so monitoring can page someone, and
 the report says what and where.
 
+**Tell me about a bug a review found on day 3.**
+The retry of a request that had already posted could be refused. A client sends a $40 payment from Alice's $50,
+times out, and retries with the same key. The retry finds the key unused (the original hasn't committed), then
+waits for Alice's row. The original commits; at `READ COMMITTED` the wait hands the retry the row as committed, with
+$10 in it, and the retry's own check says "insufficient funds". The client is told the payment failed, and it
+posted. At `SERIALIZABLE` the wait ends in `40001` and the retry finds the key, which is why day 2 never saw it,
+but a retry whose transaction began just after the commit was refused there too. The fix: a rejection is checked
+against the key once more before it is returned (`PostEntry`). The lesson is about where idempotency is decided: the
+key lookup and the posting are separate steps, so anything that happens between them has to send the request back
+to the key. `TestConcurrentCopiesOfAPaymentOnlyOneCanAffordAllGetIt` sends twelve copies at once and failed at both
+levels without the fix; day 2's version paid $20, which every copy could afford, so it couldn't fail.
+
 **Tell me about something that went wrong on day 3.**
 Two things. Running every concurrency test at both levels doubled the parallel tests, and eight tests with 16
 connections each went past Postgres's 100-connection limit: "too many clients already". CI's Postgres has the same
