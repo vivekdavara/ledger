@@ -128,3 +128,89 @@ func TestTheOutboxMigrationBackfillsEarlierEntries(t *testing.T) {
 		t.Fatalf("%d entries, want 4", n)
 	}
 }
+
+// An entry inserted before migration 0009 starts and committed while it runs still gets its event (from the day-3
+// review). CREATE TRIGGER waits for the entry's transaction, and the backfill's statement, at the runner's read
+// committed, starts after it commits, so it sees the entry; under REPEATABLE READ the migration's snapshot would
+// predate the commit and miss it.
+func TestAnEntryCommittedDuringTheOutboxMigrationGetsItsEvent(t *testing.T) {
+	t.Parallel()
+	db := storetest.EmptySchema(t)
+	ctx := context.Background()
+	if _, err := store.MigrateFS(ctx, db, migrationsUpTo(t, 8)); err != nil {
+		t.Fatal(err)
+	}
+	b := wallets(t, store.New(db)) // one entry
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	id, err := insertEntry(tx, "in flight", 2)
+	if err == nil {
+		err = insertPosting(tx, id, b.alice, "USD", 1)
+	}
+	if err == nil {
+		err = insertPosting(tx, id, b.bob, "USD", -1)
+	}
+	var holder int
+	if err == nil {
+		err = tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holder)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := store.Migrate(ctx, db); done <- err }()
+	if !waitUntilBlocked(db, holder, 1) {
+		t.Fatal("the migration never waited for the entry's transaction")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := eventsInOrder(t, db); n != 2 {
+		t.Fatalf("%d entries, want 2", n)
+	}
+}
+
+// The backfill gives events in entry order even when the entries aren't stored in that order: here entries 3, 2
+// and 1 are written in that order, so a scan without the backfill's ORDER BY meets them backwards (from the review:
+// on entries stored in id order, the test above passes without it).
+func TestTheBackfillFollowsEntryOrderNotStorageOrder(t *testing.T) {
+	t.Parallel()
+	db := storetest.EmptySchema(t)
+	ctx := context.Background()
+	if _, err := store.MigrateFS(ctx, db, migrationsUpTo(t, 8)); err != nil {
+		t.Fatal(err)
+	}
+	b := newBook(t, db)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, id := range []int64{3, 2, 1} {
+		if _, err := tx.Exec(ctx, `INSERT INTO journal_entries (id, description, posting_count)
+			OVERRIDING SYSTEM VALUE VALUES ($1, 'stored backwards', 2)`, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := insertPosting(tx, id, b.cash, "USD", 100); err != nil {
+			t.Fatal(err)
+		}
+		if err := insertPosting(tx, id, b.alice, "USD", -100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if n := eventsInOrder(t, db); n != 3 {
+		t.Fatalf("%d entries, want 3", n)
+	}
+}
