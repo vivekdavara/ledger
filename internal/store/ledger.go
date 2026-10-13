@@ -273,7 +273,9 @@ func (s *Store) History(ctx context.Context, accountID, afterVersion int64, limi
 // other's locks in a cycle, and checks the rules that need the accounts while it holds them, to say which posting
 // broke which rule. The database checks every rule again. When Postgres aborts an attempt to keep the transactions
 // serializable (40001) or to break a deadlock (40P01), or another request commits the same key first (23505),
-// PostEntry retries it under the store's RetryPolicy, and returns ErrConflict once the attempts run out.
+// PostEntry retries it under the store's RetryPolicy, and returns ErrConflict once the attempts run out. A rejection
+// is checked against the key once more before it is returned, so the retry of a request that posted meanwhile
+// replays it.
 func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	posted ledger.PostedEntry, replayed bool, err error) {
 	if err := ledger.ValidKey(key); err != nil {
@@ -289,6 +291,16 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 		}
 		s.at("looked up", attempt)
 		posted, err = s.postOnce(ctx, key, hash[:], e, attempt)
+		if _, rejected := errors.AsType[*ledger.ValidationError](err); rejected {
+			// The rejection was decided on the accounts as this attempt found them. If a request with the same key
+			// committed after the lookup above (while this attempt waited for the accounts' locks, at read committed,
+			// or between the lookup and the transaction, at either level), the money found missing may be the money
+			// that request moved: it posted, and this is its retry, so it replays (found in review on day 3).
+			if prior, found, lookErr := s.lookUp(ctx, key, hash[:]); lookErr != nil || found {
+				return prior, found, lookErr
+			}
+			return ledger.PostedEntry{}, false, err
+		}
 		if !retryable(err) {
 			return posted, false, err
 		}
