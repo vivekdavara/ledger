@@ -17,7 +17,7 @@ import (
 // that each wrote something the other read form a cycle: one is aborted with 40001. This test lists what one posting
 // attempt has read by the time it commits, with the commit-time checks run early (SET CONSTRAINTS ALL IMMEDIATE) so
 // that their reads are in the list. Every posting writes a journal entry and its postings, so a lock on the whole of
-// either table makes any two concurrent postings conflict, however unrelated (DESIGN.md, "Concurrency (day 3)").
+// either table makes any two concurrent postings conflict, however unrelated (DESIGN.md, "Concurrency (days 2 and 3)").
 func TestWhatASerializablePostingHasRead(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

@@ -49,9 +49,9 @@ func (p RetryPolicy) delay(n int) time.Duration {
 	return rand.N(ceiling)
 }
 
-// Isolation is the isolation level of PostEntry's transactions (DESIGN.md, "Concurrency (day 3)"). Both levels keep
-// every rule: an attempt decides only on rows it has locked and rows it wrote itself. They differ in what a
-// concurrent change to a locked account does to an attempt: at ReadCommitted it waits for the row and goes on with
+// Isolation is the isolation level of PostEntry's transactions (DESIGN.md, "Concurrency (days 2 and 3)"). Both
+// levels keep every rule: an attempt decides only on rows it has locked and rows it wrote itself. They differ in what
+// a concurrent change to a locked account does to an attempt: at ReadCommitted it waits for the row and goes on with
 // the row as committed; at Serializable it waits and then fails with 40001, and is retried.
 type Isolation string
 
@@ -63,7 +63,7 @@ const (
 // DefaultIsolation is the level a Store posts at unless its Options say otherwise. Read committed since day 3: every
 // rule holds at both levels, and on a ledger of 20,000 accounts read committed posted 1.2 to 1.7 times as many
 // transfers a second with no retries, where serializable retried 0.55 to 0.80 times a transfer and gave up on 2 to
-// 3% of the transfers to one hot account (DESIGN.md, "Concurrency (day 3)").
+// 3% of the transfers to one hot account (DESIGN.md, "Concurrency (days 2 and 3)").
 const DefaultIsolation = ReadCommitted
 
 // ParseIsolation reads an isolation level as LEDGER_ISOLATION spells it: "read-committed" or "serializable".

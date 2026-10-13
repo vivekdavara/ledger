@@ -41,8 +41,9 @@ func (r Report) Clean() bool {
 
 // checks are Reconcile's checks. Each query returns one row per difference: a key to order it by (the ids it names,
 // zero-padded so they sort as numbers, or the currency) and a line naming the account, entry or currency.
-// The database's own rules (DESIGN.md, "Invariants") should make every one of them find nothing; Reconcile is
-// how anyone finds out if something got past them: a trigger switched off, a hand-made fix, a bug in a migration.
+// The database's own rules (DESIGN.md, "Invariants and where each is enforced") should make every one of them find
+// nothing; Reconcile is how anyone finds out if something got past them: a trigger switched off, a hand-made fix, a
+// bug in a migration.
 var checks = []struct{ name, description, sql string }{
 	{"currency_totals", "every currency's balances sum to zero", `
 		SELECT currency, format('%s balances sum to %s', currency, sum(balance))
@@ -63,7 +64,8 @@ var checks = []struct{ name, description, sql string }{
 		  JOIN LATERAL (SELECT account_version, balance_after FROM postings WHERE account_id = a.id
 		                 ORDER BY account_version DESC LIMIT 1) last ON true
 		 WHERE a.balance <> last.balance_after`},
-	{"account_chains", "every account's postings are versions 1, 2, 3, ... each leaving the balance before plus its amount", `
+	{"account_chains",
+		"every account's postings are versions 1, 2, 3, ... each leaving the balance before plus its amount", `
 		SELECT lpad(account_id::text, 20, '0') || lpad(account_version::text, 20, '0'),
 		       format('account %s: posting %s is version %s leaving %s, expected version %s leaving %s',
 		              account_id, id, account_version, balance_after, n, expected)
