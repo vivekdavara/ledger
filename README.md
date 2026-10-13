@@ -142,7 +142,7 @@ were sent over gRPC.
 
 ## Tests
 
-93 test functions (several table-driven or property-based), all green locally and in CI:
+97 test functions (several table-driven or property-based), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -161,12 +161,17 @@ were sent over gRPC.
   the key as unused, post one entry and replay eleven times; a serialization failure forced with a test hook
   (another payment commits between the attempt's snapshot and its lock) is retried and posts against the new
   balance; retries that run out give `ErrConflict` and store no key; a retry's wait ends with its context; eight
-  workers making 80 colliding transfers keep the books balanced.
+  workers making 80 colliding transfers keep the books balanced. A property test sends random requests at once,
+  each several times and some with a different entry under the same key: each key posts exactly once, every
+  send of that entry gets it back field for field, and the others are refused (100 cases; it fails against a
+  build that skips the hash comparison, and one that doesn't store the key).
 - `internal/apierr`: every error's reason, HTTP status and gRPC code, and which ones are redacted.
 - `internal/server`: the REST API over a real schema, including 14 malformed or refused requests, each checked for
-  its status, reason, posting and message, and the health endpoints.
+  its status, reason, posting and message, and the health endpoints. A request stuck behind a row lock gives up at
+  its deadline with 504, uses up no key, and posts once the lock is gone.
 - `internal/grpcapi`: the gRPC API over an in-memory connection (bufconn) on a real schema: the same walkthrough,
-  and each error's code, `ErrorInfo` reason and posting.
+  each error's code, `ErrorInfo` reason and posting, and the call deadline. `TestBothAPIsGiveTheSameReason` sends
+  22 failing requests through both APIs and requires the same reason and posting from each.
 - `cmd/ledgerd`: the real binary's `run`: migrations, an account created over REST and read back over gRPC from
   real ports, a clean shutdown of both, and a taken port failing startup.
 

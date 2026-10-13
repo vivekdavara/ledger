@@ -1,5 +1,5 @@
-// The code generators, kept out of the service's own module so their dependencies never reach the binary.
-// Run them through the Makefile: make proto.
+// The code generators (run by make proto) and grpcurl, kept out of the service's own module so their dependencies
+// never reach the binary. Run any of them with go tool -modfile=tools/go.mod <name>.
 module github.com/vivekdavara/ledger/tools
 
 go 1.27.1
