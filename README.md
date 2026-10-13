@@ -351,6 +351,33 @@ The day-2 test of disjoint transfers now runs at both levels: `TestDisjointTrans
 logged 0 retries at read committed and 198 retries, 2 gave up, at serializable in today's first run alongside the
 other tests.
 
+### Day 3: what the outbox and the new default cost one client
+
+`make bench` again, at three builds: before the outbox (`f581a56`, serializable), with it (`4eed7ca`, still
+serializable), and now (`ff899c7`, read committed). Two rounds of `-count 3` each, the second in the opposite order,
+so medians of 6; Apple M3, Postgres 14.20 at default settings, on power, nothing else running:
+
+| Postings per entry | Plain insert, check on: before → with the outbox | Through the service: before → with the outbox → read committed | Replay |
+|---|---|---|---|
+| 2 | 304 → 321 µs | 461 → 465 → 462 µs | 81–82 µs |
+| 8 | 792 → 818 µs | 1,133 → 1,113 → 1,243 µs | 85–86 µs |
+| 64 | 4,575 → 4,439 µs | 5,041 → 5,056 → 4,979 µs | 118–119 µs |
+
+```bash
+make bench
+```
+
+For the first two columns, run it in a worktree at `f581a56` and at `4eed7ca`.
+
+- **The outbox's trigger costs about 17 µs an entry**: 304 → 321 µs at 2 postings with the check on, 250 → 268 µs
+  with it off; the six runs of each build don't overlap. At 8 and 64 postings it is lost in the spread between runs
+  (8 postings: 698–880 µs before, 737–916 with it).
+- **Through the service the three builds are within their run-to-run spread at every size,** the 8-posting row
+  included (944–1,238, 1,018–1,272 and 1,086–1,250 µs). One client never waits for anyone, so the isolation level
+  doesn't show here; it shows under contention, above.
+- Day 2's service numbers (434 / 1,124 / 5,001 µs) came from other runs on another evening; compare within a table,
+  not across them.
+
 ### Day 3: the outbox and reconciliation
 
 `make bench-outbox`, at `38041c6`, three runs each, same machine:
