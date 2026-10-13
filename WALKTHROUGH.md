@@ -301,3 +301,10 @@ Invalid UTF-8 (the package turns each bad byte into U+FFFD, so two different nam
 twice (the last wins), and field names in another case (it matches case-insensitively, even with
 `DisallowUnknownFields`). A token pre-pass (`strictKeys`) refuses the last two; `utf8.Valid` the first. A body must
 also be `application/json`, which a cross-site form can't send, and at most 64 KB (413 above).
+
+**How does paging behave while new postings arrive?**
+History pages by account version, not by offset: a page is "the next N postings after version v", and versions are
+dense and never change. A posting that arrives between two pages gets a higher version, so the client sees it on a
+later page, once; nothing shifts the way it would under `OFFSET`. `TestPagingIsStableWhilePostingsArrive` posts
+between pages and sees versions 1 to 7 once each, in order. The query is one statement (a `LEFT JOIN LATERAL` from
+the account), so "no such account" and "no postings yet" come from the same snapshot.

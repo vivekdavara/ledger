@@ -143,7 +143,7 @@ were sent over gRPC.
 
 ## Tests
 
-119 test functions (several table-driven or property-based), all green locally and in CI:
+122 test functions (several table-driven or property-based), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -171,8 +171,8 @@ were sent over gRPC.
   order whatever the request's order (`NOWAIT` probes while an attempt waits); the key checked before the entry;
   default and largest history pages; the retry delay's bounds for eight policies; and a differential property test
   where the service's account checks and the database's constraints must agree on a posting, for every type,
-  overdraft setting and balance out to the edges of `bigint` (1,000 cases). Each was checked against a build without
-  its mechanism.
+  overdraft setting and balance out to the edges of `bigint` (1,000 cases); paging that stays stable while postings
+  arrive; concurrent creates with clashing types. Each was checked against a build without its mechanism.
 - `internal/apierr`: every error's reason, HTTP status and gRPC code, which ones are redacted, and a lost database
   (SQLSTATE 08 and 57P, a broken connection) as unavailable.
 - `internal/server`: the REST API over a real schema, including 14 malformed or refused requests, each checked for
