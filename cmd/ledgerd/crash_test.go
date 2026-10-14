@@ -119,13 +119,21 @@ func (c *child) killedBySIGKILL() bool {
 	return ok && status.Signaled() && status.Signal() == syscall.SIGKILL
 }
 
+// stoppedCleanly reports whether the child, which has ended, ended as a stop signal should end it: exit 0, or
+// SIGTERM's default action, which is what a SIGTERM that arrives before Go's runtime has handed signals to main
+// does (exit 143 in a shell). Nothing can catch that one.
+func (c *child) stoppedCleanly() bool {
+	status, ok := c.cmd.ProcessState.Sys().(syscall.WaitStatus)
+	return c.cmd.ProcessState.ExitCode() == 0 || ok && status.Signaled() && status.Signal() == syscall.SIGTERM
+}
+
 // stop sends SIGTERM and waits for a clean exit.
 func (c *child) stop(t *testing.T) {
 	t.Helper()
 	_ = c.cmd.Process.Signal(syscall.SIGTERM)
 	c.wait(t, 30*time.Second)
-	if code := c.cmd.ProcessState.ExitCode(); code != 0 {
-		t.Fatalf("ledgerd exited %d after SIGTERM: %s", code, c.stderr.String())
+	if !c.stoppedCleanly() {
+		t.Fatalf("ledgerd ended with %v after SIGTERM: %s", c.cmd.ProcessState, c.stderr.String())
 	}
 }
 
@@ -350,8 +358,9 @@ func (s *supervisor) run() {
 			s.pointCrashes++
 		case killed:
 			s.kills++
-		case !stopping || c.cmd.ProcessState.ExitCode() != 0:
-			// Only SIGKILL ends a child before the stop, and only SIGTERM's clean exit after it.
+		case !stopping || !c.stoppedCleanly():
+			// Only SIGKILL ends a child before the stop, and only a clean stop after it. A child the killer had
+			// just replaced may get the SIGTERM while it starts up, which is clean too (TestAStopDuringStartupIsClean).
 			s.failure = fmt.Errorf("ledgerd ended with %v: %s", c.cmd.ProcessState, c.stderr.String())
 		}
 		failed := s.failure != nil

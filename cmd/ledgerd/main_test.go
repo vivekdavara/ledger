@@ -378,6 +378,21 @@ func TestAStopAsServeStartsIsClean(t *testing.T) {
 	}
 }
 
+// A stop signal that arrives while serve or publish connects or migrates is a clean stop: exit 0, as a stop at
+// any later moment is. migrate and reconcile, stopped before their one job is done, exit 1.
+func TestAStopDuringStartupIsClean(t *testing.T) {
+	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
+		"LEDGER_HTTP_ADDR": "127.0.0.1:0", "LEDGER_GRPC_ADDR": "127.0.0.1:0"}
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel() // the signal came before the database answered
+	for sub, want := range map[string]int{"serve": 0, "publish": 0, "migrate": 1, "reconcile": 1} {
+		var logs syncBuffer
+		if code := run(stopped, []string{sub}, env(vars), io.Discard, &logs, nil); code != want {
+			t.Errorf("%s stopped during startup: exit %d, want %d: %s", sub, code, want, logs.String())
+		}
+	}
+}
+
 // ledgerd publish writes the outbox's events to stdout as JSON lines: the entries posted before it started, then
 // one posted while it runs. A stop signal ends it with exit 0, and every event it wrote is marked published.
 func TestPublishWritesEventsAsJSONLines(t *testing.T) {

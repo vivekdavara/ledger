@@ -96,8 +96,21 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		grpcAddr = defaultGRPCAddr
 	}
 
+	// For serve and publish a stop signal is the normal way to end, so one that comes while they connect or migrate
+	// is a clean stop too: they had done nothing yet. migrate and reconcile were asked for one job, and a stop leaves
+	// it undone (found while building day 4's crash tests: serve and publish exited 1).
+	stoppedEarly := func(err error) bool {
+		if ctx.Err() == nil || (args[0] != "serve" && args[0] != "publish") {
+			return false
+		}
+		log.Info("stopped before starting", "err", err)
+		return true
+	}
 	db, err := store.Open(ctx, url)
 	if err != nil {
+		if stoppedEarly(err) {
+			return 0
+		}
 		log.Error("open the database", "err", err)
 		return 1
 	}
@@ -107,6 +120,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	applied, err := store.Migrate(ctx, db)
 	if err != nil {
+		if stoppedEarly(err) {
+			return 0
+		}
 		log.Error("migrate", "err", err)
 		return 1
 	}
