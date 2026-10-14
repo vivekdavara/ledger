@@ -526,3 +526,79 @@ func TestASteepSkewEndsQuickly(t *testing.T) {
 		}
 	}
 }
+
+// recording wraps a client and keeps each transfer key's entry, the first time the key is sent.
+type recording struct {
+	load.Client
+	mu   sync.Mutex
+	sent map[string]ledger.Entry
+}
+
+func (r *recording) PostEntry(ctx context.Context, key string, e ledger.Entry) (load.Posted, error) {
+	r.mu.Lock()
+	if _, ok := r.sent[key]; !ok && strings.Contains(key, ":t") {
+		r.sent[key] = e
+	}
+	r.mu.Unlock()
+	return r.Client.PostEntry(ctx, key, e)
+}
+
+// Retries draw their waits from a generator of their own, so a run whose requests go unanswered and are sent again
+// sends the same transfers, under the same keys, as one where every request is answered. With the waits drawn from
+// the transfers' own generator, nothing noticed (found in review).
+func TestRetriesDontChangeWhichTransfersAreSent(t *testing.T) {
+	t.Parallel()
+	cfg := load.Config{Layout: load.Random, Wallets: 10, Workers: 4, Transfers: 200, Retry: true, Prefix: "same:",
+		Skew: 1.5}
+	runs := map[string]map[string]ledger.Entry{}
+	for _, lossy := range []bool{false, true} {
+		var c load.Client = newMemLedger()
+		if lossy {
+			c = &faulty{Client: c, every: 3, fault: func(context.Context, load.Client, string, ledger.Entry) (load.Posted, error) {
+				return load.Posted{}, errLost
+			}}
+		}
+		rec := &recording{Client: c, sent: map[string]ledger.Entry{}}
+		res, err := load.Run(context.Background(), rec, cfg)
+		if err != nil || len(res.Mismatches) > 0 || lossy && res.Retries == 0 {
+			t.Fatalf("lossy=%v: %v, %+v", lossy, err, res)
+		}
+		runs[fmt.Sprint(lossy)] = rec.sent
+	}
+	if len(runs["true"]) != 200 || fmt.Sprint(runs["true"]) != fmt.Sprint(runs["false"]) {
+		t.Fatal("the retried run sent other transfers than the clean one")
+	}
+}
+
+// A transfer settled after the run is counted where its answer puts it, but not timed: its time includes the wait
+// for the run to end. Timing it went unnoticed (found in review).
+func TestSettledTransfersAreCountedButNotTimed(t *testing.T) {
+	t.Parallel()
+	c := &faulty{Client: newMemLedger(), every: 5, fault: func(context.Context, load.Client, string, ledger.Entry) (load.Posted, error) {
+		return load.Posted{}, errLost
+	}}
+	res, err := load.Run(context.Background(), c, load.Config{Wallets: 10, Workers: 4, Transfers: 100})
+	if err != nil || res.Unknown != 20 || res.Posted != 100 || res.Timed != 80 || len(res.Mismatches) > 0 {
+		t.Fatalf("%v, %+v", err, res)
+	}
+}
+
+// A conflict posted nothing: without Retry it counts as given up and is left out of the books' expectations, and
+// with Retry it is sent again until it posts. No test had a conflict, since read committed doesn't give any (found
+// in review).
+func TestConflictsAreGivenUpOrSentAgain(t *testing.T) {
+	t.Parallel()
+	for _, retry := range []bool{false, true} {
+		c := &faulty{Client: newMemLedger(), every: 4, fault: func(context.Context, load.Client, string, ledger.Entry) (load.Posted, error) {
+			return load.Posted{}, &load.APIError{Reason: "conflict", Status: http.StatusConflict}
+		}}
+		res, err := load.Run(context.Background(), c, load.Config{Wallets: 10, Workers: 4, Transfers: 100, Retry: retry})
+		if err != nil || len(res.Mismatches) > 0 {
+			t.Fatalf("retry=%v: %v, %+v", retry, err, res)
+		}
+		if !retry && (res.GaveUp != 25 || res.Posted != 75 || res.Retries != 0) ||
+			retry && (res.GaveUp != 0 || res.Posted != 100 || res.Retries != 25) {
+			t.Fatalf("retry=%v: %+v", retry, res)
+		}
+	}
+}

@@ -128,8 +128,9 @@ type Result struct {
 	Unknown int
 	Retries int // requests sent again, during the run and when settling
 	// The latency of a transfer runs from its first request to its answer, retries included; given-up and refused
-	// transfers count, and settled ones don't.
+	// transfers count, and settled ones don't. Timed is how many transfers the percentiles cover.
 	P50, P90, P99, Max time.Duration
+	Timed              int
 	// Mismatches lists each account whose balance at the end isn't what the answers imply; empty when the books
 	// agree with every answer the clients got.
 	Mismatches []string
@@ -432,6 +433,7 @@ func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
 		return out
 	}()...)
 	slices.Sort(all)
+	res.Timed = len(all)
 	if len(all) > 0 {
 		at := func(p float64) time.Duration { return all[int(p*float64(len(all)-1))] }
 		res.P50, res.P90, res.P99, res.Max = at(0.50), at(0.90), at(0.99), all[len(all)-1]
