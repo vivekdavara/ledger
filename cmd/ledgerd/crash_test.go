@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -17,6 +21,7 @@ import (
 	"github.com/vivekdavara/ledger/internal/faults"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/load"
+	"github.com/vivekdavara/ledger/internal/outbox"
 	"github.com/vivekdavara/ledger/internal/store"
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 )
@@ -281,4 +286,275 @@ func TestACrashAroundTheCommitIsSettledByTheRetry(t *testing.T) {
 			})
 		}
 	}
+}
+
+// supervisor keeps one ledgerd child running: whenever it dies it starts another with the next spec from specs
+// (cycling), as a process manager would. Meanwhile a killer sends the running child SIGKILL every now and then,
+// whatever it is doing. A child that ends by SIGKILL after writing a crash point's line was crashed by the point;
+// one that ends by SIGKILL without it was the killer's.
+type supervisor struct {
+	bin, sub  string
+	vars      map[string]string
+	specs     []string         // LEDGER_FAULTS for each start in turn; "" arms nothing
+	onExit    func(c *child)   // sees each child that ended, before the next starts
+	killEvery [2]time.Duration // the killer's wait, uniform in [min, max); zero for no killer
+
+	mu                          sync.Mutex
+	current                     *child
+	starts, pointCrashes, kills int
+	stopping                    bool
+	done                        chan struct{}
+	failure                     error
+}
+
+func (s *supervisor) run() {
+	defer close(s.done)
+	killer := make(chan struct{})
+	defer close(killer)
+	if s.killEvery[1] > 0 {
+		go s.kill(killer)
+	}
+	for i := 0; ; i++ {
+		vars := maps.Clone(s.vars)
+		if spec := s.specs[i%len(s.specs)]; spec != "" {
+			vars["LEDGER_FAULTS"] = spec
+		}
+		c := &child{cmd: exec.Command(s.bin, s.sub), exited: make(chan struct{})}
+		c.cmd.Env = os.Environ()
+		for k, v := range vars {
+			c.cmd.Env = append(c.cmd.Env, k+"="+v)
+		}
+		c.cmd.Stdout, c.cmd.Stderr = &c.stdout, &c.stderr
+		s.mu.Lock()
+		if s.stopping { // checked under the lock that stop takes, so a stop never misses a child just started
+			s.mu.Unlock()
+			return
+		}
+		if err := c.cmd.Start(); err != nil {
+			s.failure = err
+			s.mu.Unlock()
+			return
+		}
+		s.current, s.starts = c, s.starts+1
+		s.mu.Unlock()
+		go func() { _ = c.cmd.Wait(); close(c.exited) }()
+		<-c.exited
+		if s.onExit != nil {
+			s.onExit(c)
+		}
+		s.mu.Lock()
+		stopping := s.stopping
+		killed := c.killedBySIGKILL()
+		switch {
+		case killed && strings.Contains(c.stderr.String(), faults.FiredPrefix+" "):
+			s.pointCrashes++
+		case killed:
+			s.kills++
+		case !stopping || c.cmd.ProcessState.ExitCode() != 0:
+			// Only SIGKILL ends a child before the stop, and only SIGTERM's clean exit after it.
+			s.failure = fmt.Errorf("ledgerd ended with %v: %s", c.cmd.ProcessState, c.stderr.String())
+		}
+		failed := s.failure != nil
+		s.mu.Unlock()
+		if stopping || failed {
+			return
+		}
+	}
+}
+
+// kill sends the running child SIGKILL at random intervals until stop is closed or the supervisor is stopping.
+func (s *supervisor) kill(stop <-chan struct{}) {
+	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 7))
+	for {
+		select {
+		case <-stop:
+			return
+		case <-time.After(s.killEvery[0] + time.Duration(rng.Int64N(int64(s.killEvery[1]-s.killEvery[0])))):
+		}
+		s.mu.Lock()
+		if c := s.current; c != nil && !s.stopping {
+			_ = c.cmd.Process.Kill() // a child that has just ended, and isn't reaped yet, ignores it
+		}
+		s.mu.Unlock()
+	}
+}
+
+func startSupervisor(t *testing.T, s *supervisor) *supervisor {
+	t.Helper()
+	s.done = make(chan struct{})
+	go s.run()
+	t.Cleanup(func() {
+		s.mu.Lock()
+		s.stopping = true
+		if s.current != nil {
+			_ = s.current.cmd.Process.Kill()
+		}
+		s.mu.Unlock()
+		<-s.done
+	})
+	return s
+}
+
+// stop ends the running child with SIGTERM, expecting a clean exit, and waits for the supervisor.
+func (s *supervisor) stop(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	s.stopping = true
+	if s.current != nil {
+		_ = s.current.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the supervisor didn't stop")
+	}
+	if s.failure != nil {
+		t.Fatal(s.failure)
+	}
+}
+
+// counts returns how many children were started, crashed by a crash point, and killed by the killer.
+func (s *supervisor) counts() (starts, pointCrashes, kills int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.starts, s.pointCrashes, s.kills
+}
+
+// Load from 8 clients while ledgerd keeps dying: every 40th commit of a process, alternately just before and just
+// after it, and at random moments from the killer. The clients send each transfer again with its key until it is
+// answered. At the end each transfer has posted exactly once: as many transfers keys and entries as transfers, every
+// account holding what the answers imply, and ledgerd reconcile exits 0.
+func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
+	bin := faultsBinary(t)
+	for _, api := range []string{"rest", "grpc"} {
+		t.Run(api, func(t *testing.T) {
+			t.Parallel()
+			db := storetest.Migrated(t)
+			url := storetest.SchemaURL(t, db)
+			vars := map[string]string{"LEDGER_DATABASE_URL": url, "LEDGER_HTTP_ADDR": freeAddr(t),
+				"LEDGER_GRPC_ADDR": freeAddr(t)}
+			sup := startSupervisor(t, &supervisor{bin: bin, sub: "serve", vars: vars,
+				specs:     []string{faults.AfterCommit + ":40", faults.BeforeCommit + ":40"},
+				killEvery: [2]time.Duration{300 * time.Millisecond, 900 * time.Millisecond}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			const transfers = 600
+			res, err := load.Run(ctx, clientFor(t, api, vars), load.Config{Layout: load.Random, Wallets: 20,
+				Workers: 8, Transfers: transfers, Retry: true, Prefix: "chaos:"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			starts, pointCrashes, kills := sup.counts()
+			sup.stop(t)
+			t.Logf("%s: %d starts, %d crashes at a point, %d kills; posted %d, replayed %d, sent again %d; "+
+				"%.0f transfers a second, p50 %v, p99 %v, max %v", api, starts, pointCrashes, kills, res.Posted,
+				res.Replayed, res.Retries, res.PerSecond(), res.P50, res.P99, res.Max)
+
+			if len(res.Mismatches) > 0 {
+				t.Fatalf("the books don't agree with the answers: %q", res.Mismatches)
+			}
+			if res.Posted+res.Replayed != transfers || len(res.Refused) > 0 || res.GaveUp+res.Unknown > 0 {
+				t.Fatalf("%+v", res)
+			}
+			// Crashes after a commit leave transfers posted and unanswered: their retries replay.
+			if pointCrashes < 10 || res.Replayed == 0 {
+				t.Fatalf("%d crashes at a point and %d replays: the test didn't crash ledgerd as it should", pointCrashes,
+					res.Replayed)
+			}
+			if n := queryInt(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE 'chaos:t%'`); n != transfers {
+				t.Fatalf("%d transfer keys, want %d", n, transfers)
+			}
+			if n := queryInt(t, db, `SELECT count(*) FROM journal_entries`); n != 20+transfers {
+				t.Fatalf("%d entries, want %d (20 fundings and the transfers)", n, 20+transfers)
+			}
+			reconcileClean(t, url)
+		})
+	}
+}
+
+// ledgerd publish is killed again and again while it drains a backlog of 2,000 events: just after its sink took a
+// batch and before the batch is marked (every 1st, 2nd or 3rd batch of a process, in turn), and at random moments.
+// Each kill's batch is delivered again by the next publisher, so events arrive at least once; a consumer that
+// dedupes by event id sees every event once, each account's in version order; ledgerd reconcile exits 0.
+func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
+	t.Parallel()
+	bin := faultsBinary(t)
+	db := storetest.Migrated(t)
+	url := storetest.SchemaURL(t, db)
+	ctx := context.Background()
+	svc := store.New(db)
+	var accounts [4]int64
+	for i := range accounts {
+		a, _, err := svc.CreateAccount(ctx, ledger.NewAccount{Name: fmt.Sprintf("wallet:%d", i), Type: ledger.Liability,
+			Currency: "USD", AllowNegative: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		accounts[i] = a.ID
+	}
+	const events = 2000
+	var wg sync.WaitGroup
+	for w := range 4 {
+		wg.Go(func() {
+			for i := w; i < events; i += 4 {
+				from, to := accounts[i%4], accounts[(i+1+i/4%3)%4]
+				if _, _, err := svc.PostEntry(ctx, fmt.Sprintf("e%d", i), ledger.Entry{Postings: []ledger.Posting{
+					{AccountID: from, Currency: "USD", Amount: 1}, {AccountID: to, Currency: "USD", Amount: -1}}}); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	var mu sync.Mutex
+	var stream []outbox.Event
+	torn := 0
+	sup := startSupervisor(t, &supervisor{bin: bin, sub: "publish", vars: map[string]string{"LEDGER_DATABASE_URL": url},
+		specs:     []string{faults.AfterDeliver + ":1", faults.AfterDeliver + ":2", faults.AfterDeliver + ":3"},
+		killEvery: [2]time.Duration{50 * time.Millisecond, 250 * time.Millisecond},
+		onExit: func(c *child) {
+			mu.Lock()
+			defer mu.Unlock()
+			for line := range strings.Lines(c.stdout.String()) {
+				var e outbox.Event
+				if err := json.Unmarshal([]byte(line), &e); err != nil {
+					torn++ // a line cut off by a kill: consumers skip what doesn't parse
+					continue
+				}
+				stream = append(stream, e)
+			}
+		}})
+	deadline := time.Now().Add(2 * time.Minute)
+	for queryInt(t, db, `SELECT count(*) FROM outbox WHERE published_at IS NULL`) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("events still unpublished after 2 minutes")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	starts, pointCrashes, kills := sup.counts()
+	sup.stop(t)
+
+	mu.Lock()
+	defer mu.Unlock()
+	deduped := outbox.Dedupe(map[int64]bool{}, stream)
+	t.Logf("%d publishers, %d killed after delivering, %d killed at random; %d lines, %d events after dedupe, %d torn",
+		starts, pointCrashes, kills, len(stream), len(deduped), torn)
+	if len(deduped) != events {
+		t.Fatalf("%d distinct events delivered, want %d", len(deduped), events)
+	}
+	if err := outbox.CheckOrder(deduped); err != nil {
+		t.Fatal(err)
+	}
+	if pointCrashes < 5 || len(stream)-len(deduped) < 100*pointCrashes/2 {
+		t.Fatalf("%d crashes after a delivery and %d events delivered twice: the kills didn't happen as they should",
+			pointCrashes, len(stream)-len(deduped))
+	}
+	reconcileClean(t, url)
 }

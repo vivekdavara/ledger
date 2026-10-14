@@ -34,6 +34,9 @@ const (
 	AfterDeliver = "outbox.after-deliver"
 )
 
+// FiredPrefix starts the line a point writes to stderr when it crashes the process, in the faults build.
+const FiredPrefix = "faults:"
+
 // Points lists every point, so a misspelled spec is refused instead of quietly crashing nothing.
 var Points = []string{BeforeCommit, AfterCommit, AfterDeliver}
 

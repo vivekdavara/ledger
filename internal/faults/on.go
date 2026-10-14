@@ -3,7 +3,9 @@
 package faults
 
 import (
+	"fmt"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"syscall"
 )
@@ -40,6 +42,8 @@ func Point(name string) {
 	if !crash {
 		return
 	}
+	// One line on stderr says which point fired, so a test can tell this crash from a kill sent from outside.
+	fmt.Fprintf(os.Stderr, "%s %s:%s fired, killing the process\n", FiredPrefix, name, r)
 	_ = syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
 	select {} // the signal is on its way; nothing after the point may run
 }

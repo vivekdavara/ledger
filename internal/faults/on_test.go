@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -39,7 +40,15 @@ func child(t *testing.T, spec string) (string, syscall.Signal) {
 	cmd.Env = append(os.Environ(), crashChild+"="+spec)
 	// A child that hangs is stopped with SIGTERM, not CommandContext's default SIGKILL, which would pass for a crash.
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	if err == nil && stderr.Len() > 0 {
+		t.Fatalf("a child that survived wrote %q to stderr", stderr.String())
+	}
+	if err != nil && !strings.HasPrefix(stderr.String(), FiredPrefix+" "+AfterCommit+":") {
+		t.Fatalf("a killed child wrote %q to stderr, not the fired line", stderr.String())
+	}
 	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
 		if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 			return string(out), status.Signal()
