@@ -518,6 +518,23 @@ client without an answer at any point. What it doesn't model is the database or 
 commit is durable before `tx.Commit` returns, and the page cache survives a killed process. That durability is
 Postgres's (WAL and `fsync`), and the limitations say it isn't tested here.
 
+**Tell me about a bug a review found on day 4.**
+The load generator's own check was blind in one layout. At the end of a run it compared each account's balance with
+what the answers implied. In the disjoint layout each worker moves $0.10 from wallet A to B, then B to A, and so on;
+so if the ledger posted every transfer twice, the balances still came out exactly as the answers implied, and the
+check reported nothing (the reviewer showed 240 entries for 120 transfers, and 0 mismatches). The fix is to compare
+something that can't cancel: each account's version, its number of postings. A wallet must have its funding plus one
+posting per transfer answered as posted that touched it. `TestTheCheckCatchesATransferPostedTwiceOrLost` now runs
+every layout with every transfer doubled, every one lost, and just one worker's first pair doubled, and fails with
+versions ignored. The lesson: a checksum of signed amounts can hide symmetric errors; count things too.
+
+**And one in the ledger itself?**
+`PostEntry` gives up after its attempts run out and answers `conflict`, which tells the client nothing posted. But if
+the last attempt lost a race to another copy of the same request (on the key's primary key, or on the account's row
+at serializable), the key's entry had posted, and the answer was wrong. Reproduced with two copies, one attempt each,
+held at a barrier after the key lookup; fixed by looking the key up once more before answering `conflict`, as a
+rejection already did on day 3 (`TestACopyOutOfAttemptsGetsTheEntryItsKeyPosted`).
+
 **Tell me about something day 4 found.**
 A flaky test from day 3. `TestEventsWhoseMarkIsLostAreDeliveredAgain` failed once in a full parallel run: after a
 simulated crash, the next publisher found nothing to publish. In pgx (v5.11), a rollback that fails on a cancelled

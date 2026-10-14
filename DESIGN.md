@@ -715,6 +715,12 @@ process's own `LEDGER_` settings.
   its locks, a moment later. Until then `FOR UPDATE SKIP LOCKED` passes over the batch. The publisher's next poll
   takes it, as the test now does. A real crash behaves the same way: the next publisher may skip a dead one's batch
   once, never lose it.
+- **Found by the day-4 review** (README, "Review of day 4", has each one's reproduction): the books check compared
+  balances only, and in the disjoint layout faults cancel out, so it compares versions too; a request out of
+  attempts answered `conflict` though a copy with its key had committed, so running out looks the key up again;
+  `net/http` resent POSTs carrying an `Idempotency-Key` by itself, unseen, so the load generator turns that off;
+  reusing a prefix with another config gave false mismatches, so names carry a tag of the config; a steep skew hung
+  the random layout; the crash tests' random killer was never checked to have killed anything.
 
 ## Testing
 
@@ -828,3 +834,12 @@ process's own `LEDGER_` settings.
   in between; the test would then fail waiting for readiness, never pass wrongly.
 - **The books check sees only the run's own accounts** (day 4). `ledgerd reconcile`, which every failure run ends
   with, checks the whole ledger.
+- **Publisher order across a host crash** (day 4, from the review, not reproduced). A restarted publisher skips a
+  batch the dead one's session still holds (`SKIP LOCKED`). When the process dies, Postgres sees the socket close
+  within milliseconds, long before a new process is up; when the machine or the network dies instead, no FIN comes,
+  and the lock lasts until TCP keepalive gives up. A batch skipped that way is delivered later, so each account's
+  order doesn't hold across that kind of crash; `account_version` still orders a consumer's view.
+- **What the load generator reports** (day 4). A non-ledger 4xx (a proxy's 429) is a refusal and isn't retried.
+  Percentiles take the lower rank (`all[int(p*(n-1))]`). Without `-retry`, a transfer that got no answer counts as
+  finished in transfers/s and is left out of the latencies, so a run with failures looks faster than it was; with
+  `-retry` its whole wait is in its latency. An interrupted run prints nothing.
