@@ -274,9 +274,9 @@ func (s *Store) History(ctx context.Context, accountID, afterVersion int64, limi
 // other's locks in a cycle, and checks the rules that need the accounts while it holds them, to say which posting
 // broke which rule. The database checks every rule again. When Postgres aborts an attempt to keep the transactions
 // serializable (40001) or to break a deadlock (40P01), or another request commits the same key first (23505),
-// PostEntry retries it under the store's RetryPolicy, and returns ErrConflict once the attempts run out. A rejection
-// is checked against the key once more before it is returned, so the retry of a request that posted meanwhile
-// replays it.
+// PostEntry retries it under the store's RetryPolicy, and returns ErrConflict once the attempts run out. A rejection,
+// and running out of attempts, are checked against the key once more before they are returned, so the retry of a
+// request that posted meanwhile replays it.
 func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 	posted ledger.PostedEntry, replayed bool, err error) {
 	if err := ledger.ValidKey(key); err != nil {
@@ -306,6 +306,12 @@ func (s *Store) PostEntry(ctx context.Context, key string, e ledger.Entry) (
 			return posted, false, err
 		}
 		if attempt >= s.retry.Attempts {
+			// Out of attempts. The last one may have lost a race to another request with the same key, for the key
+			// itself (23505) or for the accounts (40001); then the key's entry is this request's, and so is the
+			// answer. "Conflict" tells a client that nothing posted (found in review on day 4).
+			if prior, found, lookErr := s.lookUp(ctx, key, hash[:]); lookErr != nil || found {
+				return prior, found, lookErr
+			}
 			return ledger.PostedEntry{}, false, &conflictError{attempts: attempt, last: err}
 		}
 		s.retries.Add(1)

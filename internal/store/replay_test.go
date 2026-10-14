@@ -168,3 +168,46 @@ func TestConcurrentCopiesOfAPaymentOnlyOneCanAffordAllGetIt(t *testing.T) {
 		checkBooks(t, db)
 	})
 }
+
+// Two copies of one request, each allowed a single attempt, both find the key unused, and the first commits. The
+// second affords the payment too ($20 of Alice's $50, $30 left), so it isn't refused: at read committed it posts its
+// own entry and then fails on the key's primary key (23505), at serializable it fails on Alice's row (40001), either
+// way on its last attempt. Its key's entry is posted, so its answer must be that entry: "conflict" tells a client
+// that nothing posted (found in review on day 4).
+func TestACopyOutOfAttemptsGetsTheEntryItsKeyPosted(t *testing.T) {
+	t.Parallel()
+	atEachLevel(t, func(t *testing.T, level store.Isolation) {
+		db := storetest.Migrated(t)
+		s := at(db, level, store.RetryPolicy{Attempts: 1})
+		b := wallets(t, s)
+		var arrived sync.WaitGroup
+		arrived.Add(2)
+		store.SetHook(s, func(point string, attempt int) {
+			if point == "looked up" {
+				arrived.Done()
+				arrived.Wait()
+			}
+		})
+		results := make([]struct {
+			posted   ledger.PostedEntry
+			replayed bool
+			err      error
+		}, 2)
+		var wg sync.WaitGroup
+		for i := range results {
+			wg.Go(func() {
+				r := &results[i]
+				r.posted, r.replayed, r.err = s.PostEntry(context.Background(), "pay-1", payment(b, 2000))
+			})
+		}
+		wg.Wait()
+		if results[0].err != nil || results[1].err != nil || results[0].posted.ID != results[1].posted.ID ||
+			results[0].replayed == results[1].replayed {
+			t.Fatalf("got %+v; want the one entry, posted once and replayed once", results)
+		}
+		if bal, ver := balanceOf(t, db, b.alice); bal != -3000 || ver != 2 {
+			t.Fatalf("alice: balance %d version %d, want one $20 payment", bal, ver)
+		}
+		checkBooks(t, db)
+	})
+}
