@@ -264,7 +264,9 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 		code = 1
 	}
 	if code == 0 {
-		log.Info("stopped")
+		// The retries are the attempts aborted by Postgres (40001, 40P01) or lost to a request with the same key,
+		// and tried again: what a load test can't see from outside (scripts/load.sh reads them here).
+		log.Info("stopped", "posting_retries", svc.Retries())
 	}
 	return code
 }

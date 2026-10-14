@@ -2,7 +2,7 @@
 LEDGER_TEST_DATABASE_URL ?= postgres://localhost:5432/ledger_test?sslmode=disable
 export LEDGER_TEST_DATABASE_URL
 
-.PHONY: bench bench-contention bench-outbox check lint proto test
+.PHONY: bench bench-contention bench-outbox check lint load proto test
 
 # What CI runs.
 check: lint test
@@ -32,6 +32,11 @@ bench-contention:
 bench-outbox:
 	go test -run '^$$' -bench Publish -benchtime 3x -count 3 ./internal/outbox
 	go test -run '^$$' -bench Reconcile -benchtime 3x -count 3 -timeout 20m ./internal/store
+
+# README, "Results" (day 4): ledgerload against a real ledgerd, in bench-contention's layouts, over REST and gRPC at
+# both isolation levels; 3 runs of 3000 transfers each, on a padded schema each. Needs a quiet machine and jq.
+load:
+	scripts/load.sh 3 3000
 
 # Lint proto/ and regenerate internal/gen from it. The generators are pinned in tools/go.mod, so nothing needs
 # installing; the generated code is committed, so building never needs them.
