@@ -614,3 +614,28 @@ func TestALostConnectionDuringDeliveryLosesNoEvent(t *testing.T) {
 		t.Fatalf("%d deliveries, want each of the 3 events twice", len(got))
 	}
 }
+
+// A publisher killed partway through a line leaves it cut off in output that outlives it (a file it appends to, a
+// pipe kept open across restarts). The next process's first event is glued onto the fragment and lost to a consumer
+// reading lines, though marked published, unless that process starts on a new line (found in review on day 4).
+func TestANewProcessStartsOnANewLine(t *testing.T) {
+	t.Parallel()
+	events := []outbox.Event{{ID: 8, Type: outbox.EntryPosted, EntryID: 8}, {ID: 9, Type: outbox.EntryPosted, EntryID: 9}}
+	for _, fresh := range []bool{false, true} {
+		var out bytes.Buffer
+		out.WriteString(`{"id":7,"type":"entry_po`) // what the killed predecessor left
+		if err := (&outbox.JSONLines{W: &out, StartOnNewLine: fresh}).Deliver(context.Background(), events); err != nil {
+			t.Fatal(err)
+		}
+		var read []int64
+		for line := range strings.Lines(out.String()) {
+			var e outbox.Event
+			if json.Unmarshal([]byte(line), &e) == nil {
+				read = append(read, e.ID)
+			}
+		}
+		if want := map[bool]string{false: "[9]", true: "[8 9]"}[fresh]; fmt.Sprint(read) != want {
+			t.Fatalf("StartOnNewLine %v: a consumer read events %v, want %s", fresh, read, want)
+		}
+	}
+}

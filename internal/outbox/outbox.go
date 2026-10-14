@@ -60,12 +60,23 @@ type Sink interface {
 // fragment and lost to the consumer, though marked published (found in review on day 3). Consumers skip lines that
 // don't parse.
 type JSONLines struct {
-	W    io.Writer
-	torn bool // the last write stopped partway through a line
+	W io.Writer
+	// StartOnNewLine writes a newline before the first delivery, for output that outlives the process: a file it
+	// appends to, or a pipe a supervisor keeps open across restarts. A publisher killed partway through a line leaves
+	// it cut off there, and the next process's first event would be glued onto it: unreadable to a consumer, though
+	// marked published (found in review on day 4). ledgerd publish sets it; consumers skip the empty line, as any
+	// line that doesn't parse.
+	StartOnNewLine bool
+
+	torn    bool // the last write stopped partway through a line
+	started bool // a delivery has begun
 }
 
 // Deliver writes the events, and stops at the first error.
 func (j *JSONLines) Deliver(ctx context.Context, events []Event) error {
+	if !j.started {
+		j.started, j.torn = true, j.StartOnNewLine
+	}
 	if j.torn {
 		if _, err := j.W.Write([]byte{'\n'}); err != nil {
 			return err

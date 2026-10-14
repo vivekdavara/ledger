@@ -45,6 +45,28 @@ func TestParseRefusesWhatItCantRead(t *testing.T) {
 	}
 }
 
+// The decision itself, for both kinds of rule. Only 100% was tested before, so a percentage read as a fraction
+// (5% firing on every hit) passed (found in review).
+func TestWhenARuleFires(t *testing.T) {
+	third := Rule{Nth: 3}
+	for hit := 1; hit <= 5; hit++ {
+		if third.fires(hit, 0) != (hit == 3) {
+			t.Errorf("Nth 3 on hit %d: %v", hit, third.fires(hit, 0))
+		}
+	}
+	for _, c := range []struct {
+		percent, draw float64
+		want          bool
+	}{
+		{5, 0, true}, {5, 0.0499, true}, {5, 0.05, false}, {5, 0.5, false}, {5, 0.999, false},
+		{0.5, 0.0049, true}, {0.5, 0.005, false}, {100, 0.9999, true},
+	} {
+		if got := (Rule{Percent: c.percent}).fires(1, c.draw); got != c.want {
+			t.Errorf("%v%% with draw %v: %v, want %v", c.percent, c.draw, got, c.want)
+		}
+	}
+}
+
 func TestRuleStringIsTheSpec(t *testing.T) {
 	for _, spec := range []string{"3", "5%", "0.5%"} {
 		rules, err := Parse(AfterCommit + ":" + spec)

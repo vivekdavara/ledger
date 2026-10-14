@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Enabled reports whether this binary was built with the faults tag, and so whether a point can crash it.
@@ -37,7 +38,7 @@ func Point(name string) {
 	mu.Lock()
 	r, ok := armed[name]
 	hits[name]++
-	crash := ok && (r.Nth == hits[name] || r.Percent > 0 && rand.Float64()*100 < r.Percent)
+	crash := ok && r.fires(hits[name], rand.Float64())
 	mu.Unlock()
 	if !crash {
 		return
@@ -45,5 +46,9 @@ func Point(name string) {
 	// One line on stderr says which point fired, so a test can tell this crash from a kill sent from outside.
 	fmt.Fprintf(os.Stderr, "%s %s:%s fired, killing the process\n", FiredPrefix, name, r)
 	_ = syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
-	select {} // the signal is on its way; nothing after the point may run
+	// SIGKILL can't be caught, so this line isn't reached, except as PID 1 in a container: the kernel drops the
+	// signals init has no handler for, its own SIGKILL included. Exit then, which is as abrupt: no deferred function
+	// runs (found in review: the point would have blocked forever, holding its transaction's locks).
+	time.Sleep(time.Second)
+	os.Exit(137)
 }

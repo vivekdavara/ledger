@@ -50,6 +50,12 @@ type Rule struct {
 	Percent float64 // crash on each hit with this probability, in percent: more than 0, at most 100
 }
 
+// fires reports whether the rule crashes the process on this hit of its point (counting from 1), given a draw
+// uniform in [0, 1).
+func (r Rule) fires(hit int, draw float64) bool {
+	return r.Nth > 0 && hit == r.Nth || r.Percent > 0 && draw*100 < r.Percent
+}
+
 func (r Rule) String() string {
 	if r.Nth > 0 {
 		return strconv.Itoa(r.Nth)

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/faults"
 	ledgerv1 "github.com/vivekdavara/ledger/internal/gen/ledger/v1"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/outbox"
@@ -429,7 +430,9 @@ func TestPublishWritesEventsAsJSONLines(t *testing.T) {
 	lines := func(n int) []string {
 		t.Helper()
 		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			if got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n"); len(got) >= n && got[0] != "" {
+			// The output starts on a new line (JSONLines.StartOnNewLine), then has one event a line.
+			out, fresh := strings.CutPrefix(stdout.String(), "\n")
+			if got := strings.Split(strings.TrimSuffix(out, "\n"), "\n"); fresh && len(got) >= n && got[0] != "" {
 				return got
 			}
 		}
@@ -460,6 +463,31 @@ func TestPublishWritesEventsAsJSONLines(t *testing.T) {
 	if err := db.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&unpublished); err != nil ||
 		unpublished != 0 {
 		t.Fatalf("%d unpublished, %v", unpublished, err)
+	}
+}
+
+// LEDGER_FAULTS needs the faults build: a release binary given a spec refuses to start, a misspelled point is
+// refused in any build, and a spec of blanks arms nothing and says nothing. The refusal had no test through
+// ledgerd itself, only through faults.Arm (found in review).
+func TestLEDGERFAULTSNeedsTheFaultsBuild(t *testing.T) {
+	if faults.Enabled {
+		t.Skip("built with -tags faults")
+	}
+	url := storetest.SchemaURL(t, storetest.EmptySchema(t))
+	for spec, want := range map[string]struct {
+		code int
+		log  string
+	}{
+		faults.AfterCommit + ":1": {1, "built without -tags faults"},
+		"store.after-comit:1":     {1, "unknown point"},
+		"   ":                     {0, `"applied":[`},
+	} {
+		var logs syncBuffer
+		code := run(context.Background(), []string{"migrate"}, env(map[string]string{"LEDGER_DATABASE_URL": url,
+			"LEDGER_FAULTS": spec}), io.Discard, &logs, nil)
+		if code != want.code || !strings.Contains(logs.String(), want.log) || strings.Contains(logs.String(), "armed") {
+			t.Errorf("LEDGER_FAULTS=%q: exit %d, log %s", spec, code, logs.String())
+		}
 	}
 }
 

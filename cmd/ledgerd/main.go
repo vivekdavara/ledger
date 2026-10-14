@@ -76,11 +76,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return 2
 	}
 	if spec := getenv("LEDGER_FAULTS"); spec != "" {
-		if _, err := faults.Arm(spec); err != nil {
+		rules, err := faults.Arm(spec)
+		if err != nil {
 			log.Error("LEDGER_FAULTS", "err", err)
 			return 1
 		}
-		log.Warn("crash points armed: this process will kill itself on purpose", "faults", spec)
+		if len(rules) > 0 { // a spec of blanks arms nothing, and says nothing (found in review)
+			log.Warn("crash points armed: this process will kill itself on purpose", "faults", spec)
+		}
 	}
 	url := getenv("LEDGER_DATABASE_URL")
 	if url == "" {
@@ -187,7 +190,7 @@ func reconcile(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.L
 // (day 3)"). A failed write leaves the events unpublished, to be written again.
 func publish(ctx context.Context, db *pgxpool.Pool, out io.Writer, log *slog.Logger) int {
 	log.Info("publishing")
-	err := outbox.New(db, &outbox.JSONLines{W: out}, outbox.Options{}).Run(ctx, func(err error) {
+	err := outbox.New(db, &outbox.JSONLines{W: out, StartOnNewLine: true}, outbox.Options{}).Run(ctx, func(err error) {
 		log.Error("publish", "err", err)
 	})
 	if !errors.Is(err, context.Canceled) {
