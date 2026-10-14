@@ -33,8 +33,14 @@ type api struct {
 // apis serves both APIs over one store on a fresh schema and returns a client of each, and the schema's pool.
 func apis(t *testing.T) (*pgxpool.Pool, []api) {
 	t.Helper()
+	return apisAt(t, store.DefaultIsolation)
+}
+
+// apisAt is apis with the store posting at the given level.
+func apisAt(t *testing.T, level store.Isolation) (*pgxpool.Pool, []api) {
+	t.Helper()
 	db := storetest.MigratedWithConns(t, 8)
-	svc := store.New(db)
+	svc := store.NewWithOptions(db, store.Options{Isolation: level})
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	httpSrv := httptest.NewServer(server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, svc, log))
 	t.Cleanup(httpSrv.Close)
@@ -293,5 +299,66 @@ func TestASkewConcentratesTheTransfers(t *testing.T) {
 		if skew == 0 && busiest > 40 || skew == 2 && busiest < 100 {
 			t.Fatalf("skew %v: the busiest wallet paid %d of 200", skew, busiest)
 		}
+	}
+}
+
+// Twelve copies of one payment at once, six over each API, for $40 of Alice's $50: only one can post, and every
+// copy that looked the key up before it committed then finds $10 left. Each copy must still get the posted entry
+// back, not "insufficient funds": the day-3 review's bug, end to end. Ten rounds at each level, each on a fresh
+// Alice.
+func TestConcurrentCopiesOverBothAPIsAllGetTheEntry(t *testing.T) {
+	t.Parallel()
+	for _, level := range []store.Isolation{store.ReadCommitted, store.Serializable} {
+		t.Run(string(level), func(t *testing.T) {
+			t.Parallel()
+			_, apis := apisAt(t, level)
+			ctx := context.Background()
+			cash, err := apis[0].client.CreateAccount(ctx, ledger.NewAccount{Name: "cash", Type: ledger.Asset, Currency: "USD"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for round := range 10 {
+				alice, err1 := apis[0].client.CreateAccount(ctx, ledger.NewAccount{Name: fmt.Sprintf("alice-%d", round),
+					Type: ledger.Liability, Currency: "USD"})
+				bob, err2 := apis[0].client.CreateAccount(ctx, ledger.NewAccount{Name: fmt.Sprintf("bob-%d", round),
+					Type: ledger.Liability, Currency: "USD"})
+				_, err3 := apis[0].client.PostEntry(ctx, fmt.Sprintf("fund-%d", round), ledger.Entry{
+					Postings: []ledger.Posting{{AccountID: cash, Currency: "USD", Amount: 5000},
+						{AccountID: alice, Currency: "USD", Amount: -5000}}})
+				if err := errors.Join(err1, err2, err3); err != nil {
+					t.Fatal(err)
+				}
+				pay := ledger.Entry{Postings: []ledger.Posting{{AccountID: alice, Currency: "USD", Amount: 4000},
+					{AccountID: bob, Currency: "USD", Amount: -4000}}}
+				const copies = 12
+				results := make([]struct {
+					posted load.Posted
+					err    error
+				}, copies)
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				for i := range copies {
+					wg.Go(func() {
+						<-start
+						results[i].posted, results[i].err = apis[i%2].client.PostEntry(ctx, fmt.Sprintf("pay-%d", round), pay)
+					})
+				}
+				close(start)
+				wg.Wait()
+				fresh := 0
+				for i, r := range results {
+					if r.err != nil || r.posted.EntryID != results[0].posted.EntryID {
+						t.Fatalf("round %d, copy %d over %s: entry %d, %v; want entry %d", round, i, apis[i%2].name,
+							r.posted.EntryID, r.err, results[0].posted.EntryID)
+					}
+					if !r.posted.Replayed {
+						fresh++
+					}
+				}
+				if b, err := apis[1].client.Balance(ctx, alice); fresh != 1 || err != nil || b != -1000 {
+					t.Fatalf("round %d: %d copies posted, alice %d, %v", round, fresh, b, err)
+				}
+			}
+		})
 	}
 }
