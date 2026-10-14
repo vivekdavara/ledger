@@ -83,11 +83,14 @@ func TestUsageAndUnreachableServers(t *testing.T) {
 			t.Errorf("%s: exit %d, %s", api, code, errs.String())
 		}
 	}
-	// A layout the generator doesn't know is refused before anything is sent.
-	restAddr, _ := serve(t)
-	var errs bytes.Buffer
-	if code := run(context.Background(), []string{"-addr", restAddr, "-layout", "skewed"}, io.Discard, &errs); code != 1 ||
-		!strings.Contains(errs.String(), "unknown layout") {
-		t.Errorf("exit %d, %s", code, errs.String())
+	// A config that can't run is a usage error, refused before anything is sent: addr is the port nothing listens on,
+	// so a request would have been "nothing answers" and exit 1 (found in review).
+	for _, args := range [][]string{{"-layout", "skewed"}, {"-skew", "0.5"}, {"-pad", "-1"}, {"-prefix", "a b"},
+		{"-api", "grpc", "-wallets", "1", "-layout", "hot"}} {
+		var errs bytes.Buffer
+		if code := run(context.Background(), append(args, "-addr", addr), io.Discard, &errs); code != 2 ||
+			strings.Contains(errs.String(), "nothing answers") {
+			t.Errorf("%q: exit %d, %s", args, code, errs.String())
+		}
 	}
 }

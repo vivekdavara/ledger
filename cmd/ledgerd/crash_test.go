@@ -475,7 +475,7 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 				t.Fatalf("%d crashes at a point and %d replays: the test didn't crash ledgerd as it should", pointCrashes,
 					res.Replayed)
 			}
-			if n := queryInt(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE 'chaos:t%'`); n != transfers {
+			if n := queryInt(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE $1`, res.Names+"t%"); n != transfers {
 				t.Fatalf("%d transfer keys, want %d", n, transfers)
 			}
 			if n := queryInt(t, db, `SELECT count(*) FROM journal_entries`); n != 20+transfers {

@@ -3,12 +3,14 @@ package load
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
 	mathrand "math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,9 +47,30 @@ type Config struct {
 	Pad int
 	// Retry sends a transfer again, with its key, after a conflict or an unknown outcome, until it is answered or
 	// ctx ends. Without it a conflict is counted as given up, and an unknown outcome is settled after the run.
-	Retry  bool
-	Prefix string // starts every account name and key of the run; default random, so runs can share a ledger
+	Retry bool
+	// Prefix starts every account name and key of the run, followed by a tag of the configuration (Result.Names);
+	// default random, so runs can share a ledger. At most 100 visible ASCII characters, as keys are.
+	Prefix string
 	Seed   uint64 // chooses the transfers; runs with the same seed and config send the same transfers
+}
+
+// Normalize returns the config with its defaults filled in, or an error saying why it can't run. Run calls it; a
+// command can call it first, to refuse a bad config before sending anything.
+func (c Config) Normalize() (Config, error) {
+	c = c.withDefaults()
+	return c, c.validate()
+}
+
+// names is the start of every account name and key of the run: the prefix, then a tag of everything that decides
+// which transfers are sent (layout, wallets, skew, workers, transfers, padding, seed). A rerun with the same flags
+// finds its accounts and keys again and replays every transfer; any other configuration gets accounts and keys of
+// its own, so its books check starts from its own funding. With the prefix alone, a rerun with fewer transfers or
+// another number of workers found the first run's postings on its accounts, and was refused idempotency_key_reused
+// for keys that now named other transfers: false mismatches (found in review).
+func (c Config) names() string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%d|%g|%d|%d|%d|%d", c.Layout, c.Wallets, c.Skew, c.Workers, c.Transfers,
+		c.Pad, c.Seed))
+	return c.Prefix + hex.EncodeToString(sum[:4]) + ":"
 }
 
 func (c Config) withDefaults() Config {
@@ -84,13 +107,16 @@ func (c Config) validate() error {
 		return errors.New("load: a skew is 0 (uniform) or a Zipf exponent above 1")
 	case c.Pad < 0:
 		return errors.New("load: padding is not negative")
+	case len(c.Prefix) > 100 || strings.ContainsFunc(c.Prefix, func(r rune) bool { return r < 0x21 || r > 0x7e }):
+		return errors.New("load: a prefix is at most 100 visible ASCII characters, since keys start with it")
 	}
 	return nil
 }
 
 // Result is what a run did, as its clients saw it.
 type Result struct {
-	Config  Config
+	Config  Config        // as given, with its defaults filled in
+	Names   string        // the start of every account name and key the run used: Config.Prefix and the config's tag
 	Elapsed time.Duration // the transfers only: setup, padding and the check aren't counted
 	// Each transfer ends in exactly one of these. Posted and Replayed count the transfers whose answer said they
 	// posted: Replayed when the answer was a replay, because an earlier attempt of the same transfer had posted it.
@@ -258,9 +284,13 @@ func (ch *chooser) transfer(w, i int) (from, to int64) {
 			from, to = to, from
 		}
 	case Random:
+		// The payee is drawn like the payer, and when it is the payer, uniformly from the other wallets: drawing again
+		// until they differ never ended at a steep skew, where wallet 0 is almost every draw (found in review: at skew
+		// 30, 20 transfers ran on after the run's deadline).
+		n := len(ch.acct.wallets)
 		x, y := ch.wallet(), ch.wallet()
-		for y == x {
-			y = ch.wallet()
+		if y == x {
+			y = (x + 1 + ch.rng.IntN(n-1)) % n
 		}
 		from, to = ch.acct.wallets[x], ch.acct.wallets[y]
 	case Hot:
@@ -297,10 +327,12 @@ func (w *worker) apply(from, to int64) {
 // clients, settles any transfer whose outcome is unknown, and checks every account of the run against what the
 // answers say was posted. It fails only when it can't do that: a setup request refused, ctx ended.
 func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
-	cfg = cfg.withDefaults()
-	if err := cfg.validate(); err != nil {
+	cfg, err := cfg.Normalize()
+	if err != nil {
 		return Result{}, err
 	}
+	given := cfg
+	cfg.Prefix = cfg.names() // from here on, the prefix of every name and key the run uses
 	acct, err := setUp(ctx, c, cfg)
 	if err != nil {
 		return Result{}, err
@@ -361,7 +393,7 @@ func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	res := Result{Config: cfg, Elapsed: elapsed, Refused: map[string]int{}}
+	res := Result{Config: given, Names: cfg.Prefix, Elapsed: elapsed, Refused: map[string]int{}}
 	rng := mathrand.New(mathrand.NewPCG(cfg.Seed, 4))
 	for _, wk := range workers {
 		if wk.err != nil {

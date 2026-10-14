@@ -58,6 +58,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: ledgerload [flags]; -api is rest or grpc; see -h")
 		return 2
 	}
+	// A config that can't run is a usage error, refused before anything is sent (found in review: it went out to the
+	// server first, and exited 1).
+	cfg, err := load.Config{Layout: load.Layout(*layout), Wallets: *wallets, Skew: *skew, Workers: *workers,
+		Transfers: *transfers, Pad: *pad, Retry: *retry, Prefix: *prefix, Seed: *seed}.Normalize()
+	if err != nil {
+		fmt.Fprintln(stderr, "ledgerload:", err)
+		return 2
+	}
 
 	var client load.Client
 	switch *api {
@@ -65,7 +73,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if *addr == "" {
 			*addr = "localhost:8103"
 		}
-		client = load.NewREST("http://"+*addr, *workers)
+		client = load.NewREST("http://"+*addr, cfg.Workers) // one connection per worker, defaults included
 	case "grpc":
 		if *addr == "" {
 			*addr = "localhost:9103"
@@ -82,7 +90,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// Run waits out a ledgerd that goes away during the run (a crash test restarts it); one that isn't there at the
 	// start is a mistake to report at once. Any answer will do, "no such account" included.
 	probe, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
-	_, err := client.Account(probe, 1)
+	_, err = client.Account(probe, 1)
 	cancelProbe()
 	if load.Classify(err) == load.Unknown {
 		fmt.Fprintf(stderr, "ledgerload: nothing answers at %s: %v\n", *addr, err)
@@ -91,8 +99,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	res, err := load.Run(ctx, client, load.Config{Layout: load.Layout(*layout), Wallets: *wallets, Skew: *skew,
-		Workers: *workers, Transfers: *transfers, Pad: *pad, Retry: *retry, Prefix: *prefix, Seed: *seed})
+	res, err := load.Run(ctx, client, cfg)
 	if err != nil {
 		fmt.Fprintln(stderr, "ledgerload:", err)
 		return 1

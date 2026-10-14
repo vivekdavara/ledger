@@ -95,7 +95,7 @@ func TestEveryLayoutPostsEachTransferOnceAndTheBooksAgree(t *testing.T) {
 			if res.P50 <= 0 || res.P50 > res.P99 || res.P99 > res.Max {
 				t.Fatalf("%s %s: percentiles %v %v %v", a.name, layout, res.P50, res.P99, res.Max)
 			}
-			if n := count(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE $1`, cfg.Prefix+"t%"); n != 120 {
+			if n := count(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE $1`, res.Names+"t%"); n != 120 {
 				t.Fatalf("%s %s: %d transfer keys, want 120", a.name, layout, n)
 			}
 		}
@@ -312,7 +312,7 @@ func TestASkewConcentratesTheTransfers(t *testing.T) {
 		}
 		// The share of the transfers paid by the busiest wallet: about 1/20 uniformly, most of them at skew 2.
 		busiest := count(t, db, `SELECT max(n) FROM (SELECT count(*) AS n FROM postings p JOIN accounts a
-			ON a.id = p.account_id WHERE a.name LIKE $1 AND p.amount = 10 GROUP BY a.id) s`, prefix+"wallet:%")
+			ON a.id = p.account_id WHERE a.name LIKE $1 AND p.amount = 10 GROUP BY a.id) s`, res.Names+"wallet:%")
 		t.Logf("skew %v: the busiest wallet paid %d of 200", skew, busiest)
 		if skew == 0 && busiest > 40 || skew == 2 && busiest < 100 {
 			t.Fatalf("skew %v: the busiest wallet paid %d of 200", skew, busiest)
@@ -424,6 +424,105 @@ func TestEveryResendIsCounted(t *testing.T) {
 		if len(res.Mismatches) > 0 || res.Replayed != 40 || res.Retries != 40 || requests.Load() != 80 ||
 			retry && res.Unknown != 0 || !retry && res.Unknown != 40 {
 			t.Fatalf("retry=%v: the server saw %d requests: %+v", retry, requests.Load(), res)
+		}
+	}
+}
+
+// memLedger is a Client that keeps a ledger in memory: enough for tests of the generator itself, with no database.
+// It posts each key once and replays it after, as the ledger does; it checks no funds.
+type memLedger struct {
+	mu       sync.Mutex
+	names    map[string]int64
+	accounts map[int64]*load.Account
+	keys     map[string]int64
+	entries  int64
+}
+
+func newMemLedger() *memLedger {
+	return &memLedger{names: map[string]int64{}, accounts: map[int64]*load.Account{}, keys: map[string]int64{}}
+}
+
+func (m *memLedger) CreateAccount(_ context.Context, a ledger.NewAccount) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id, ok := m.names[a.Name]; ok {
+		return id, nil
+	}
+	id := int64(len(m.accounts) + 1)
+	m.names[a.Name], m.accounts[id] = id, &load.Account{}
+	return id, nil
+}
+
+func (m *memLedger) PostEntry(_ context.Context, key string, e ledger.Entry) (load.Posted, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id, ok := m.keys[key]; ok {
+		return load.Posted{EntryID: id, Replayed: true}, nil
+	}
+	m.entries++
+	for _, p := range e.Postings {
+		m.accounts[p.AccountID].Balance += p.Amount
+		m.accounts[p.AccountID].Version++
+	}
+	m.keys[key] = m.entries
+	return load.Posted{EntryID: m.entries}, nil
+}
+
+func (m *memLedger) Account(_ context.Context, id int64) (load.Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if a, ok := m.accounts[id]; ok {
+		return *a, nil
+	}
+	return load.Account{}, &load.APIError{Reason: "not_found"}
+}
+
+func (m *memLedger) Close() error { return nil }
+
+// A rerun with the same prefix and flags replays every transfer; with any other configuration it starts accounts and
+// keys of its own. Before, a rerun with fewer transfers reported 10 mismatches, and one with 3 workers instead of 4
+// got 57 idempotency_key_reused refusals and 9 mismatches (found in review).
+func TestARerunWithAnotherConfigurationStartsAfresh(t *testing.T) {
+	t.Parallel()
+	m := newMemLedger()
+	base := load.Config{Layout: load.Random, Wallets: 10, Workers: 4, Transfers: 60, Prefix: "rerun:"}
+	for i, run := range []struct {
+		change           func(*load.Config)
+		posted, replayed int
+	}{
+		{func(*load.Config) {}, 60, 0},
+		{func(c *load.Config) { c.Transfers = 30 }, 30, 0},
+		{func(c *load.Config) { c.Workers = 3 }, 60, 0},
+		{func(c *load.Config) { c.Retry = true }, 0, 60}, // retrying doesn't change which transfers are sent
+		{func(*load.Config) {}, 0, 60},
+	} {
+		cfg := base
+		run.change(&cfg)
+		res, err := load.Run(context.Background(), m, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Posted != run.posted || res.Replayed != run.replayed || len(res.Refused) > 0 || len(res.Mismatches) > 0 {
+			t.Fatalf("run %d: %+v", i, res)
+		}
+	}
+}
+
+// At a steep skew wallet 0 is almost every draw, and drawing a payee until it differed from the payer never ended:
+// at skew 30 and 64, a run of 20 transfers was still running 6 s after its deadline (found in review).
+func TestASteepSkewEndsQuickly(t *testing.T) {
+	t.Parallel()
+	for _, skew := range []float64{30, 64} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		start := time.Now()
+		res, err := load.Run(ctx, newMemLedger(), load.Config{Layout: load.Random, Wallets: 100, Workers: 4,
+			Transfers: 2000, Skew: skew})
+		cancel()
+		if err != nil || len(res.Mismatches) > 0 || res.Posted != 2000 {
+			t.Fatalf("skew %v: %v, %+v", skew, err, res)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Fatalf("skew %v: %v for 2,000 transfers in memory", skew, took)
 		}
 	}
 }
