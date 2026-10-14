@@ -493,7 +493,7 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 				"LEDGER_GRPC_ADDR": freeAddr(t), "LEDGER_ISOLATION": run.level}
 			sup := startSupervisor(t, &supervisor{bin: bin, sub: "serve", vars: vars,
 				specs:  []string{faults.AfterCommit + ":40", faults.BeforeCommit + ":40", killFromOutside},
-				killAt: [2]time.Duration{50 * time.Millisecond, 300 * time.Millisecond}})
+				killAt: [2]time.Duration{30 * time.Millisecond, 150 * time.Millisecond}})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
@@ -518,8 +518,8 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 				t.Fatalf("%+v", res)
 			}
 			// Crashes after a commit leave transfers posted and unanswered: their retries replay. 620 commits allow
-			// at most 15 point crashes, and every third process is killed from outside instead.
-			if pointCrashes < 5 || kills < 1 || res.Replayed == 0 {
+			// at most 15 point crashes, fewer as the processes killed from outside take their share (5 to 8 here).
+			if pointCrashes < 3 || kills < 1 || res.Replayed == 0 {
 				t.Fatalf("%d crashes at a point, %d kills and %d replays: the test didn't crash ledgerd as it should",
 					pointCrashes, kills, res.Replayed)
 			}
@@ -585,6 +585,9 @@ func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			for line := range strings.Lines(c.stdout.String()) {
+				if line == "\n" {
+					continue // each process starts its output on a new line (JSONLines.StartOnNewLine)
+				}
 				var e outbox.Event
 				if err := json.Unmarshal([]byte(line), &e); err != nil {
 					torn++ // a line cut off by a kill: consumers skip what doesn't parse

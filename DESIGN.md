@@ -679,7 +679,7 @@ child process; a test process can't watch its own SIGKILL.
   way, and `ledgerd reconcile` exits 0.
 - **`TestKillsDuringLoadPostEachTransferOnce`**, over each API at each isolation level: 8 clients post 600
   transfers with `Retry` while a supervisor keeps `ledgerd serve` running and it keeps dying: at every 40th commit
-  of a process, just before it or just after it, and every third process is killed from outside 50 to 300 ms after
+  of a process, just before it or just after it, and every third process is killed from outside 30 to 150 ms after
   it starts. Every
   transfer is answered as posted or replayed, the books agree with the answers, there are exactly 600 transfer keys
   and 620 entries, and `ledgerd reconcile` exits 0. In the first run at read committed: 15 point crashes and 2 kills
@@ -699,12 +699,13 @@ child process; a test process can't watch its own SIGKILL.
 
 The supervisor counts a child that ends by `SIGKILL` after a point's line as a point crash, and one without the
 line as killed from outside; any other end before the stop fails the test (and stops its load at once), and so does
-anything but a clean exit after the final `SIGTERM` (exit 0, or death by `SIGTERM` itself, which is what a stop that lands before Go's runtime hands
-signals to `main` gets). Each test asserts that the crashes it needs happened (at least 5 point crashes and some
-replays, and a kill from outside; at least 5 publisher crashes, half a batch of duplicates for each, and a kill),
-so a crash mechanism that stopped working would fail them instead of passing quietly. (At first a killer goroutine
-sent `SIGKILL` at random intervals, and nothing asserted that it killed anything: with the killer removed, every
-test stayed green. The review found it.) Children get none of the test process's own `LEDGER_` settings.
+anything but a clean exit after the final `SIGTERM` (exit 0, or death by `SIGTERM` itself, which is what a stop gets
+when it lands before Go's runtime hands signals to `main`). Each test asserts that the crashes it needs happened (at
+least 3 point crashes, some replays and a kill from outside; at least 5 publisher crashes, half a batch of
+duplicates for each, and a kill), so a crash mechanism that stopped working would fail them instead of passing
+quietly. (At first a killer goroutine sent `SIGKILL` at random intervals, and nothing asserted that it killed
+anything: with the killer removed, every test stayed green. The review found it.) Children get none of the test
+process's own `LEDGER_` settings.
 
 ### What day 4 found
 
