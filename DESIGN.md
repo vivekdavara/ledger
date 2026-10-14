@@ -589,19 +589,121 @@ report (it sums as `numeric` now).
 
 ## Load and failure injection (day 4)
 
-A Go load generator posts transfers over the API with configurable contention (how many accounts, how skewed the
-choice is), and reports throughput and latency percentiles. Failure injection kills a request between commit and
-response, then retries it with the same idempotency key, and checks that the effect happened exactly once.
+Two questions: what does the API add to the in-process numbers under contention, and does "exactly once per key"
+survive real crashes, at the worst moments? A load generator answers the first and drives the second; crash points
+built into a test-only binary make the worst moments happen on purpose.
 
-What day 3 adds to the plan:
+```mermaid
+flowchart LR
+    W["ledgerload / internal/load: N workers, each transfer sent with its key"] -- "REST or gRPC" --> D
+    subgraph SUP ["crash tests (cmd/ledgerd/crash_test.go)"]
+        D["ledgerd serve or publish, built with -tags faults"]
+        K["killer: SIGKILL at random moments"] -. kills .-> D
+        V["supervisor: restarts it on the same ports"] -. restarts .-> D
+    end
+    D -- "store.before-commit / store.after-commit / outbox.after-deliver: SIGKILL itself" --> D
+    D --> PG[("PostgreSQL")]
+    W -- "at the end: every balance vs what the answers imply" --> D
+    PG -. "ledgerd reconcile: must exit 0" .-> R["reconcile"]
+```
 
-- Use `BenchmarkContention`'s layouts (disjoint, random, hot) over REST and gRPC, on a padded ledger, so the API's
-  cost shows against the in-process numbers above.
-- Kill `ledgerd publish` mid-batch (SIGKILL) and restart it: every event arrives at least once, and a consumer that
-  dedupes sees each once (the tests do this with a cancelled context and a terminated backend; the binary hasn't
-  been killed for real yet).
-- End every failure run with `ledgerd reconcile`, which must exit 0.
-- Retries of refused requests while the original commits, over the API: the day-3 review's bug, end to end.
+### The load generator
+
+`internal/load` drives a running ledgerd as a client would; `cmd/ledgerload` wraps it as a command and
+`scripts/load.sh` (`make load`) runs it against a fresh, padded schema per run.
+
+- **Contention.** `BenchmarkContention`'s layouts: **disjoint** (each worker moves money between two wallets of its
+  own), **random** (two different wallets of `-wallets`, default 100), **hot** (a wallet pays one merchant). `-skew s`
+  chooses wallets by a Zipf law instead of uniformly (wallet k weighs (1+k)^-s; at s = 2, one wallet of 20 paid 106
+  of 200 transfers in `TestASkewConcentratesTheTransfers`).
+- **Outcomes.** `Classify` sorts every answer from either API into four: **answered**; **refused** (the ledger said
+  no, nothing posted); **conflict** (the server gave up after its own retries, nothing posted, safe to send again);
+  **unknown** (no answer: a broken connection, a server that's down, `unavailable`, `deadline_exceeded`,
+  `internal`). Only an unknown outcome can hide a posted entry, and only sending the request again with the same key
+  can tell.
+- **Keys name transfers.** Worker w sends transfers w+1, w+1+N, ... in order and draws their accounts from its own
+  generator; retry waits draw from another. So a key always names the same transfer, and a second run with the same
+  seed and prefix sends the same requests: every one replays (`TestARunOverEachAPIAgreesWithTheBooks`). The first
+  version handed out transfer numbers to whichever worker was free, so a rerun sent different transfers under used
+  keys; that test caught it.
+- **Retry or settle.** With `-retry`, a conflict or an unknown outcome is sent again (full jitter, 5 to 200 ms) until
+  answered. Without it, a conflict counts as given up, and an unknown outcome is settled after the run by sending it
+  again until answered: a replay means the first request had posted, a fresh post means it hadn't. Either way the
+  transfer has then posted once.
+- **The books check.** At the end every account of the run is read back through the API and compared with what the
+  answers imply: each wallet's funding, moved by each transfer answered as posted or replayed; the merchant's
+  payments; cash. A transfer posted twice, or answered as posted and lost, is a mismatch, and `ledgerload` exits 3.
+  `TestTheCheckCatchesATransferPostedTwiceOrLost` makes both happen through a wrapped client.
+- **What it reports:** transfers a second over the transfers alone (setup, padding and the check aren't timed), and
+  each transfer's latency from its first request to its answer, retries included. `ledgerd serve` logs its own
+  posting retries when it stops, the one number a client can't see; `scripts/load.sh` adds them to each run.
+
+### Crash points (the faults build)
+
+`internal/faults` names three points, placed where a crash is most interesting:
+
+| Point | Where | A crash there leaves |
+|---|---|---|
+| `store.before-commit` | `postOnce`, just before `tx.Commit` | nothing posted, the client without an answer |
+| `store.after-commit` | `postOnce`, just after a successful commit | the entry posted, the client without an answer |
+| `outbox.after-deliver` | `PublishOnce`, after the sink took the batch, before the mark | the batch delivered and still unpublished |
+
+In a normal build `faults.Point` is an empty function. Built with `-tags faults`, `ledgerd` arms points from
+`LEDGER_FAULTS`: `store.after-commit:40` crashes the 40th time the point is reached, `outbox.after-deliver:20%`
+each time with probability 20%, and items combine with commas. A point that fires writes one line to stderr
+(`faults: store.after-commit:40 fired, killing the process`) and sends its own process `SIGKILL`: no deferred
+function runs, nothing is flushed, the kernel closes the sockets, as when the OOM killer or `kill -9` strikes.
+
+- **Why a build tag, not a flag.** The release binary contains no way to crash itself. A non-empty `LEDGER_FAULTS`
+  in a build without the tag makes `ledgerd` refuse to start (`ErrNotBuilt`), so a crash test can't pass against a
+  binary that can't crash; a misspelled point is refused for the same reason.
+- **Why points and not only random kills.** A random `SIGKILL` rarely lands between a commit and its answer, the one
+  moment that tests idempotency; a point lands there every time. The crash tests use both: points for the moments
+  that matter, a killer for everything else (mid-request, mid-transaction, idle, during startup).
+- **What it is not:** a power cut. Postgres's commit was already durable, and the operating system's page cache
+  survives a killed process. Durability across a machine crash is Postgres's (`fsync`, its WAL), not tested here.
+
+### The crash tests
+
+`cmd/ledgerd/crash_test.go` builds `ledgerd` with the tag once per run (`go build -tags faults`) and runs it as a
+child process; a test process can't watch its own SIGKILL.
+
+- **`TestACrashAroundTheCommitIsSettledByTheRetry`**, over REST and over gRPC: Alice pays $40 of her $50 and
+  `ledgerd` dies just before or just after the commit. The client gets no answer; the database holds the payment
+  (after) or nothing (before); a restarted `ledgerd` answers the retry with the same key with a replay (after) or a
+  fresh post (before), never "insufficient funds", though a second posting couldn't be afforded. One entry either
+  way, and `ledgerd reconcile` exits 0.
+- **`TestKillsDuringLoadPostEachTransferOnce`**, over each API: 8 clients post 600 transfers with `Retry` while a
+  supervisor keeps `ledgerd serve` running and it keeps dying: at every 40th commit of a process, alternately just
+  before and just after it, and at random from the killer every 0.3 to 0.9 s. Every transfer is answered as posted
+  or replayed, the books agree with the answers, there are exactly 600 transfer keys and 620 entries, and `ledgerd
+  reconcile` exits 0. In the first run: 15 point crashes and 2 kills over REST, with 21 transfers answered as
+  replays; 15 and 4 over gRPC, with 15. With the key's insert turned into a `SELECT` (a mutation, restored after),
+  both fail with double posts.
+- **`TestAKilledPublisherDeliversEveryEventAtLeastOnce`**: `ledgerd publish` drains 2,000 events while it dies just
+  after its 1st, 2nd or 3rd delivery (in turn) and at random every 50 to 250 ms. Every event arrives at least once;
+  after `Dedupe` each arrives once, each account's in version order (`CheckOrder`); every outbox row ends published
+  and `ledgerd reconcile` exits 0. In the first run: 23 publishers, 19 crashed after a delivery and 3 at random, 4,000
+  lines for 2,000 events, none cut off.
+- **`TestConcurrentCopiesOverBothAPIsAllGetTheEntry`** (`internal/load`): the day-3 review's bug end to end: twelve
+  copies of the $40 payment at once, six over each API, ten rounds at each isolation level; all twelve get the one
+  entry. With the re-lookup after a rejection switched off, 3 of 3 runs fail with `insufficient_funds`, at both
+  levels.
+
+The supervisor counts a child that ends by `SIGKILL` after a point's line as a point crash, and one without the
+line as the killer's; any other end before the stop fails the test, and so does anything but a clean exit after
+the final `SIGTERM`. Each test asserts that the crashes it needs happened (at least 10 point crashes and some
+replays; at least 5 publisher crashes and a batch's worth of duplicates per two), so a crash mechanism that stopped
+working would fail them instead of passing quietly.
+
+### What day 4 found
+
+- **A dead session's row locks outlive its client for a moment.** `TestEventsWhoseMarkIsLostAreDeliveredAgain`
+  failed once in a full parallel run ("published 0"). The crashed attempt's rollback fails on its cancelled context,
+  and pgx (v5.11, `Tx.Rollback`, then `die`) closes the connection and returns; Postgres ends the session, and frees
+  its locks, a moment later. Until then `FOR UPDATE SKIP LOCKED` passes over the batch. The publisher's next poll
+  takes it, as the test now does. A real crash behaves the same way: the next publisher may skip a dead one's batch
+  once, never lose it.
 
 ## Testing
 
@@ -636,6 +738,13 @@ What day 3 adds to the plan:
   redelivered, a second publisher skipping the first's rows, one publisher keeping each account's order), and the
   reconciliation's cover eleven kinds of damage made on purpose (see "Reconciliation"). Each mechanism was removed
   once to see its test fail.
+- **Day 4: load and crashes.** The load generator's own tests run both APIs in process: every layout posts each
+  transfer once and the books agree; the check catches a double post and a lost post; lost answers settle as
+  replays and lost requests as fresh posts, with and without retries; outcomes classify right over both APIs (a
+  refusal, nothing listening, a conflict, a proxy's 502). The crash tests run a real `ledgerd` built with the faults
+  tag and kill it (see "The crash tests"); each asserts that its crashes happened. The faults build's own tests run
+  the test binary as a child and watch it die on the right hit. Mutations: the key's insert removed (the load crash
+  test fails with double posts), the re-lookup after a rejection removed (the concurrent-copies test fails 3 of 3).
 
 ## Limitations
 
@@ -698,3 +807,13 @@ What day 3 adds to the plan:
   delete old keys. Deleting a key by hand makes its retry post again.
 - **The database fallback can't tell a missing account from a currency mismatch.** Both break the same composite
   foreign key. The service's own check, made under the row locks, always tells them apart first.
+- **The crash tests kill `ledgerd`, not Postgres or the machine** (day 4). A killed process loses what it held in
+  memory and its connections; Postgres and the page cache carry on. A crash of the database or a power cut is
+  Postgres's durability to keep (its WAL and `fsync`), and isn't tested here.
+- **Load numbers are one machine's** (day 4). The load generator, `ledgerd` and Postgres share an 8-core laptop, so
+  the client's CPU competes with the server's; the numbers compare designs on this machine and say nothing about a
+  deployment's capacity.
+- **A restarted child reuses addresses that were free a moment before** (day 4). Another process could take a port
+  in between; the test would then fail waiting for readiness, never pass wrongly.
+- **The books check sees only the run's own accounts** (day 4). `ledgerd reconcile`, which every failure run ends
+  with, checks the whole ledger.
