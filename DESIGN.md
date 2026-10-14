@@ -598,7 +598,7 @@ flowchart LR
     W["ledgerload / internal/load: N workers, each transfer sent with its key"] -- "REST or gRPC" --> D
     subgraph SUP ["crash tests (cmd/ledgerd/crash_test.go)"]
         D["ledgerd serve or publish, built with -tags faults"]
-        K["killer: SIGKILL at random moments"] -. kills .-> D
+        K["every third process: SIGKILL from outside, at a random moment"] -. kills .-> D
         V["supervisor: restarts it on the same ports"] -. restarts .-> D
     end
     D -- "store.before-commit / store.after-commit / outbox.after-deliver: SIGKILL itself" --> D
@@ -648,18 +648,22 @@ flowchart LR
 | `store.after-commit` | `postOnce`, just after a successful commit | the entry posted, the client without an answer |
 | `outbox.after-deliver` | `PublishOnce`, after the sink took the batch, before the mark | the batch delivered and still unpublished |
 
-In a normal build `faults.Point` is an empty function. Built with `-tags faults`, `ledgerd` arms points from
-`LEDGER_FAULTS`: `store.after-commit:40` crashes the 40th time the point is reached, `outbox.after-deliver:20%`
-each time with probability 20%, and items combine with commas. A point that fires writes one line to stderr
-(`faults: store.after-commit:40 fired, killing the process`) and sends its own process `SIGKILL`: no deferred
-function runs, nothing is flushed, the kernel closes the sockets, as when the OOM killer or `kill -9` strikes.
+In a normal build `faults.Point` is an empty function, and the compiler removes the calls:
+`go build -gcflags=-m ./internal/store ./internal/outbox` reports `inlining call to faults.Point` at all three call
+sites (and none in a `-tags faults` build, where the function has a body). Built with `-tags faults`, `ledgerd` arms
+points from `LEDGER_FAULTS`: `store.after-commit:40` crashes the 40th time the point is reached,
+`outbox.after-deliver:20%` each time with probability 20%, and items combine with commas. A point that fires writes
+one line to stderr (`faults: store.after-commit:40 fired, killing the process`) and sends its own process `SIGKILL`:
+no deferred function runs, nothing is flushed, the kernel closes the sockets, as when the OOM killer or `kill -9`
+strikes.
 
 - **Why a build tag, not a flag.** The release binary contains no way to crash itself. A non-empty `LEDGER_FAULTS`
   in a build without the tag makes `ledgerd` refuse to start (`ErrNotBuilt`), so a crash test can't pass against a
   binary that can't crash; a misspelled point is refused for the same reason.
 - **Why points and not only random kills.** A random `SIGKILL` rarely lands between a commit and its answer, the one
   moment that tests idempotency; a point lands there every time. The crash tests use both: points for the moments
-  that matter, a killer for everything else (mid-request, mid-transaction, idle, during startup).
+  that matter, kills from outside at random moments for everything else (mid-request, mid-transaction, idle, during
+  startup).
 - **What it is not:** a power cut. Postgres's commit was already durable, and the operating system's page cache
   survives a killed process. Durability across a machine crash is Postgres's (`fsync`, its WAL), not tested here.
 
@@ -673,15 +677,18 @@ child process; a test process can't watch its own SIGKILL.
   (after) or nothing (before); a restarted `ledgerd` answers the retry with the same key with a replay (after) or a
   fresh post (before), never "insufficient funds", though a second posting couldn't be afforded. One entry either
   way, and `ledgerd reconcile` exits 0.
-- **`TestKillsDuringLoadPostEachTransferOnce`**, over each API at each isolation level: 8 clients post 600 transfers with `Retry` while a
-  supervisor keeps `ledgerd serve` running and it keeps dying: at every 40th commit of a process, alternately just
-  before and just after it, and at random from the killer every 0.3 to 0.9 s. Every transfer is answered as posted
-  or replayed, the books agree with the answers, there are exactly 600 transfer keys and 620 entries, and `ledgerd
-  reconcile` exits 0. In the first run: 15 point crashes and 2 kills over REST, with 21 transfers answered as
-  replays; 15 and 4 over gRPC, with 15. With the key's insert turned into a `SELECT` (a mutation, restored after),
-  both fail with double posts.
+- **`TestKillsDuringLoadPostEachTransferOnce`**, over each API at each isolation level: 8 clients post 600
+  transfers with `Retry` while a supervisor keeps `ledgerd serve` running and it keeps dying: at every 40th commit
+  of a process, just before it or just after it, and every third process is killed from outside 50 to 300 ms after
+  it starts. Every
+  transfer is answered as posted or replayed, the books agree with the answers, there are exactly 600 transfer keys
+  and 620 entries, and `ledgerd reconcile` exits 0. In the first run at read committed: 15 point crashes and 2 kills
+  over REST, with 21 transfers answered as replays; 15 and 4 over gRPC, with 15 (at serializable, in a later run,
+  14 and 4 with 20 replays, and 16 and 4 with 11). With the key's insert turned into a `SELECT` (a mutation,
+  restored after), both APIs fail with double posts.
 - **`TestAKilledPublisherDeliversEveryEventAtLeastOnce`**: `ledgerd publish` drains 2,000 events while it dies just
-  after its 1st, 2nd or 3rd delivery (in turn) and at random every 50 to 250 ms. Every event arrives at least once;
+  after its 1st, 2nd or 3rd delivery (in turn), and every fourth process is killed from outside within 10 ms of its
+  first event. Every event arrives at least once;
   after `Dedupe` each arrives once, each account's in version order (`CheckOrder`); every outbox row ends published
   and `ledgerd reconcile` exits 0. In the first run: 23 publishers, 19 crashed after a delivery and 3 at random, 4,000
   lines for 2,000 events, none cut off.
@@ -691,10 +698,13 @@ child process; a test process can't watch its own SIGKILL.
   levels.
 
 The supervisor counts a child that ends by `SIGKILL` after a point's line as a point crash, and one without the
-line as the killer's; any other end before the stop fails the test, and so does anything but a clean exit after
-the final `SIGTERM`. Each test asserts that the crashes it needs happened (at least 10 point crashes and some
-replays; at least 5 publisher crashes and a batch's worth of duplicates per two), so a crash mechanism that stopped
-working would fail them instead of passing quietly.
+line as killed from outside; any other end before the stop fails the test (and stops its load at once), and so does
+anything but a clean exit after the final `SIGTERM` (exit 0, or death by `SIGTERM` itself, which is what a stop that lands before Go's runtime hands
+signals to `main` gets). Each test asserts that the crashes it needs happened (at least 5 point crashes and some
+replays, and a kill from outside; at least 5 publisher crashes, half a batch of duplicates for each, and a kill),
+so a crash mechanism that stopped working would fail them instead of passing quietly. (At first a killer goroutine
+sent `SIGKILL` at random intervals, and nothing asserted that it killed anything: with the killer removed, every
+test stayed green. The review found it.) Children get none of the test process's own `LEDGER_` settings.
 
 ### What day 4 found
 

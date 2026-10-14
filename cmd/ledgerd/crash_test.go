@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -80,10 +81,7 @@ type child struct {
 func startChild(t *testing.T, bin, subcommand string, vars map[string]string) *child {
 	t.Helper()
 	c := &child{cmd: exec.Command(bin, subcommand), exited: make(chan struct{})}
-	c.cmd.Env = os.Environ()
-	for k, v := range vars {
-		c.cmd.Env = append(c.cmd.Env, k+"="+v) // a later entry wins
-	}
+	c.cmd.Env = childEnv(vars)
 	c.cmd.Stdout, c.cmd.Stderr = &c.stdout, &c.stderr
 	if err := c.cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -91,6 +89,16 @@ func startChild(t *testing.T, bin, subcommand string, vars map[string]string) *c
 	go func() { _ = c.cmd.Wait(); close(c.exited) }()
 	t.Cleanup(func() { c.kill() })
 	return c
+}
+
+// childEnv is the test's environment without any LEDGER_ setting, plus vars: a LEDGER_FAULTS or LEDGER_ISOLATION
+// in the shell that runs the tests must not arm or change the children (found in review).
+func childEnv(vars map[string]string) []string {
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "LEDGER_") })
+	for k, v := range vars {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 // kill ends the child with SIGKILL, unless it has ended already, and waits for it.
@@ -296,42 +304,51 @@ func TestACrashAroundTheCommitIsSettledByTheRetry(t *testing.T) {
 	}
 }
 
+// killFromOutside starts a supervisor's spec that has the supervisor kill the child itself, with SIGKILL, at a random
+// moment of its life, whatever it is doing (mid-request, mid-transaction, between batches). "kill" alone arms no
+// crash point; "kill:" followed by a LEDGER_FAULTS spec arms one as a backstop, for a child that would otherwise
+// finish all its work before the moment comes.
+const killFromOutside = "kill"
+
 // supervisor keeps one ledgerd child running: whenever it dies it starts another with the next spec from specs
-// (cycling), as a process manager would. Meanwhile a killer sends the running child SIGKILL every now and then,
-// whatever it is doing. A child that ends by SIGKILL after writing a crash point's line was crashed by the point;
-// one that ends by SIGKILL without it was the killer's.
+// (cycling), as a process manager would. A spec is LEDGER_FAULTS for that child, or killFromOutside. A child that ends
+// by SIGKILL after writing a crash point's line was crashed by the point; one that ends by SIGKILL without it was
+// killed from outside. (At first a killer goroutine sent SIGKILL at random intervals, and a run could end with no
+// kill at all and still pass: the review removed the killer and every test stayed green.)
 type supervisor struct {
-	bin, sub  string
-	vars      map[string]string
-	specs     []string         // LEDGER_FAULTS for each start in turn; "" arms nothing
-	onExit    func(c *child)   // sees each child that ended, before the next starts
-	killEvery [2]time.Duration // the killer's wait, uniform in [min, max); zero for no killer
+	bin, sub string
+	vars     map[string]string
+	specs    []string         // for each start in turn
+	onExit   func(c *child)   // sees each child that ended, before the next starts
+	killAt   [2]time.Duration // when a killFromOutside child is killed: uniform in [min, max) after it starts
+	// killFromOutput counts killAt from the child's first output on stdout instead, for a child that does its work
+	// in bursts there (ledgerd publish).
+	killFromOutput bool
 
 	mu                          sync.Mutex
 	current                     *child
 	starts, pointCrashes, kills int
 	stopping                    bool
 	done                        chan struct{}
+	failed                      chan struct{} // closed when the supervisor fails, so the test can stop its load
 	failure                     error
 }
 
 func (s *supervisor) run() {
 	defer close(s.done)
-	killer := make(chan struct{})
-	defer close(killer)
-	if s.killEvery[1] > 0 {
-		go s.kill(killer)
-	}
+	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 7))
 	for i := 0; ; i++ {
+		spec := s.specs[i%len(s.specs)]
 		vars := maps.Clone(s.vars)
-		if spec := s.specs[i%len(s.specs)]; spec != "" {
-			vars["LEDGER_FAULTS"] = spec
+		points, killed := spec, false
+		if rest, ok := strings.CutPrefix(spec, killFromOutside); ok {
+			points, killed = strings.TrimPrefix(rest, ":"), true
+		}
+		if points != "" {
+			vars["LEDGER_FAULTS"] = points
 		}
 		c := &child{cmd: exec.Command(s.bin, s.sub), exited: make(chan struct{})}
-		c.cmd.Env = os.Environ()
-		for k, v := range vars {
-			c.cmd.Env = append(c.cmd.Env, k+"="+v)
-		}
+		c.cmd.Env = childEnv(vars)
 		c.cmd.Stdout, c.cmd.Stderr = &c.stdout, &c.stderr
 		s.mu.Lock()
 		if s.stopping { // checked under the lock that stop takes, so a stop never misses a child just started
@@ -339,29 +356,50 @@ func (s *supervisor) run() {
 			return
 		}
 		if err := c.cmd.Start(); err != nil {
-			s.failure = err
+			s.fail(err)
 			s.mu.Unlock()
 			return
 		}
 		s.current, s.starts = c, s.starts+1
 		s.mu.Unlock()
 		go func() { _ = c.cmd.Wait(); close(c.exited) }()
+		if killed {
+			after := s.killAt[0] + time.Duration(rng.Int64N(int64(s.killAt[1]-s.killAt[0])))
+			go func() {
+				for s.killFromOutput && c.stdout.String() == "" {
+					select {
+					case <-c.exited:
+						return
+					case <-time.After(time.Millisecond):
+					}
+				}
+				select {
+				case <-c.exited:
+				case <-time.After(after):
+					s.mu.Lock()
+					if !s.stopping {
+						_ = c.cmd.Process.Kill()
+					}
+					s.mu.Unlock()
+				}
+			}()
+		}
 		<-c.exited
 		if s.onExit != nil {
 			s.onExit(c)
 		}
 		s.mu.Lock()
 		stopping := s.stopping
-		killed := c.killedBySIGKILL()
+		sigkill := c.killedBySIGKILL()
 		switch {
-		case killed && strings.Contains(c.stderr.String(), faults.FiredPrefix+" "):
+		case sigkill && strings.Contains(c.stderr.String(), faults.FiredPrefix+" "):
 			s.pointCrashes++
-		case killed:
+		case sigkill && killed:
 			s.kills++
 		case !stopping || !c.stoppedCleanly():
-			// Only SIGKILL ends a child before the stop, and only a clean stop after it. A child the killer had
-			// just replaced may get the SIGTERM while it starts up, which is clean too (TestAStopDuringStartupIsClean).
-			s.failure = fmt.Errorf("ledgerd ended with %v: %s", c.cmd.ProcessState, c.stderr.String())
+			// Only SIGKILL ends a child before the stop, and only a clean stop after it. A child just started when the
+			// stop comes may get it while it starts up, which is clean too (TestAStopDuringStartupIsClean).
+			s.fail(fmt.Errorf("ledgerd (spec %q) ended with %v: %s", spec, c.cmd.ProcessState, c.stderr.String()))
 		}
 		failed := s.failure != nil
 		s.mu.Unlock()
@@ -371,26 +409,17 @@ func (s *supervisor) run() {
 	}
 }
 
-// kill sends the running child SIGKILL at random intervals until stop is closed or the supervisor is stopping.
-func (s *supervisor) kill(stop <-chan struct{}) {
-	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 7))
-	for {
-		select {
-		case <-stop:
-			return
-		case <-time.After(s.killEvery[0] + time.Duration(rng.Int64N(int64(s.killEvery[1]-s.killEvery[0])))):
-		}
-		s.mu.Lock()
-		if c := s.current; c != nil && !s.stopping {
-			_ = c.cmd.Process.Kill() // a child that has just ended, and isn't reaped yet, ignores it
-		}
-		s.mu.Unlock()
+// fail records the supervisor's failure and tells the test; s.mu is held.
+func (s *supervisor) fail(err error) {
+	if s.failure == nil {
+		s.failure = err
+		close(s.failed)
 	}
 }
 
 func startSupervisor(t *testing.T, s *supervisor) *supervisor {
 	t.Helper()
-	s.done = make(chan struct{})
+	s.done, s.failed = make(chan struct{}), make(chan struct{})
 	go s.run()
 	t.Cleanup(func() {
 		s.mu.Lock()
@@ -418,20 +447,37 @@ func (s *supervisor) stop(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the supervisor didn't stop")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.failure != nil {
 		t.Fatal(s.failure)
 	}
 }
 
-// counts returns how many children were started, crashed by a crash point, and killed by the killer.
+// stopOnFailure returns ctx, cancelled as soon as the supervisor fails: the load stops at once, and the test
+// reports the failure, instead of retrying against a ledgerd that will never come back until the test times out
+// (found in review).
+func (s *supervisor) stopOnFailure(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-s.failed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+// counts returns how many children were started, crashed by a crash point, and killed from outside.
 func (s *supervisor) counts() (starts, pointCrashes, kills int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.starts, s.pointCrashes, s.kills
 }
 
-// Load from 8 clients while ledgerd keeps dying: every 40th commit of a process, alternately just before and just
-// after it, and at random moments from the killer. The clients send each transfer again with its key until it is
+// Load from 8 clients while ledgerd keeps dying: at the 40th commit of a process, just before it or just after it,
+// and every third process killed from outside at a random moment of its life. The clients send each transfer again with its key until it is
 // answered. At the end each transfer has posted exactly once: as many transfers keys and entries as transfers, every
 // account holding what the answers imply, and ledgerd reconcile exits 0. Over each API, at each isolation level.
 func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
@@ -446,19 +492,21 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 			vars := map[string]string{"LEDGER_DATABASE_URL": url, "LEDGER_HTTP_ADDR": freeAddr(t),
 				"LEDGER_GRPC_ADDR": freeAddr(t), "LEDGER_ISOLATION": run.level}
 			sup := startSupervisor(t, &supervisor{bin: bin, sub: "serve", vars: vars,
-				specs:     []string{faults.AfterCommit + ":40", faults.BeforeCommit + ":40"},
-				killEvery: [2]time.Duration{300 * time.Millisecond, 900 * time.Millisecond}})
+				specs:  []string{faults.AfterCommit + ":40", faults.BeforeCommit + ":40", killFromOutside},
+				killAt: [2]time.Duration{50 * time.Millisecond, 300 * time.Millisecond}})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
+			ctx, stopLoad := sup.stopOnFailure(ctx)
+			defer stopLoad()
 			const transfers = 600
 			res, err := load.Run(ctx, clientFor(t, api, vars), load.Config{Layout: load.Random, Wallets: 20,
 				Workers: 8, Transfers: transfers, Retry: true, Prefix: "chaos:"})
+			starts, pointCrashes, kills := sup.counts()
+			sup.stop(t) // reports the supervisor's failure, if the load stopped for one
 			if err != nil {
 				t.Fatal(err)
 			}
-			starts, pointCrashes, kills := sup.counts()
-			sup.stop(t)
 			t.Logf("%s at %s: %d starts, %d crashes at a point, %d kills; posted %d, replayed %d, sent again %d; "+
 				"%.0f transfers a second, p50 %v, p99 %v, max %v", api, run.level, starts, pointCrashes, kills, res.Posted,
 				res.Replayed, res.Retries, res.PerSecond(), res.P50, res.P99, res.Max)
@@ -470,10 +518,10 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 				t.Fatalf("%+v", res)
 			}
 			// Crashes after a commit leave transfers posted and unanswered: their retries replay. 620 commits allow
-			// at most 15 point crashes, fewer when the killer ends a process first (more often on a slower machine).
-			if pointCrashes < 5 || res.Replayed == 0 {
-				t.Fatalf("%d crashes at a point and %d replays: the test didn't crash ledgerd as it should", pointCrashes,
-					res.Replayed)
+			// at most 15 point crashes, and every third process is killed from outside instead.
+			if pointCrashes < 5 || kills < 1 || res.Replayed == 0 {
+				t.Fatalf("%d crashes at a point, %d kills and %d replays: the test didn't crash ledgerd as it should",
+					pointCrashes, kills, res.Replayed)
 			}
 			if n := queryInt(t, db, `SELECT count(*) FROM idempotency_keys WHERE key LIKE $1`, res.Names+"t%"); n != transfers {
 				t.Fatalf("%d transfer keys, want %d", n, transfers)
@@ -487,7 +535,8 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 }
 
 // ledgerd publish is killed again and again while it drains a backlog of 2,000 events: just after its sink took a
-// batch and before the batch is marked (every 1st, 2nd or 3rd batch of a process, in turn), and at random moments.
+// batch and before the batch is marked (its 1st, 2nd or 3rd batch, in turn), and every fourth process from outside,
+// within 10 ms of its first event (a crash point at its 10th batch stops it draining everything first).
 // Each kill's batch is delivered again by the next publisher, so events arrive at least once; a consumer that
 // dedupes by event id sees every event once, each account's in version order; ledgerd reconcile exits 0.
 func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
@@ -529,8 +578,9 @@ func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
 	var stream []outbox.Event
 	torn := 0
 	sup := startSupervisor(t, &supervisor{bin: bin, sub: "publish", vars: map[string]string{"LEDGER_DATABASE_URL": url},
-		specs:     []string{faults.AfterDeliver + ":1", faults.AfterDeliver + ":2", faults.AfterDeliver + ":3"},
-		killEvery: [2]time.Duration{50 * time.Millisecond, 250 * time.Millisecond},
+		specs: []string{faults.AfterDeliver + ":1", faults.AfterDeliver + ":2", faults.AfterDeliver + ":3",
+			killFromOutside + ":" + faults.AfterDeliver + ":10"},
+		killAt: [2]time.Duration{0, 10 * time.Millisecond}, killFromOutput: true,
 		onExit: func(c *child) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -556,7 +606,7 @@ func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	deduped := outbox.Dedupe(map[int64]bool{}, stream)
-	t.Logf("%d publishers, %d killed after delivering, %d killed at random; %d lines, %d events after dedupe, %d torn",
+	t.Logf("%d publishers, %d killed after delivering, %d killed from outside; %d lines, %d events after dedupe, %d torn",
 		starts, pointCrashes, kills, len(stream), len(deduped), torn)
 	if len(deduped) != events {
 		t.Fatalf("%d distinct events delivered, want %d", len(deduped), events)
@@ -564,9 +614,26 @@ func TestAKilledPublisherDeliversEveryEventAtLeastOnce(t *testing.T) {
 	if err := outbox.CheckOrder(deduped); err != nil {
 		t.Fatal(err)
 	}
-	if pointCrashes < 5 || len(stream)-len(deduped) < 100*pointCrashes/2 {
-		t.Fatalf("%d crashes after a delivery and %d events delivered twice: the kills didn't happen as they should",
-			pointCrashes, len(stream)-len(deduped))
+	if pointCrashes < 5 || kills < 1 || len(stream)-len(deduped) < 100*pointCrashes/2 {
+		t.Fatalf("%d crashes after a delivery, %d kills and %d events delivered twice: the crashes didn't happen as "+
+			"they should", pointCrashes, kills, len(stream)-len(deduped))
 	}
 	reconcileClean(t, url)
+}
+
+// A child gets none of the test's own LEDGER_ settings: a LEDGER_FAULTS in the shell would arm the restart that must
+// run unarmed, and a LEDGER_ISOLATION would change the level under test (found in review).
+func TestChildrenDontInheritLedgerSettings(t *testing.T) {
+	t.Setenv("LEDGER_FAULTS", faults.AfterCommit+":1")
+	t.Setenv("LEDGER_ISOLATION", "serializable")
+	env := childEnv(map[string]string{"LEDGER_DATABASE_URL": "postgres://somewhere"})
+	var ledgers []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LEDGER_") {
+			ledgers = append(ledgers, kv)
+		}
+	}
+	if len(ledgers) != 1 || ledgers[0] != "LEDGER_DATABASE_URL=postgres://somewhere" {
+		t.Fatalf("the child's LEDGER_ settings: %q", ledgers)
+	}
 }
