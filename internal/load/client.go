@@ -146,6 +146,12 @@ func (c *REST) do(ctx context.Context, method, path string, header http.Header, 
 	if err != nil {
 		return nil, err
 	}
+	// net/http treats a request with an Idempotency-Key header and a rewindable body as safe to send again, and does
+	// so by itself when a reused connection breaks before the answer (go1.27.1: Request.isReplayable,
+	// persistConn.shouldRetryRequest). That is safe against this ledger, which dedupes on the key, but then the
+	// generator neither sees nor counts the resend (found in review: 40 lost answers, 16 of them resent unseen).
+	// Without GetBody the body can't be rewound, so every resend is Run's own.
+	req.GetBody = nil
 	for k, v := range header {
 		req.Header[k] = v
 	}
@@ -242,6 +248,10 @@ type GRPC struct {
 	api  ledgerv1.LedgerServiceClient
 }
 
+// callTimeout bounds each gRPC call, as the REST client's timeout bounds each request: a connection that stays open
+// but never answers would otherwise hold a call until the run's own deadline.
+const callTimeout = 30 * time.Second
+
 // NewGRPC returns a gRPC client for the API at addr (host:port). It reconnects quickly after the server goes away
 // (from 50 ms, at most 1 s apart, instead of gRPC's default of 1 s growing to 2 minutes), since a crash test restarts
 // the server at once.
@@ -298,6 +308,8 @@ var typeToProto = map[ledger.AccountType]ledgerv1.AccountType{
 }
 
 func (c *GRPC) CreateAccount(ctx context.Context, a ledger.NewAccount) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	resp, err := c.api.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: a.Name, Type: typeToProto[a.Type],
 		Currency: a.Currency, AllowNegative: a.AllowNegative})
 	if err != nil {
@@ -312,6 +324,8 @@ func (c *GRPC) PostEntry(ctx context.Context, key string, e ledger.Entry) (Poste
 	for i, p := range e.Postings {
 		req.Postings[i] = &ledgerv1.Posting{AccountId: p.AccountID, Currency: p.Currency, Amount: p.Amount}
 	}
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	resp, err := c.api.PostEntry(ctx, req)
 	if err != nil {
 		return Posted{}, fromStatus(err)
@@ -320,6 +334,8 @@ func (c *GRPC) PostEntry(ctx context.Context, key string, e ledger.Entry) (Poste
 }
 
 func (c *GRPC) Account(ctx context.Context, id int64) (Account, error) {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	resp, err := c.api.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: id})
 	if err != nil {
 		return Account{}, fromStatus(err)

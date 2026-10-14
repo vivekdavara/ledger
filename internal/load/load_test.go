@@ -380,3 +380,50 @@ func TestConcurrentCopiesOverBothAPIsAllGetTheEntry(t *testing.T) {
 		})
 	}
 }
+
+// A server that posts each transfer's first request and then breaks the connection without answering, on a
+// connection the client has used before. net/http used to send such a request again by itself (it carries an
+// Idempotency-Key), so the server saw more requests than the generator counted: 80 for 40 transfers whose answers
+// were lost, against 24 resends counted (found in review). Now every request the server sees is one Run sent and
+// counted: the transfers, and their retries.
+func TestEveryResendIsCounted(t *testing.T) {
+	t.Parallel()
+	db := storetest.Migrated(t)
+	svc := store.New(db)
+	ledgerAPI := server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, svc,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var seen sync.Map
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("Idempotency-Key")
+		if !strings.Contains(key, ":t") {
+			ledgerAPI.ServeHTTP(w, r)
+			return
+		}
+		requests.Add(1)
+		if _, again := seen.LoadOrStore(key, true); again {
+			ledgerAPI.ServeHTTP(w, r)
+			return
+		}
+		ledgerAPI.ServeHTTP(httptest.NewRecorder(), r) // it posts; the answer goes nowhere
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer srv.Close()
+	for _, retry := range []bool{false, true} {
+		requests.Store(0)
+		c := load.NewREST(srv.URL, 4)
+		res, err := load.Run(context.Background(), c, load.Config{Wallets: 10, Workers: 4, Transfers: 40, Retry: retry,
+			Prefix: fmt.Sprintf("lost-%v:", retry)})
+		c.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Mismatches) > 0 || res.Replayed != 40 || res.Retries != 40 || requests.Load() != 80 ||
+			retry && res.Unknown != 0 || !retry && res.Unknown != 40 {
+			t.Fatalf("retry=%v: the server saw %d requests: %+v", retry, requests.Load(), res)
+		}
+	}
+}
