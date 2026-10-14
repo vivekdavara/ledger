@@ -673,7 +673,7 @@ child process; a test process can't watch its own SIGKILL.
   (after) or nothing (before); a restarted `ledgerd` answers the retry with the same key with a replay (after) or a
   fresh post (before), never "insufficient funds", though a second posting couldn't be afforded. One entry either
   way, and `ledgerd reconcile` exits 0.
-- **`TestKillsDuringLoadPostEachTransferOnce`**, over each API: 8 clients post 600 transfers with `Retry` while a
+- **`TestKillsDuringLoadPostEachTransferOnce`**, over each API at each isolation level: 8 clients post 600 transfers with `Retry` while a
   supervisor keeps `ledgerd serve` running and it keeps dying: at every 40th commit of a process, alternately just
   before and just after it, and at random from the killer every 0.3 to 0.9 s. Every transfer is answered as posted
   or replayed, the books agree with the answers, there are exactly 600 transfer keys and 620 entries, and `ledgerd

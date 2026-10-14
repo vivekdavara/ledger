@@ -424,16 +424,18 @@ func (s *supervisor) counts() (starts, pointCrashes, kills int) {
 // Load from 8 clients while ledgerd keeps dying: every 40th commit of a process, alternately just before and just
 // after it, and at random moments from the killer. The clients send each transfer again with its key until it is
 // answered. At the end each transfer has posted exactly once: as many transfers keys and entries as transfers, every
-// account holding what the answers imply, and ledgerd reconcile exits 0.
+// account holding what the answers imply, and ledgerd reconcile exits 0. Over each API, at each isolation level.
 func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 	bin := faultsBinary(t)
-	for _, api := range []string{"rest", "grpc"} {
-		t.Run(api, func(t *testing.T) {
+	for _, run := range []struct{ api, level string }{{"rest", "read-committed"}, {"grpc", "read-committed"},
+		{"rest", "serializable"}, {"grpc", "serializable"}} {
+		api := run.api
+		t.Run(api+"/"+run.level, func(t *testing.T) {
 			t.Parallel()
 			db := storetest.Migrated(t)
 			url := storetest.SchemaURL(t, db)
 			vars := map[string]string{"LEDGER_DATABASE_URL": url, "LEDGER_HTTP_ADDR": freeAddr(t),
-				"LEDGER_GRPC_ADDR": freeAddr(t)}
+				"LEDGER_GRPC_ADDR": freeAddr(t), "LEDGER_ISOLATION": run.level}
 			sup := startSupervisor(t, &supervisor{bin: bin, sub: "serve", vars: vars,
 				specs:     []string{faults.AfterCommit + ":40", faults.BeforeCommit + ":40"},
 				killEvery: [2]time.Duration{300 * time.Millisecond, 900 * time.Millisecond}})
@@ -448,8 +450,8 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 			}
 			starts, pointCrashes, kills := sup.counts()
 			sup.stop(t)
-			t.Logf("%s: %d starts, %d crashes at a point, %d kills; posted %d, replayed %d, sent again %d; "+
-				"%.0f transfers a second, p50 %v, p99 %v, max %v", api, starts, pointCrashes, kills, res.Posted,
+			t.Logf("%s at %s: %d starts, %d crashes at a point, %d kills; posted %d, replayed %d, sent again %d; "+
+				"%.0f transfers a second, p50 %v, p99 %v, max %v", api, run.level, starts, pointCrashes, kills, res.Posted,
 				res.Replayed, res.Retries, res.PerSecond(), res.P50, res.P99, res.Max)
 
 			if len(res.Mismatches) > 0 {
