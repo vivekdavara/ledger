@@ -211,7 +211,7 @@ were sent over gRPC.
 
 ## Tests
 
-178 test functions (159 at the end of day 3, 122 at the end of day 2; several table-driven or property-based, and
+193 test functions (159 at the end of day 3, 122 at the end of day 2; several table-driven or property-based, and
 the concurrency tests run at both isolation levels), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
@@ -292,6 +292,13 @@ the concurrency tests run at both isolation levels), all green locally and in CI
   600 transfers while `ledgerd` dies at crash points and at random post exactly once, over each API (they fail with
   double posts when the key isn't stored); a publisher killed after its deliveries and at random delivers all 2,000
   events at least once, each account's in order. Each ends with `ledgerd reconcile` exiting 0.
+- Day 4, from building and from the review (each fails without its fix): a stop while `serve` or `publish` starts
+  exits 0; a request out of attempts gets the entry its key posted; the books check catches faults that cancel out
+  (versions); every resend is counted; reruns with another config start afresh; a steep skew ends; bad flags exit 2
+  before any request; `Classify` against every reason in apierr's table, over both APIs; retries don't change which
+  transfers are sent; settled transfers aren't timed; conflicts are given up or sent again; exit 3 on a mismatch;
+  `LEDGER_FAULTS` refused by a release `ledgerd`; crash percentages; each publisher starts on a new line; children
+  don't inherit `LEDGER_` settings.
 
 ## Results
 
