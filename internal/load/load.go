@@ -309,7 +309,6 @@ func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
 	}
 
 	workers := make([]*worker, cfg.Workers)
-	var next atomic.Int64
 	var wg sync.WaitGroup
 	start := time.Now()
 	for w := range cfg.Workers {
@@ -320,14 +319,19 @@ func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
 			ch.zipf = mathrand.NewZipf(ch.rng, cfg.Skew, 1, uint64(len(acct.wallets)-1))
 		}
 		wg.Go(func() {
+			// Worker w sends transfers w+1, w+1+Workers, ... in order, each chosen by the worker's own generator, so
+			// a transfer's key always names the same transfer: a second run with the same seed and prefix sends the
+			// same requests, and every one replays. The waits before sending again draw from another generator, so
+			// retries don't change which transfers follow.
+			jitter := mathrand.New(mathrand.NewPCG(cfg.Seed, uint64(5000+w)))
 			for i := 0; ; i++ {
-				n := next.Add(1)
-				if n > int64(cfg.Transfers) {
+				n := w + 1 + i*cfg.Workers
+				if n > cfg.Transfers {
 					return
 				}
 				from, to := ch.transfer(w, i)
 				p := pending{key: fmt.Sprintf("%st%d", cfg.Prefix, n), from: from, to: to, began: time.Now()}
-				posted, retries, err := send(ctx, cfg.Retry, ch.rng, func() (Posted, error) {
+				posted, retries, err := send(ctx, cfg.Retry, jitter, func() (Posted, error) {
 					return c.PostEntry(ctx, p.key, entry(from, to))
 				})
 				wk.retries += retries
