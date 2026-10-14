@@ -272,6 +272,7 @@ func (ch *chooser) transfer(w, i int) (from, to int64) {
 // worker is one client's share of a run.
 type worker struct {
 	delta                                       map[int64]int64 // what the transfers answered as posted moved, by account
+	touched                                     map[int64]int64 // how many of those transfers posted to each account
 	latencies                                   []time.Duration
 	unknown                                     []pending // transfers that got no answer, to settle after the run
 	posted, replayed, gaveUp, unknowns, retries int
@@ -288,6 +289,8 @@ type pending struct {
 func (w *worker) apply(from, to int64) {
 	w.delta[from] += amount
 	w.delta[to] -= amount
+	w.touched[from]++
+	w.touched[to]++
 }
 
 // Run sets up the run's accounts (and the padding), posts cfg.Transfers transfers from cfg.Workers concurrent
@@ -312,7 +315,7 @@ func Run(ctx context.Context, c Client, cfg Config) (Result, error) {
 	var wg sync.WaitGroup
 	start := time.Now()
 	for w := range cfg.Workers {
-		wk := &worker{delta: map[int64]int64{}, refused: map[string]int{}}
+		wk := &worker{delta: map[int64]int64{}, touched: map[int64]int64{}, refused: map[string]int{}}
 		workers[w] = wk
 		ch := &chooser{cfg: cfg, acct: acct, rng: mathrand.New(mathrand.NewPCG(cfg.Seed, uint64(1000+w)))}
 		if cfg.Skew > 1 {
@@ -430,27 +433,39 @@ func entry(from, to int64) ledger.Entry {
 }
 
 // check compares each of the run's accounts with what the answers imply: cash holds every wallet's funding, each
-// wallet its funding moved by the transfers answered as posted, the merchant what it was paid. A transfer posted
-// twice, or answered as posted and lost, shows up as a mismatch.
+// wallet its funding moved by the transfers answered as posted, the merchant what it was paid. Versions count
+// postings, so each account must also have exactly as many postings as those transfers (and its funding) gave it. A
+// transfer posted twice, or answered as posted and lost, shows up as a mismatch, even where balances alone would
+// hide it: in the disjoint layout each worker's transfers go back and forth between its two wallets, so a transfer
+// posted twice moves the balances by the same amount as one posted twice in the other direction (found in review).
 func check(ctx context.Context, c Client, cfg Config, acct accounts, workers []*worker) ([]string, error) {
-	want := map[int64]int64{acct.cash: int64(len(acct.wallets)) * funding, acct.merchant: 0}
+	want := map[int64]Account{acct.cash: {Balance: int64(len(acct.wallets)) * funding,
+		Version: int64(len(acct.wallets))}, acct.merchant: {}}
 	for _, w := range acct.wallets {
-		want[w] = -funding
+		want[w] = Account{Balance: -funding, Version: 1}
 	}
 	for _, wk := range workers {
 		for id, d := range wk.delta {
-			want[id] += d
+			a := want[id]
+			a.Balance += d
+			want[id] = a
+		}
+		for id, n := range wk.touched {
+			a := want[id]
+			a.Version += n
+			want[id] = a
 		}
 	}
 	var mismatches []string
 	rng := mathrand.New(mathrand.NewPCG(cfg.Seed, 5))
 	for _, id := range slices.Sorted(maps.Keys(want)) {
-		got, _, err := send(ctx, true, rng, func() (int64, error) { return c.Balance(ctx, id) })
+		got, _, err := send(ctx, true, rng, func() (Account, error) { return c.Account(ctx, id) })
 		if err != nil {
 			return nil, fmt.Errorf("read account %d: %w", id, err)
 		}
 		if got != want[id] {
-			mismatches = append(mismatches, fmt.Sprintf("account %d: balance %d, the answers imply %d", id, got, want[id]))
+			mismatches = append(mismatches, fmt.Sprintf("account %d: balance %d after %d postings, the answers imply %d "+
+				"after %d", id, got.Balance, got.Version, want[id].Balance, want[id].Version))
 		}
 	}
 	return mismatches, nil

@@ -112,19 +112,22 @@ func TestEveryLayoutPostsEachTransferOnceAndTheBooksAgree(t *testing.T) {
 	reconciled(t, db)
 }
 
-// faulty wraps a client and changes what the first request of every few transfers does, to show that Run's check
-// and settling work. Requests sent again pass through unchanged.
+// faulty wraps a client and changes what the first request of some transfers does (every few of them, or those
+// whose key only says so), to show that Run's check and settling work. Requests sent again pass through unchanged.
 type faulty struct {
 	load.Client
 	seen  sync.Map
 	n     atomic.Int64
 	every int64
+	only  func(key string) bool // when set, the transfers to change instead of every few
 	fault func(ctx context.Context, c load.Client, key string, e ledger.Entry) (load.Posted, error)
 }
 
 func (f *faulty) PostEntry(ctx context.Context, key string, e ledger.Entry) (load.Posted, error) {
-	if _, again := f.seen.LoadOrStore(key, true); !again && strings.Contains(key, ":t") && f.n.Add(1)%f.every == 0 {
-		return f.fault(ctx, f.Client, key, e)
+	if _, again := f.seen.LoadOrStore(key, true); !again && strings.Contains(key, ":t") {
+		if f.only != nil && f.only(key) || f.only == nil && f.n.Add(1)%f.every == 0 {
+			return f.fault(ctx, f.Client, key, e)
+		}
 	}
 	return f.Client.PostEntry(ctx, key, e)
 }
@@ -132,9 +135,15 @@ func (f *faulty) PostEntry(ctx context.Context, key string, e ledger.Entry) (loa
 // errLost stands for an answer that never arrived: not an answer from the ledger, so its outcome is unknown.
 var errLost = errors.New("connection reset by peer")
 
+// The check must catch a transfer posted twice and one answered as posted but lost, in every layout, however many
+// there are. In the disjoint layout each worker's transfers go back and forth between its two wallets, so faults can
+// cancel out in the balances: every transfer posted twice, or just a worker's first two (t1 and t5 with four
+// workers, one each way), left every balance as the answers implied, and the check found nothing until it compared
+// versions too (found in review).
 func TestTheCheckCatchesATransferPostedTwiceOrLost(t *testing.T) {
 	t.Parallel()
 	db, apis := apis(t)
+	firstPair := func(key string) bool { return strings.HasSuffix(key, ":t1") || strings.HasSuffix(key, ":t5") }
 	for name, fault := range map[string]func(context.Context, load.Client, string, ledger.Entry) (load.Posted, error){
 		// The ledger posts it twice: what a broken idempotency key would do.
 		"twice": func(ctx context.Context, c load.Client, key string, e ledger.Entry) (load.Posted, error) {
@@ -148,16 +157,25 @@ func TestTheCheckCatchesATransferPostedTwiceOrLost(t *testing.T) {
 			return load.Posted{EntryID: 1}, nil
 		},
 	} {
-		c := &faulty{Client: apis[0].client, every: 7, fault: fault}
-		res, err := load.Run(context.Background(), c, load.Config{Wallets: 10, Workers: 4, Transfers: 70,
-			Prefix: name + ":"})
-		if err != nil {
-			t.Fatal(err)
+		for _, layout := range load.Layouts {
+			for which, c := range map[string]*faulty{
+				"every-7th": {Client: apis[0].client, every: 7, fault: fault},
+				"all":       {Client: apis[0].client, every: 1, fault: fault},
+				"t1-and-t5": {Client: apis[0].client, only: firstPair, fault: fault},
+			} {
+				res, err := load.Run(context.Background(), c, load.Config{Layout: layout, Wallets: 10, Workers: 4,
+					Transfers: 120, Prefix: fmt.Sprintf("%s-%s-%s:", name, layout, which)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(res.Mismatches) == 0 {
+					t.Fatalf("%s, %s, %s: the check found nothing: %+v", name, layout, which, res)
+				}
+				if layout == load.Disjoint && which == "t1-and-t5" {
+					t.Logf("%s, disjoint, t1 and t5: %q", name, res.Mismatches)
+				}
+			}
 		}
-		if len(res.Mismatches) == 0 {
-			t.Fatalf("%s: the check found nothing: %+v", name, res)
-		}
-		t.Logf("%s: %d mismatches, the first: %s", name, len(res.Mismatches), res.Mismatches[0])
 	}
 	reconciled(t, db) // the ledger itself is consistent: it did what it was asked
 }
@@ -223,10 +241,10 @@ func TestOutcomes(t *testing.T) {
 		if load.Classify(err) != load.Refused || load.Reason(err) != "insufficient_funds" {
 			t.Fatalf("%s: overdraft: %v (%v)", a.name, err, load.Classify(err))
 		}
-		if b, err := a.client.Balance(ctx, alice); err != nil || b != 0 {
+		if b, err := a.client.Account(ctx, alice); err != nil || b != (load.Account{}) {
 			t.Fatalf("%s: balance %d, %v", a.name, b, err)
 		}
-		if _, err := a.client.Balance(ctx, 1<<40); load.Classify(err) != load.Refused || load.Reason(err) != "not_found" {
+		if _, err := a.client.Account(ctx, 1<<40); load.Classify(err) != load.Refused || load.Reason(err) != "not_found" {
 			t.Fatalf("%s: a missing account: %v", a.name, err)
 		}
 	}
@@ -246,7 +264,7 @@ func TestOutcomes(t *testing.T) {
 	defer grpcClient.Close()
 	for name, c := range map[string]load.Client{"rest": rest, "grpc": grpcClient} {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := c.Balance(ctx, 1)
+		_, err := c.Account(ctx, 1)
 		cancel()
 		if load.Classify(err) != load.Unknown {
 			t.Fatalf("%s: nothing listening: %v (%v)", name, err, load.Classify(err))
@@ -268,7 +286,7 @@ func TestOutcomes(t *testing.T) {
 	if _, err := c.PostEntry(ctx, "k", ledger.Entry{}); load.Classify(err) != load.Conflict {
 		t.Fatalf("conflict: %v", err)
 	}
-	if _, err := c.Balance(ctx, 1); load.Classify(err) != load.Unknown || load.Reason(err) != "unavailable" {
+	if _, err := c.Account(ctx, 1); load.Classify(err) != load.Unknown || load.Reason(err) != "unavailable" {
 		t.Fatalf("502: %v (%v)", err, load.Classify(err))
 	}
 }
@@ -355,7 +373,7 @@ func TestConcurrentCopiesOverBothAPIsAllGetTheEntry(t *testing.T) {
 						fresh++
 					}
 				}
-				if b, err := apis[1].client.Balance(ctx, alice); fresh != 1 || err != nil || b != -1000 {
+				if b, err := apis[1].client.Account(ctx, alice); fresh != 1 || err != nil || b.Balance != -1000 {
 					t.Fatalf("round %d: %d copies posted, alice %d, %v", round, fresh, b, err)
 				}
 			}

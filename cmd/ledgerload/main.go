@@ -82,7 +82,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// Run waits out a ledgerd that goes away during the run (a crash test restarts it); one that isn't there at the
 	// start is a mistake to report at once. Any answer will do, "no such account" included.
 	probe, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
-	_, err := client.Balance(probe, 1)
+	_, err := client.Account(probe, 1)
 	cancelProbe()
 	if load.Classify(err) == load.Unknown {
 		fmt.Fprintf(stderr, "ledgerload: nothing answers at %s: %v\n", *addr, err)

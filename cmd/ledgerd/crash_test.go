@@ -283,7 +283,7 @@ func TestACrashAroundTheCommitIsSettledByTheRetry(t *testing.T) {
 				if again, err := c.PostEntry(ctx, "pay", pay); err != nil || !again.Replayed || again.EntryID != posted.EntryID {
 					t.Fatalf("a third send: %+v, %v; want a replay of entry %d", again, err, posted.EntryID)
 				}
-				if b, err := c.Balance(ctx, alice); err != nil || b != -1000 {
+				if b, err := c.Account(ctx, alice); err != nil || b != (load.Account{Balance: -1000, Version: 2}) {
 					t.Fatalf("alice: %d, %v; want -1000 ($10 left)", b, err)
 				}
 				if n := queryInt(t, db, `SELECT count(*) FROM journal_entries WHERE description = 'alice pays bob'`); n != 1 {
@@ -469,8 +469,9 @@ func TestKillsDuringLoadPostEachTransferOnce(t *testing.T) {
 			if res.Posted+res.Replayed != transfers || len(res.Refused) > 0 || res.GaveUp+res.Unknown > 0 {
 				t.Fatalf("%+v", res)
 			}
-			// Crashes after a commit leave transfers posted and unanswered: their retries replay.
-			if pointCrashes < 10 || res.Replayed == 0 {
+			// Crashes after a commit leave transfers posted and unanswered: their retries replay. 620 commits allow
+			// at most 15 point crashes, fewer when the killer ends a process first (more often on a slower machine).
+			if pointCrashes < 5 || res.Replayed == 0 {
 				t.Fatalf("%d crashes at a point and %d replays: the test didn't crash ledgerd as it should", pointCrashes,
 					res.Replayed)
 			}

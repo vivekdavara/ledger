@@ -32,9 +32,15 @@ type Client interface {
 	CreateAccount(ctx context.Context, a ledger.NewAccount) (int64, error)
 	// PostEntry posts e under key.
 	PostEntry(ctx context.Context, key string, e ledger.Entry) (Posted, error)
-	// Balance returns an account's stored balance in minor units, debits positive.
-	Balance(ctx context.Context, id int64) (int64, error)
+	// Account returns an account's stored balance and version.
+	Account(ctx context.Context, id int64) (Account, error)
 	Close() error
+}
+
+// Account is what the generator reads back from an account: its stored balance in minor units (debits positive)
+// and its version, the number of postings it has.
+type Account struct {
+	Balance, Version int64
 }
 
 // Posted is the answer to a PostEntry that succeeded.
@@ -213,19 +219,21 @@ func (c *REST) PostEntry(ctx context.Context, key string, e ledger.Entry) (Poste
 	return Posted{EntryID: out.ID, Replayed: resp.Header.Get("Idempotent-Replayed") == "true"}, nil
 }
 
-func (c *REST) Balance(ctx context.Context, id int64) (int64, error) {
+func (c *REST) Account(ctx context.Context, id int64) (Account, error) {
 	var out struct {
 		Currency string `json:"currency"`
 		Balance  string `json:"balance"`
+		Version  int64  `json:"version"`
 	}
 	if _, err := c.do(ctx, http.MethodGet, "/v1/accounts/"+strconv.FormatInt(id, 10), nil, nil, &out); err != nil {
-		return 0, err
+		return Account{}, err
 	}
 	cur, err := money.Lookup(out.Currency)
 	if err != nil {
-		return 0, err
+		return Account{}, err
 	}
-	return cur.Parse(out.Balance)
+	balance, err := cur.Parse(out.Balance)
+	return Account{Balance: balance, Version: out.Version}, err
 }
 
 // GRPC is a Client over the gRPC API.
@@ -311,10 +319,10 @@ func (c *GRPC) PostEntry(ctx context.Context, key string, e ledger.Entry) (Poste
 	return Posted{EntryID: resp.GetEntry().GetId(), Replayed: resp.GetReplayed()}, nil
 }
 
-func (c *GRPC) Balance(ctx context.Context, id int64) (int64, error) {
+func (c *GRPC) Account(ctx context.Context, id int64) (Account, error) {
 	resp, err := c.api.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: id})
 	if err != nil {
-		return 0, fromStatus(err)
+		return Account{}, fromStatus(err)
 	}
-	return resp.GetAccount().GetBalance(), nil
+	return Account{Balance: resp.GetAccount().GetBalance(), Version: resp.GetAccount().GetVersion()}, nil
 }
