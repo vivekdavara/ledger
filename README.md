@@ -452,6 +452,111 @@ make bench-outbox
 The publisher's numbers are an upper bound for one process: the sink discards what it encodes. A real broker's
 acknowledgement would add its round trip per batch.
 
+### Day 4: the API under contention
+
+`make load` (`scripts/load.sh 3 3000`) at `82301aa`: `ledgerload` against a real `ledgerd` over loopback, 16 workers
+and a pool of 16 connections, 3,000 two-posting transfers a run, three runs each, every run on a fresh schema padded to
+20,000 accounts and 10,000 entries. The in-process column is `BenchmarkContention` with `-padding 20000` (the second
+half of `make bench-contention`), run right after on the same commit. Medians of three; Apple M3, Postgres 14.20 at
+default settings, on battery (45% at the start of the session, 18% at the end; Low Power Mode off).
+
+| Read committed | In process | REST | gRPC |
+|---|---|---|---|
+| disjoint | 6,904/s, p99 16 ms | 5,372/s, p99 19 ms | 5,617/s, p99 22 ms |
+| random | 6,673/s, p99 12 ms | 5,394/s, p99 15 ms | 5,418/s, p99 13 ms |
+| hot | 2,140/s, p99 58 ms | 2,062/s, p99 18 ms | 1,949/s, p99 23 ms |
+
+| Serializable: transfers/s, retries/transfer, gave up | In process | REST | gRPC |
+|---|---|---|---|
+| disjoint | 4,165, 0.56, 0 | 3,783, 0.60, 0–1 | 3,212, 0.63, 0–1 |
+| random | 4,094, 0.79, 0–1 | 3,553, 0.74, 1 | 2,388, 0.76, 1–2 |
+| hot | 1,756, 0.81, 69–75 | 1,523, 1.15, 45–61 | 1,364, 1.09, 59–61 |
+
+```bash
+make load
+```
+
+- **At read committed the API keeps 78 to 81% of the in-process rate** on disjoint and random wallets, and 91 to 96%
+  on the hot account, where one row lock, not the API, sets the pace. The client, the server and Postgres share the
+  same 8 cores, so some of the difference is the client's own CPU.
+- **At serializable REST keeps 87 to 91%; gRPC 58 to 78%,** with a wide spread between its runs (random: 2,261, 2,388
+  and 3,343 a second). Not investigated further.
+- **The books agreed after every one of the 42 runs** (36 here and 6 with one client), and `ledgerd reconcile` exited
+  0 after each; the script stops at the first run where it doesn't.
+- The hot account's p99 over the API (18 to 23 ms) is below the in-process one (58 ms). Not investigated; compare the
+  rates, which agree.
+- **One client, no contention** (the last six runs of `make load`: disjoint, 2,000 transfers, read committed): p50
+  554 µs over REST and 544 µs over gRPC, p99 958 and 1,463 µs. Day 3 measured 461 to 465 µs for the same posting in
+  process (`make bench`, on another day and an unpadded ledger), so the API and the loopback round trip add about a
+  tenth of a millisecond.
+
+Today's in-process numbers are 0 to 11% above day 3's padded ones (6,231 / 6,370 / 2,113 and 4,042 / 3,787 / 1,755),
+which were measured on power.
+
+### Day 4: crashes
+
+The crash tests are part of `make check`; their logs show what each run did:
+
+```bash
+go test -race -count=1 -v -run 'TestKillsDuringLoad|TestAKilledPublisher|TestACrash' ./cmd/ledgerd
+```
+
+Two runs at `32fa5af`, each over REST and gRPC at both levels, 8 clients and 600 transfers per run, `ledgerd` dying
+at every 40th commit of a process (just before or just after it) and every third process killed from outside:
+
+| Run | Processes | Point crashes | Kills from outside | Answered as replays | Sent again |
+|---|---|---|---|---|---|
+| REST, read committed | 15, 14 | 10, 9 | 4, 4 | 20, 12 | 337, 316 |
+| REST, serializable | 16, 14 | 10, 9 | 5, 4 | 10, 17 | 382, 319 |
+| gRPC, read committed | 18, 16 | 12, 10 | 5, 5 | 14, 13 | 371, 385 |
+| gRPC, serializable | 17, 19 | 11, 12 | 5, 6 | 10, 14 | 346, 458 |
+
+Every transfer posted exactly once in every run: 600 transfer keys, 620 entries, every balance and version as the
+answers imply, `ledgerd reconcile` clean. The killed publisher, in the same two runs: 15 and 19 processes, 11 and 14
+crashed just after a delivery, 3 and 4 killed from outside; 3,400 and 3,600 lines for the 2,000 events, every one
+delivered at least once, each account's in version order after dedupe, no line cut off.
+
+Throughput under crashes is not a result: it is set by how often the test kills `ledgerd` (270 to 495 transfers a
+second here, with each restart taking its share).
+
+## Review of day 4
+
+Once the load generator and the crash tests were in (`1c8e796`), two review agents read them, one the crash points
+and crash tests, one the load generator, each in its own git worktree (13 minutes each). They reported only what they
+had reproduced, and I reproduced each finding again before fixing it; each fix has a test that fails without it.
+
+1. **The books check couldn't see faults that cancel out.** In the disjoint layout a worker's transfers go back and
+   forth between its two wallets, so with every transfer posted twice (240 entries for 120 transfers), every one lost,
+   or just a worker's first two doubled, every balance still matched the answers. The check compares versions (the
+   number of postings) too now.
+2. **A request out of attempts could be told `conflict` though its key had posted** (a hypothesis in the review,
+   reproduced with two copies held at a barrier and one attempt each): the last attempt lost a race for the key
+   (`23505`) or the account (`40001`) to a copy that committed. `conflict` tells a client nothing posted. Running out
+   of attempts now looks the key up once more, as a rejection does.
+3. **`net/http` resent some POSTs by itself, uncounted.** It treats a request with an `Idempotency-Key` header as safe
+   to send again on a reused connection that broke (go1.27.1, `Request.isReplayable`): 80 requests reached the server
+   for 40 lost answers, while the generator counted 10 resends. Safe against this ledger, but invisible; the client
+   now turns it off.
+4. **Rerunning a prefix with another config gave false mismatches** and `idempotency_key_reused`: names and keys now
+   carry a tag of the config. **A steep skew hung the random layout** (skew 30: still running after the run's
+   deadline). **Bad flags exited 1 after a request** instead of 2 before one.
+5. **The crash tests' stop raced a restart** (1 publisher run in 25): a child started just before the stop got the
+   `SIGTERM` during startup. I had found the cause while building (a stop while `serve` or `publish` connects or
+   migrates exited 1; it exits 0 now, `80923b6`) before the report came; the supervisor also accepts death by
+   `SIGTERM`, which is what a stop before Go's handlers are in place gets.
+6. **A publisher killed mid-line could cost the next one its first event,** in output that outlives a process (a
+   file, a kept-open pipe): the next line was glued onto the fragment. `ledgerd publish` starts its output on a new
+   line now.
+7. Smaller: a spec of blanks in `LEDGER_FAULTS` said crash points were armed; a crash point as PID 1 in a container
+   would have blocked forever (the kernel drops init's own `SIGKILL`), and now exits; gRPC calls had no deadline;
+   the children inherited the test's own `LEDGER_` settings.
+
+Tests that still passed with their mechanism removed, now fixed: the random killer (nothing asserted a kill: with it
+removed both tests passed; every third process is now killed from outside and the tests require it), crash
+percentages (5% firing on every hit), the release build's refusal through `ledgerd`, four of `Classify`'s outcomes and
+gRPC's code fallback, retries changing later transfers, settled transfers being timed, retrying after a conflict, and
+the exit code 3. Judgement calls are in DESIGN.md's "Limitations".
+
 ## Review of day 3
 
 Once the day's work was in (`ec83ff1`), two review agents read it: one the isolation levels and the
