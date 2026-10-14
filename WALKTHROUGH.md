@@ -3,8 +3,8 @@
 The questions an interviewer is likely to ask about Ledger, with short answers that point at the code. This file
 grows each day; this version covers day 1 (the money type, the validator, the schema and its invariants, the
 migration runner, the binary), day 2 (the API: REST and gRPC over one service, posting with retries, idempotency
-keys) and day 3 (the isolation levels compared, the outbox, reconciliation). Read DESIGN.md first for the full
-picture.
+keys), day 3 (the isolation levels compared, the outbox, reconciliation) and day 4 (a load generator over the API,
+and crash tests that kill a real ledgerd). Read DESIGN.md first for the full picture.
 
 **Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the migrations in
 `internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
@@ -15,7 +15,10 @@ picture.
 `internal/store/isolation_test.go` → `internal/store/predicate_locks_test.go` →
 `internal/store/transfers_property_test.go` → `internal/store/migrations/0009_outbox.sql` →
 `internal/outbox/outbox.go` (`PublishOnce`, `Run`) and its tests → `internal/store/reconcile.go` →
-`internal/store/reconcile_test.go`.
+`internal/store/reconcile_test.go`. For day 4: DESIGN.md "Load and failure injection" → `internal/faults/faults.go`
+and `on.go` → the three `faults.Point` calls (`internal/store/ledger.go` `postOnce`, `internal/outbox/outbox.go`
+`PublishOnce`) → `internal/load/client.go` (`Classify`) → `internal/load/load.go` (`Run`, `send`, `check`) →
+`cmd/ledgerd/crash_test.go` (the supervisor, then the three tests) → `scripts/load.sh`.
 
 ## The model
 
@@ -445,3 +448,80 @@ And one commit went in with a failing test, because my command ran the commit af
 result: the outbox-order test used the default retry budget at `SERIALIZABLE`, and under the full suite's load some
 transfers gave up. It wasn't pushed; I fixed the test (it tests order, so it gets a generous budget, and runs at both
 levels) and amended the commit, and every commit after that ran only if `make check` passed.
+
+## Load and crashes (day 4)
+
+**What does "exactly once" mean for a payments API, and how do you test it?**
+The client can't have it on its own: a request whose answer is lost may or may not have posted. What the ledger
+gives is "at most once per key", and the client turns that into exactly once by sending the request again, with the
+same key, until it gets an answer. The test is to make answers go missing at the worst moments and check the books:
+`TestKillsDuringLoadPostEachTransferOnce` kills `ledgerd` again and again (at every 40th commit of a process, just
+before or just after it, and at random) while 8 clients post 600 transfers and retry with their keys. At the end there
+are exactly 600 transfer keys and 620 entries, every balance is what the answers imply, and `ledgerd reconcile`
+exits 0. With the key's insert removed, the same test fails with double posts.
+
+**How do you crash a process exactly between the commit and the answer?**
+With a crash point: `faults.Point(faults.AfterCommit)` sits right after `tx.Commit` in `postOnce`. In a normal build it
+is an empty function. In a `-tags faults` build, `LEDGER_FAULTS=store.after-commit:3` makes the third hit send the
+process `SIGKILL`, which can't be caught: no deferred function runs, the kernel closes the sockets, the client sees a
+broken connection. Random kills alone would almost never land in that window, and that window is the one that tests
+idempotency. The idea is FoundationDB's "buggify" or etcd's failpoints, much smaller.
+
+**Why a build tag? Couldn't you check an environment variable?**
+Then every production binary could be made to crash itself by one stray variable. With the tag, the release binary
+doesn't contain the code; and a release binary given `LEDGER_FAULTS` refuses to start (`faults.ErrNotBuilt`), so a
+crash test pointed at the wrong binary fails instead of passing because nothing crashed. The tests build the tagged
+binary themselves (`go build -tags faults`, once per run) and assert that the crashes they need happened.
+
+**Why does the test run ledgerd as a child process?**
+Because the crash is a real `SIGKILL`: it would kill the test. The test process starts `ledgerd`, a supervisor
+restarts it on the same ports whenever it dies, and a killer goroutine sends it `SIGKILL` at random. The supervisor
+tells the two kinds of death apart by the line a point writes to stderr before it fires, and fails the test on any
+other exit. `internal/faults` tests its own build the same way: the test binary runs itself as a child and checks it
+died on the right hit.
+
+**What does the retry after a crash get back?**
+It depends where the crash was, and the test checks both (`TestACrashAroundTheCommitIsSettledByTheRetry`). Before the
+commit nothing posted, so the retry posts it: 201. After the commit it had posted, so the retry finds the key and
+replays the entry: 200 with `Idempotent-Replayed: true`, or `replayed` over gRPC. The payment is $40 of Alice's $50,
+so a second posting would be refused for funds; the retry must be a replay, and is, because the key is looked up
+before any check.
+
+**What does the load generator measure, and how do you know its numbers are right?**
+Transfers a second over the transfers alone, and each transfer's latency from its first request to its answer, in
+three layouts (each worker on its own wallets, random pairs of 100, everyone paying one merchant), with an optional
+Zipf skew. It also checks itself: at the end it reads every account it used and compares it with what the answers
+imply, so a double post or a lost post shows up as a mismatch (`ledgerload` exits 3).
+`TestTheCheckCatchesATransferPostedTwiceOrLost` wraps the client to post some transfers twice, or to answer without
+posting, and the check catches both.
+
+**How does a client decide whether to retry?**
+`load.Classify` sorts every answer into four. Answered. Refused: the ledger said no and nothing posted (insufficient
+funds, a bad request); sending it again gets the same answer. Conflict: the server ran out of its own retries, and
+nothing posted; safe to send again with the key. Unknown: no answer, or `unavailable`, `deadline_exceeded`,
+`internal`; the entry may or may not have posted, and only a retry with the same key can tell. A broken connection is
+unknown, never refused: treating it as a failure would lose payments that posted.
+
+**Why does a key always name the same transfer?**
+So that a run can be repeated: worker w sends transfers w+1, w+1+N, ... in order, choosing their accounts from its
+own seeded generator, and the waits between retries draw from a different one. The first version gave transfer
+numbers to whichever worker was free; then a second run sent different transfers under keys already used, and got
+`idempotency_key_reused`. The test that runs the same seed twice caught it; now the second run is 60 replays.
+
+**What does the API cost over the in-process numbers?**
+README "Results", day 4, has the table from `make load`: the same three layouts over REST and gRPC at both levels, on
+a padded ledger, against `make bench-contention`'s in-process numbers.
+
+**Is a killed process a realistic crash?**
+For the service, yes: `SIGKILL` is what the OOM killer, a failed health check or `kill -9` does, and it leaves the
+client without an answer at any point. What it doesn't model is the database or the machine dying: Postgres's
+commit is durable before `tx.Commit` returns, and the page cache survives a killed process. That durability is
+Postgres's (WAL and `fsync`), and the limitations say it isn't tested here.
+
+**Tell me about something day 4 found.**
+A flaky test from day 3. `TestEventsWhoseMarkIsLostAreDeliveredAgain` failed once in a full parallel run: after a
+simulated crash, the next publisher found nothing to publish. In pgx (v5.11), a rollback that fails on a cancelled
+context closes the connection and returns at once; Postgres ends that session, and releases its row locks, a moment
+later. Until then `FOR UPDATE SKIP LOCKED` skips the batch. That's correct behaviour (the next poll takes it), so the
+test now polls as `Run` does. The lesson: a lock held by a dead client lasts until the server notices, and code that
+skips locked rows must expect to see them again.
