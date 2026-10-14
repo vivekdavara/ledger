@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/faults"
 	"github.com/vivekdavara/ledger/internal/ledger"
 	"github.com/vivekdavara/ledger/internal/money"
 )
@@ -442,9 +443,11 @@ func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.
 			return ledger.PostedEntry{}, err
 		}
 	}
+	faults.Point(faults.BeforeCommit) // a crash test's point: nothing has posted yet
 	if err := tx.Commit(ctx); err != nil {
 		return ledger.PostedEntry{}, translate(err)
 	}
+	faults.Point(faults.AfterCommit) // a crash test's point: posted, and the client has no answer
 	return posted, nil
 }
 

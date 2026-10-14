@@ -13,7 +13,9 @@
 // Configuration comes from the environment: LEDGER_DATABASE_URL (required), LEDGER_HTTP_ADDR (REST and the health
 // endpoints, default :8103), LEDGER_GRPC_ADDR (default :9103), LEDGER_SHUTDOWN_GRACE (how long in-flight work
 // gets after a stop signal, default 10s) and LEDGER_ISOLATION (the posting transactions' isolation level,
-// read-committed or serializable; see DESIGN.md, "Concurrency (days 2 and 3)"). Logs are JSON lines on stderr.
+// read-committed or serializable; see DESIGN.md, "Concurrency (days 2 and 3)"). LEDGER_FAULTS arms crash points for
+// a crash test, in a binary built with -tags faults (internal/faults); any other build refuses to start with it.
+// Logs are JSON lines on stderr.
 package main
 
 import (
@@ -33,6 +35,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/faults"
 	"github.com/vivekdavara/ledger/internal/grpcapi"
 	"github.com/vivekdavara/ledger/internal/outbox"
 	"github.com/vivekdavara/ledger/internal/server"
@@ -71,6 +74,13 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if len(args) != 1 || !slices.Contains(commands, args[0]) {
 		fmt.Fprintln(stderr, "usage: ledgerd "+strings.Join(commands, "|"))
 		return 2
+	}
+	if spec := getenv("LEDGER_FAULTS"); spec != "" {
+		if _, err := faults.Arm(spec); err != nil {
+			log.Error("LEDGER_FAULTS", "err", err)
+			return 1
+		}
+		log.Warn("crash points armed: this process will kill itself on purpose", "faults", spec)
 	}
 	url := getenv("LEDGER_DATABASE_URL")
 	if url == "" {

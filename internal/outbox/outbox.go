@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vivekdavara/ledger/internal/faults"
 )
 
 // EntryPosted is the type of the one kind of event there is so far.
@@ -195,6 +196,7 @@ func (p *Publisher) PublishOnce(ctx context.Context) (int, error) {
 		}
 		return 0, fmt.Errorf("deliver %d events from %d: %w", len(ids), ids[0], deliverErr)
 	}
+	faults.Point(faults.AfterDeliver) // a crash test's point: delivered, not yet marked
 	if _, err := tx.Exec(ctx, `UPDATE outbox SET published_at = now(), attempts = attempts + 1, last_error = NULL
 		WHERE id = ANY($1)`, ids); err != nil {
 		return 0, fmt.Errorf("mark %d delivered events published: %w", len(ids), err)
