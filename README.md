@@ -7,13 +7,15 @@ to zero in each currency, so money is moved, never created or destroyed. The rul
 validator, for clear errors, and by the database at commit, so no bug, second writer or hand-typed `psql` session
 can break it.
 
-> **Status: day 3 of 5.** Day 1: the money type, the entry validator, the schema with its database-enforced
+> **Status: day 4 of 5.** Day 1: the money type, the entry validator, the schema with its database-enforced
 > invariants, the migration runner, health endpoints and CI. Day 2: the API, REST on :8103 and gRPC on :9103 over
 > one service: accounts, balances, paged history, and posting entries atomically with retries and idempotency keys.
 > Day 3: the two isolation levels compared under contention (`READ COMMITTED` is now the default), a property test
 > of random concurrent transfers, a transactional outbox with a publisher (`ledgerd publish`), and a reconciliation
-> job (`ledgerd reconcile`). Next: a load generator and failure injection (day 4).
-> [DESIGN.md](DESIGN.md) is the full design and the plan for the remaining days.
+> job (`ledgerd reconcile`). Day 4: a load generator over either API that checks the books against its answers
+> (`ledgerload`, `make load`), and crash tests that kill a real `ledgerd` with `SIGKILL` (at crash points built into
+> a test-only binary, and at random) and show that every transfer still posts exactly once and no event is lost.
+> Next: the release (day 5). [DESIGN.md](DESIGN.md) is the full design.
 
 ## Architecture
 
@@ -21,6 +23,7 @@ can break it.
 flowchart LR
     R[REST client] -- "HTTP :8103, decimal strings" --> H[internal/server]
     G[gRPC client] -- "gRPC :9103, minor units" --> P[internal/grpcapi]
+    L["ledgerload: transfers with keys, then every balance vs the answers"] -. "REST or gRPC" .-> H
     H --> S
     P --> S
     S["store.Store: validate, lock accounts in id order, check, post, store the key"]
@@ -117,6 +120,42 @@ LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./
 exits 0 when they all agree, 3 when any found a difference (the log names which), 1 when it couldn't run. It
 changes nothing, so it doesn't migrate: run it against a current schema.
 
+### Load
+
+With `ledgerd serve` running:
+
+```bash
+go run ./cmd/ledgerload -api grpc -layout hot -workers 16 -transfers 3000
+```
+
+`ledgerload` creates and funds its own accounts (under a random prefix), posts the transfers from 16 concurrent
+clients, and prints throughput, latency percentiles, how each transfer ended, and whether every account it used holds
+what the answers imply. `-layout` is `disjoint`, `random` or `hot`; `-wallets`, `-skew` (a Zipf exponent above 1),
+`-pad`, `-retry` (send conflicts and unanswered requests again with their key until answered) and `-json` adjust it.
+It exits 0 when the books agree, 3 when they don't.
+
+```bash
+make load
+```
+
+`make load` runs `scripts/load.sh`: each isolation level, API and layout, three runs each, on a fresh schema padded as
+`make bench-contention` pads it, with `ledgerd reconcile` required to exit 0 after every run. It needs `jq` and a quiet
+machine; the results are under "Results".
+
+### Crash tests
+
+The crash tests are part of `make check`. They build `ledgerd` with `-tags faults`, which compiles in three crash
+points (just before a posting's commit, just after it, and between an outbox delivery and its mark), armed by
+`LEDGER_FAULTS`:
+
+```bash
+go build -tags faults -o bin/ledgerd-faults ./cmd/ledgerd
+```
+
+`LEDGER_FAULTS=store.after-commit:3 bin/ledgerd-faults serve` kills itself with `SIGKILL` just after its third
+commit; `store.after-commit:5%` does it with probability 5% at each one. A normal build refuses to start with
+`LEDGER_FAULTS` set. DESIGN.md, "Load and failure injection (day 4)", explains the points and the tests.
+
 ## The API
 
 Start the server as above, then (the `id`s are what a fresh `ledger` database gives):
@@ -172,8 +211,8 @@ were sent over gRPC.
 
 ## Tests
 
-159 test functions (122 at the end of day 2; several table-driven or property-based, and the concurrency tests run
-at both isolation levels), all green locally and in CI:
+178 test functions (159 at the end of day 3, 122 at the end of day 2; several table-driven or property-based, and
+the concurrency tests run at both isolation levels), all green locally and in CI:
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -239,6 +278,20 @@ at both isolation levels), all green locally and in CI:
   finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0. Day 3: an unknown
   `LEDGER_ISOLATION` refused, the level the store posts at shown in the log; `publish` writing the events of entries
   posted before and while it runs; `reconcile`'s three exit codes, and that it leaves an old schema as it is.
+- Day 4, `internal/faults`: the spec's parser (hit numbers, percentages, misspelled points and impossible rules
+  refused); in a normal build a spec is refused and a point does nothing; in the faults build, the test binary runs
+  itself as a child and dies by `SIGKILL` on the right hit, after writing the point's line.
+- Day 4, `internal/load` and `cmd/ledgerload`: every layout posts each transfer once over both APIs and the books
+  agree; the check catches a transfer posted twice and one answered as posted but lost; lost answers settle as
+  replays and lost requests as fresh posts, with and without retries; every kind of outcome over both APIs; a skew
+  concentrates transfers; twelve concurrent copies of a payment only one can afford, over both APIs at once, all get
+  the one entry, ten rounds at each level (3 of 3 runs fail without the re-lookup after a rejection); the command's
+  output, JSON, exit codes, and a rerun with the same seed replaying every transfer.
+- Day 4, `cmd/ledgerd` crash tests, against a real `ledgerd` built with `-tags faults`: a crash just before or just
+  after the commit, over each API, is settled by the retry (a fresh post or a replay, never "insufficient funds");
+  600 transfers while `ledgerd` dies at crash points and at random post exactly once, over each API (they fail with
+  double posts when the key isn't stored); a publisher killed after its deliveries and at random delivers all 2,000
+  events at least once, each account's in order. Each ends with `ledgerd reconcile` exiting 0.
 
 ## Results
 
@@ -490,7 +543,8 @@ it:
 ## Layout
 
 ```
-cmd/ledgerd/              the binary: migrate, serve REST + gRPC, publish the outbox, reconcile
+cmd/ledgerd/              the binary: migrate, serve REST + gRPC, publish the outbox, reconcile; the crash tests
+cmd/ledgerload/           the load generator's command
 proto/ledger/v1/          the gRPC API's definition
 internal/money/           currencies, amounts, exact parsing
 internal/ledger/          Entry, Posting, Validate; Account, its type and shown balance; the Service interface
@@ -499,10 +553,13 @@ internal/store/migrations 0001 to 0009 (DESIGN.md, "Schema", says what each does
 internal/store/storetest/ a fresh schema per test
 internal/outbox/          the outbox's publisher, its sinks, Dedupe and CheckOrder
 internal/apierr/          the one table from errors to reasons, HTTP statuses and gRPC codes
+internal/faults/          crash points: nothing in a normal build, SIGKILL in a -tags faults build
+internal/load/            the load generator: REST and gRPC clients, outcomes, Run and its books check
 internal/server/          HTTP: health endpoints and the REST API (api.go)
 internal/grpcapi/         gRPC: LedgerService
 internal/gen/             generated from proto/ by make proto (committed)
 tools/                    the code generators and grpcurl, in their own module
+scripts/                  dev-db.sh (the local databases), load.sh (make load)
 ```
 
 ## License
