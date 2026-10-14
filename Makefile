@@ -10,9 +10,13 @@ check: lint test
 lint:
 	@unformatted="$$(gofmt -l .)"; if [ -n "$$unformatted" ]; then echo "not gofmt-formatted:"; echo "$$unformatted"; exit 1; fi
 	go vet ./...
+	go vet -tags faults ./...
 
+# The faults build (DESIGN.md, "Load and failure injection (day 4)") is tested on its own: its points crash the
+# process, so only internal/faults's own tests, which watch a child process crash, run with the tag.
 test:
 	go test -race -count=1 -timeout 4m ./...
+	go test -race -count=1 -tags faults ./internal/faults
 
 # README, "Results": the commit-time check's cost (BenchmarkPostEntry) and the service's
 # (BenchmarkServicePostEntry). Needs a quiet machine.
