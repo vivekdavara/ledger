@@ -199,7 +199,16 @@ func TestEventsWhoseMarkIsLostAreDeliveredAgain(t *testing.T) {
 	if n := unpublished(t, db); n != 3 {
 		t.Fatalf("%d unpublished after the crash, want 3", n)
 	}
-	if n, err := p.PublishOnce(context.Background()); n != 3 || err != nil {
+	// The crashed attempt's rollback failed on its cancelled context, so pgx closed the connection and moved on;
+	// Postgres ends that session, and frees its row locks, a moment later. Until then SKIP LOCKED passes over the
+	// three rows, and the next poll takes them: so does this test (it failed once in a full parallel run, with
+	// "published 0").
+	n, err := p.PublishOnce(context.Background())
+	for deadline := time.Now().Add(10 * time.Second); n == 0 && err == nil && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		n, err = p.PublishOnce(context.Background())
+	}
+	if n != 3 || err != nil {
 		t.Fatalf("after the restart: published %d, %v; want 3", n, err)
 	}
 	got := sk.events()
