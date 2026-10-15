@@ -586,9 +586,20 @@ would poll the database for each watcher, and grpc-go's client-side health check
 health checking".
 
 **How do you know the README's numbers still hold at the release?**
-`scripts/release_check.sh` ran every measurement again at v1.0.0's code, and the README's "Release check" puts the
-new numbers next to the first ones. It also runs `make check` on a clean `git archive` of the commit, which fails a
-release that depends on a file nobody committed.
+`scripts/release_check.sh` ran every measurement again, twice: before the hand check's one fix and at the tag's code
+after it, and the README's "Release check" puts the numbers next to the first ones (the second run's medians were
+within 9% of the first's, the reconciliation 10% faster). It also runs `make check` on a clean `git archive` of the
+commit, which fails a release that depends on a file nobody committed.
+
+**What did the release check find?**
+Two things the reviews hadn't. A stale number: the README said one reconciliation of 200,000 postings takes 546 to
+571 ms, but day 3 measured that before its own review added two checks and made the sums `numeric`; v1.0.0 takes 724
+to 741 ms. Nothing re-ran it after the fix, so the README went on citing the old reconciliation's time; the release
+check re-runs every measurement so that can't last. And a client bug, from running the README's commands by hand:
+with the server on 127.0.0.1 alone, `ledgerload -api grpc` couldn't reach it through `localhost`, though REST and
+grpcurl could. This Mac's localhost is `::1` and 127.0.0.1, and with gRPC's default `dns` resolver the client never
+got to the IPv4 address. `NewGRPC` now hands a plain `host:port` to Go's dialer, which tries each address
+(`TestAGRPCClientOfLocalhostReachesAServerOnIPv4Alone`).
 
 **Why do your tests run two packages at a time?**
 Every database test gets a schema and a connection pool of its own, so tests run in parallel without seeing each

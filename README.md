@@ -62,10 +62,10 @@ balance is the sum of its postings, and the database maintains it, so it can't d
 
 ## Results at a glance
 
-v1.0.0's own numbers, from the release check (`scripts/release_check.sh` at `e5e4ee4`, the tag's code): Apple M3,
+v1.0.0's own numbers, from the release check (`scripts/release_check.sh`, first run, at `e5e4ee4`): Apple M3,
 PostgreSQL 14.20 at default settings, client, server and database on one machine, on power, nothing else running.
-Medians of 3 runs, or the range of the 3. "Results" has each one's first measurement, its full table and the
-comparison.
+Medians of 3 runs, or the range of the 3. A second run at `6a512be`, the tag's code, passed too, with medians within
+9% of these (the reconciliation 10% faster); "Release check" has both, and "Results" each one's first measurement.
 
 | What | Result | Command |
 |---|---|---|
@@ -311,7 +311,7 @@ The main ones; DESIGN.md, "Limitations", has every one, with its reason.
 
 ## Tests
 
-206 test functions (193 at the end of day 4, 159 at the end of day 3, 122 at the end of day 2; several table-driven or
+207 test functions (193 at the end of day 4, 159 at the end of day 3, 122 at the end of day 2; several table-driven or
 property-based, and the concurrency tests run at both isolation levels), all green locally and in CI. `make check`
 runs them two packages at a time: each test has a schema and a connection pool of its own, and with every package at
 once the suite reached Postgres's 100 connections (day 5).
@@ -411,7 +411,8 @@ once the suite reached Postgres's 100 connections (day 5).
   same over both. From the review (each fails without its fix): 40 idle stops with a zero grace all exit 0, while a
   gRPC call alone still running at the end of a grace is cut off with exit 1; REST pages past version 2^31; a
   missing key is `invalid_argument` over both APIs; `serve`'s settings are refused before the database is touched;
-  `JSONLines` stops between events when its context ends; every REST answer says `Cache-Control: no-store`.
+  `JSONLines` stops between events when its context ends; every REST answer says `Cache-Control: no-store`. From the
+  release's hand check: a gRPC client of `localhost` reaches a server listening on 127.0.0.1 alone.
 
 ## Results
 
@@ -645,8 +646,8 @@ second here, with each restart taking its share).
 scripts/release_check.sh
 ```
 
-Run at `e5e4ee4`, the code v1.0.0 is tagged with (only docs changed after it), 10:43 to 10:54 on 2026-10-15: Apple M3,
-PostgreSQL 14.20 at default settings, on power, nothing else running. Every step passed:
+First run at `e5e4ee4`, 10:43 to 10:54 on 2026-10-15: Apple M3, PostgreSQL 14.20 at default settings, on power,
+nothing else running. Every step passed:
 
 - `make check` (27 s), then `make check` on a clean `git archive` of the commit (32 s), so the release needs nothing
   that isn't committed.
@@ -687,6 +688,25 @@ PostgreSQL 14.20 at default settings, on power, nothing else running. Every step
   serializable 15, 10 and 4; gRPC read committed 18, 12 and 5; gRPC serializable 19, 12 and 6. Every one of the 600
   transfers posted exactly once in each. The publisher: 19 processes, 14 killed after a delivery and 4 from outside;
   3,614 lines for the 2,000 events, none cut off.
+
+**Hand check.** Then every command in "Run it" and "The API", by hand, against the release build on a fresh
+database: the walkthrough's answers as shown (201; then 200 with `Idempotent-Replayed: true` and the same body byte for
+byte; `idempotency_key_reused`; the `insufficient_funds` message exactly as quoted), `GET /v1/entries/1` byte for byte
+the POST's answer, the same key with the postings in another order replayed over gRPC, the health check `SERVING`,
+`publish`'s output starting with an empty line, `reconcile` exiting 0 with ten checks, the `ledgerload` command, a
+release build refusing `LEDGER_FAULTS` (exit 1), and SIGTERM closing both ports. It found one bug: with `ledgerd`
+listening on 127.0.0.1 alone, `ledgerload -api grpc` and its default `localhost:9103` said "nothing answers" after its
+5 s probe, as day 4's build did. This Mac's localhost is `::1` and 127.0.0.1, and with gRPC's default `dns` resolver
+the client never reached the IPv4 server, while REST and grpcurl did. A plain `host:port` now goes to Go's own dialer,
+which tries each address (`6a512be`, with a test that fails without it here).
+
+**Second run** at `6a512be`, the code v1.0.0 is tagged with (only docs changed after it), 11:02 to 11:12, same
+conditions: every step passed again. Against the first run's medians: `make bench` within 2.3%, except plain inserts of
+64 postings 9% faster; the padded contention benchmark within 8.4%; `make load` within 4.1%, with the books agreeing
+after all 42 runs; the publisher 4.5% faster at batch 1,000 and 14.5% at batch 100; one reconciliation 650–670 ms
+(10% faster). The small-table contention runs moved more (random wallets at read committed: 1,662 → 3,720 a second),
+as they did between earlier days. The crash tests: 8–11 crashes at a point and 4–5 kills from outside per run, every
+transfer posted exactly once; the publisher 12 processes, 2,952 lines for the 2,000 events, none cut off.
 
 ## What the reviews found
 
@@ -734,6 +754,8 @@ Found while releasing:
   (sampled peak 82 → 56–57).
 - The release check found the README's reconciliation time stale: 546–571 ms was measured before day 3's review
   added two checks and `numeric` sums, and v1.0.0's is 724–741 ms ("Release check").
+- The hand check of the README's commands found `ledgerload -api grpc` unable to reach, through `localhost`, a server
+  listening on 127.0.0.1 alone ("Release check").
 
 ### Review of day 4
 

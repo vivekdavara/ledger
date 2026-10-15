@@ -52,5 +52,7 @@ The first release: a double-entry payments ledger with REST and gRPC APIs over P
   idempotency key was `malformed_request` over REST but `invalid_argument` over gRPC (now `invalid_argument` over
   both); a typo in `serve`'s settings migrated the database before failing; six places where the docs no longer
   matched the code.
+- Fixed, from the release's hand check: `ledgerload -api grpc` reached a server listening on 127.0.0.1 alone only by
+  its address, not through `localhost`.
 - `scripts/release_check.sh`: `make check`, the same on a clean export of the commit, then every measurement in the
   README again. Tests run two packages at a time, under Postgres's 100 connections.

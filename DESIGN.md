@@ -785,8 +785,12 @@ Day 5 added the small things a release needs, then reviewed the whole repo and c
 The review's findings are in the README ("Review of day 5"), each with its fix and its test: a zero grace that made
 every stop fail, REST refusing its own paging cursor past version 2^31, the APIs disagreeing on a missing key, a typo
 in `serve`'s settings migrating the database first, and six places where the docs no longer said what the code
-does. The other find was the test suite's: with every package's tests at once, each with a schema and a pool of its
-own, `make check` reached Postgres's 100 connections and failed once, so tests run two packages at a time.
+does. The test suite's own: with every package's tests at once, each with a schema and a pool of its own,
+`make check` reached Postgres's 100 connections and failed once, so tests run two packages at a time. And the release
+check's: the README's reconciliation time predated day 3's review fixes (546–571 ms then, 724–741 ms at v1.0.0), and
+running the README's commands by hand showed `ledgerload -api grpc` couldn't reach, through `localhost`, a server
+listening on 127.0.0.1 alone: gRPC's default `dns` resolver never got to the IPv4 address of a localhost that is
+`::1` as well. `load.NewGRPC` now hands a plain `host:port` to Go's dialer.
 
 ## Testing
 
