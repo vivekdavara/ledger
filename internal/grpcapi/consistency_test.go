@@ -100,6 +100,7 @@ func TestBothAPIsGiveTheSameReason(t *testing.T) {
 	entryCase("unknown currency", "k5", "", leg{cash, "XXX", 100}, leg{alice, "XXX", -100})
 	entryCase("description too long", "k6", strings.Repeat("d", 501), leg{cash, "USD", 1}, leg{alice, "USD", -1})
 	entryCase("invalid key", "has space", "", leg{cash, "USD", 100}, leg{alice, "USD", -100})
+	entryCase("no key", "", "", leg{cash, "USD", 100}, leg{alice, "USD", -100}) // REST: no header at all
 	entryCase("unknown account", "k7", "", leg{cash, "USD", 100}, leg{999999, "USD", -100})
 	entryCase("account id zero", "k8", "", leg{cash, "USD", 100}, leg{0, "USD", -100})
 	entryCase("currency mismatch", "k9", "", leg{cash, "USD", 100}, leg{eur, "USD", -100})

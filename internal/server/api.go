@@ -243,11 +243,19 @@ func (a api) history(w http.ResponseWriter, r *http.Request) {
 // postEntry posts an entry. The Idempotency-Key header is required. The answer is 201 for a new entry, and 200 with
 // Idempotent-Replayed: true when an earlier request with the key posted it; both carry the entry as posted.
 func (a api) postEntry(w http.ResponseWriter, r *http.Request) {
-	key := r.Header.Get("Idempotency-Key")
-	if len(r.Header.Values("Idempotency-Key")) != 1 {
+	keys := r.Header.Values("Idempotency-Key")
+	switch {
+	case len(keys) == 0:
+		// The reason gRPC gives for an empty idempotency_key, which it can't tell from a missing one: the APIs gave
+		// different reasons for the same mistake until the day-5 review.
+		a.fail(w, r, fmt.Errorf("%w: send it in an Idempotency-Key header, and the same one on a retry",
+			ledger.ErrIdempotencyKey))
+		return
+	case len(keys) > 1:
 		a.fail(w, r, fmt.Errorf("%w: send exactly one Idempotency-Key header", apierr.ErrMalformed))
 		return
 	}
+	key := keys[0]
 	var req entryJSON
 	if err := decode(w, r, &req, entryNames); err != nil {
 		a.fail(w, r, err)

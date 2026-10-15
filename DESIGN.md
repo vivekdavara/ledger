@@ -451,12 +451,12 @@ fault (its index in the request).
 
 | Reason | Meaning | HTTP | gRPC |
 |---|---|---|---|
-| `malformed_request` | not one JSON object, not UTF-8, a key twice, an unknown field, a missing `Idempotency-Key` | 400 | `INVALID_ARGUMENT` |
+| `malformed_request` | not one JSON object, not UTF-8, a key twice, an unknown field, two `Idempotency-Key` headers | 400 | `INVALID_ARGUMENT` |
 | `unsupported_media_type` | a body that isn't `Content-Type: application/json` | 415 | (REST only) |
 | `request_too_large` | a body over 64 KB | 413 | `RESOURCE_EXHAUSTED`, from gRPC itself |
-| `invalid_argument` | a rule the request alone breaks: counts, amounts, currencies, names, types, keys, pages | 400 | `INVALID_ARGUMENT` |
+| `invalid_argument` | a rule the request alone breaks: counts, amounts, currencies, names, types, ids, keys (a missing one too, since day 5), pages | 400 | `INVALID_ARGUMENT` |
 | `unbalanced` | postings don't sum to zero in some currency | 400 | `INVALID_ARGUMENT` |
-| `not_found` | the account in the request's path | 404 | `NOT_FOUND` |
+| `not_found` | the account or entry in the request's path | 404 | `NOT_FOUND` |
 | `unknown_account` | an account a posting names | 422 | `NOT_FOUND` |
 | `currency_mismatch` | the posting's currency isn't its account's | 422 | `FAILED_PRECONDITION` |
 | `insufficient_funds` | the posting would overdraw a protected account | 422 | `FAILED_PRECONDITION` |

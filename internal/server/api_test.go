@@ -184,8 +184,8 @@ func TestRESTErrors(t *testing.T) {
 		posting         int
 		message         string
 	}{
-		{"no key", "", entry(leg(cash, "USD", "1.00"), leg(alice, "USD", "-1.00")), 400, "malformed_request", -1,
-			"Idempotency-Key"},
+		{"no key", "", entry(leg(cash, "USD", "1.00"), leg(alice, "USD", "-1.00")), 400, "invalid_argument", -1,
+			"send it in an Idempotency-Key header"},
 		{"bad key", "has space", entry(leg(cash, "USD", "1.00"), leg(alice, "USD", "-1.00")), 400,
 			"invalid_argument", -1, "visible ASCII"},
 		{"not JSON", "k1", `{"postings":`, 400, "malformed_request", -1, ""},

@@ -273,7 +273,7 @@ the concurrency tests run at both isolation levels), all green locally and in CI
   details.
 - `internal/grpcapi`: the gRPC API over an in-memory connection (bufconn) on a real schema: the same walkthrough,
   each error's code, `ErrorInfo` reason and posting, and the call deadline. `TestBothAPIsGiveTheSameReason` sends
-  27 failing requests through both APIs and requires the same reason and posting from each.
+  28 failing requests through both APIs and requires the same reason and posting from each.
 - `internal/store`, day 3: the concurrency tests and both service property tests run at each isolation level. An
   attempt that waits for an account another transaction is changing decides on the balance as committed, at both
   levels (0 retries at `READ COMMITTED`, 1 at `SERIALIZABLE`). A property test sends batches of up to 24 random
