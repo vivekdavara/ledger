@@ -268,8 +268,13 @@ type inFlight struct {
 	db         *pgxpool.Pool
 }
 
-func startInFlight(t *testing.T, grace string) inFlight {
+// startInFlight starts serve with the grace given, then a posting over each API named ("rest", "grpc"; both if none
+// is), each held behind a row lock the test's transaction keeps until release.
+func startInFlight(t *testing.T, grace string, apis ...string) inFlight {
 	t.Helper()
+	if len(apis) == 0 {
+		apis = []string{"rest", "grpc"}
+	}
 	db := storetest.EmptySchema(t)
 	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, db), "LEDGER_HTTP_ADDR": "127.0.0.1:0",
 		"LEDGER_GRPC_ADDR": "127.0.0.1:0", "LEDGER_SHUTDOWN_GRACE": grace}
@@ -307,7 +312,7 @@ func startInFlight(t *testing.T, grace string) inFlight {
 	var once sync.Once
 	f.release = func() { once.Do(func() { _ = tx.Rollback(context.Background()) }) }
 	t.Cleanup(f.release)
-	go func() {
+	rest := func() {
 		req, _ := http.NewRequest("POST", "http://"+at.HTTP+"/v1/entries", strings.NewReader(
 			`{"postings":[{"account_id":1,"currency":"USD","amount":"1.00"},{"account_id":2,"currency":"USD","amount":"-1.00"}]}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -320,20 +325,23 @@ func startInFlight(t *testing.T, grace string) inFlight {
 			resp.Body.Close()
 		}
 		f.rest <- err
-	}()
+	}
 	conn, err := grpc.NewClient(at.GRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	go func() {
+	grpcCall := func() {
 		_, err := ledgerv1.NewLedgerServiceClient(conn).PostEntry(context.Background(), &ledgerv1.PostEntryRequest{
 			IdempotencyKey: "in-flight-grpc", Postings: []*ledgerv1.Posting{
 				{AccountId: 1, Currency: "USD", Amount: 100}, {AccountId: 2, Currency: "USD", Amount: -100}}})
 		f.grpc <- err
-	}()
-	// Both are waiting once two sessions are blocked by the test's transaction. The second waits in the row's lock
-	// queue behind the first, so it is blocked by the first, not by the test: count the whole chain.
+	}
+	for _, api := range apis {
+		go map[string]func(){"rest": rest, "grpc": grpcCall}[api]()
+	}
+	// They are all waiting once as many sessions are blocked by the test's transaction. The second waits in the row's
+	// lock queue behind the first, so it is blocked by the first, not by the test: count the whole chain.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var waiting int
@@ -345,7 +353,7 @@ func startInFlight(t *testing.T, grace string) inFlight {
 			SELECT count(*) FROM blocked`, holder).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
-		if waiting >= 2 {
+		if waiting >= len(apis) {
 			return f
 		}
 		if time.Now().After(deadline) {
@@ -410,6 +418,44 @@ func TestShutdownCutsOffWorkStillRunningAfterTheGrace(t *testing.T) {
 	}
 	if entries != 0 {
 		t.Fatalf("%d entries posted by requests that were cut off", entries)
+	}
+}
+
+// A call still running when the grace ends is cut off, and the exit says so, over gRPC alone too: REST's Shutdown
+// reports its own requests, and gRPC's are counted by grpcapi.Server.
+func TestAGRPCCallStillRunningAfterTheGraceIsCutOff(t *testing.T) {
+	f := startInFlight(t, "300ms", "grpc")
+	f.stop()
+	select {
+	case code := <-f.exit:
+		if code != 1 || !strings.Contains(f.logs.String(), `"calls":1`) {
+			t.Fatalf("exit %d, log %s; want 1 and one call cut off", code, f.logs.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("still running 20 s after the stop, with a 300 ms grace: %s", f.logs.String())
+	}
+	select {
+	case err := <-f.grpc:
+		if err == nil {
+			t.Errorf("posted after being cut off")
+		}
+	case <-time.After(10 * time.Second):
+		t.Errorf("no answer after the cut-off")
+	}
+}
+
+// A zero grace cuts off whatever is running, at once; a server running nothing has nothing to cut off, so its stop is
+// clean (found in the day-5 review: 40 of 40 such stops exited 1, logging calls cut off that didn't exist).
+func TestAnIdleStopWithNoGraceIsClean(t *testing.T) {
+	db := storetest.Migrated(t)
+	for i := range 40 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var logs syncBuffer
+		if code := serve(ctx, db, store.New(db), "127.0.0.1:0", "127.0.0.1:0", 0,
+			slog.New(slog.NewJSONHandler(&logs, nil)), nil); code != 0 {
+			t.Fatalf("stop %d exited %d: %s", i+1, code, logs.String())
+		}
 	}
 }
 

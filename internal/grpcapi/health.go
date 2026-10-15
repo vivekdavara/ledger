@@ -25,7 +25,7 @@ const readyTimeout = 2 * time.Second
 //
 // Watch and List are left unimplemented (UNIMPLEMENTED): Watch would mean polling the database for every watcher,
 // and grpc-go's client-side health checking treats UNIMPLEMENTED as "no health checking", not as unhealthy.
-func RegisterHealth(s *grpc.Server, ready func(context.Context) error, log *slog.Logger) {
+func RegisterHealth(s grpc.ServiceRegistrar, ready func(context.Context) error, log *slog.Logger) {
 	healthpb.RegisterHealthServer(s, &health{ready: ready, log: log})
 }
 

@@ -308,10 +308,17 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 	select {
 	case <-grpcStopped:
 	case <-shutdownCtx.Done():
-		log.Error("shut down grpc", "err", "calls still running after the grace period; cutting them off")
+		// The grace is over. GracefulStop may still be closing idle connections, which cuts nothing off: only calls
+		// still running make this a failed stop (found in the day-5 review: with a zero grace, every stop of an
+		// idle server exited 1, saying calls were cut off).
+		running := grpcSrv.Running()
 		grpcSrv.Stop()
 		<-grpcStopped
-		code = 1
+		if running > 0 {
+			log.Error("shut down grpc", "err", "calls still running after the grace period; cut them off",
+				"calls", running)
+			code = 1
+		}
 	}
 	if err := <-httpDone; !errors.Is(err, http.ErrServerClosed) && code == 0 {
 		log.Error("serve http", "err", err)

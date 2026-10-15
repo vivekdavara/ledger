@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vivekdavara/ledger/internal/apierr"
@@ -31,16 +32,35 @@ const maxMessage = 64 << 10
 // is sooner, and a call without one gets this.
 const MaxCallTime = 10 * time.Second
 
-// New returns a gRPC server with LedgerService and server reflection (for grpcurl) registered.
-func New(svc ledger.Service, log *slog.Logger) *grpc.Server { return newServer(svc, log, MaxCallTime) }
+// Server is a gRPC server that counts the calls it is running, so that a shutdown can tell whether its grace period
+// cut any off.
+type Server struct {
+	*grpc.Server
+	running atomic.Int64
+}
 
-func newServer(svc ledger.Service, log *slog.Logger, maxCall time.Duration) *grpc.Server {
+// Running is the number of calls, unary or streaming, the server is running now.
+func (s *Server) Running() int64 { return s.running.Load() }
+
+// New returns a gRPC server with LedgerService and server reflection (for grpcurl) registered.
+func New(svc ledger.Service, log *slog.Logger) *Server { return newServer(svc, log, MaxCallTime) }
+
+func newServer(svc ledger.Service, log *slog.Logger, maxCall time.Duration) *Server {
+	s := &Server{}
 	bound := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+		s.running.Add(1)
+		defer s.running.Add(-1)
 		ctx, cancel := context.WithTimeout(ctx, maxCall) // keeps the client's deadline if that is sooner
 		defer cancel()
 		return next(ctx, req)
 	}
-	s := grpc.NewServer(grpc.MaxRecvMsgSize(maxMessage), grpc.UnaryInterceptor(bound))
+	counted := func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+		s.running.Add(1)
+		defer s.running.Add(-1)
+		return next(srv, ss)
+	}
+	s.Server = grpc.NewServer(grpc.MaxRecvMsgSize(maxMessage), grpc.UnaryInterceptor(bound),
+		grpc.StreamInterceptor(counted))
 	ledgerv1.RegisterLedgerServiceServer(s, &service{svc: svc, log: log})
 	reflection.Register(s)
 	return s
