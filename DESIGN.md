@@ -906,7 +906,11 @@ listening on 127.0.0.1 alone: gRPC's default `dns` resolver never got to the IPv
   the client's CPU competes with the server's; the numbers compare designs on this machine and say nothing about a
   deployment's capacity.
 - **A restarted child reuses addresses that were free a moment before** (day 4). Another process could take a port
-  in between; the test would then fail waiting for readiness, never pass wrongly.
+  in between; the test would then fail, never pass wrongly. It happened once in CI on day 5 (1 run in 20: "address
+  already in use" on a restart). The ports came from listening on `:0`, so they were ephemeral, and any outgoing
+  connection, such as another test's to Postgres, could be given one between restarts. Since then (after v1.0.0)
+  `freeAddr` picks ports below the ephemeral ranges, which no connection is given, so only a process that binds that
+  very port could still take it.
 - **The books check sees only the run's own accounts** (day 4). `ledgerd reconcile`, which every failure run ends
   with, checks the whole ledger.
 - **Publisher order across a host crash** (day 4, from the review, not reproduced). A restarted publisher skips a

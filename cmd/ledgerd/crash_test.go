@@ -147,15 +147,38 @@ func (c *child) stop(t *testing.T) {
 
 // freeAddr returns a localhost address with a port that was free a moment ago. A restarted ledgerd listens on the
 // same addresses, so that its clients can reconnect.
+//
+// The port comes from below the kernels' ephemeral ranges (Linux 32768-60999, macOS 49152-65535). A port that
+// listening on :0 hands out is ephemeral, and between two restarts any outgoing connection, such as another test's
+// to Postgres, can be given it as its own: a restart in CI then failed with "address already in use" (day 5, 1 run
+// of 20). No connection is given a port from below the range, and the ports handed out here are never handed out
+// twice in one test run.
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	handedOut.Lock()
+	defer handedOut.Unlock()
+	for range 1000 {
+		port := 20000 + rand.IntN(12000)
+		if handedOut.ports[port] {
+			continue
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			continue // something listens there: another
+		}
+		ln.Close()
+		handedOut.ports[port] = true
+		return ln.Addr().String()
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	t.Fatal("no free port in 20000-31999 after 1000 tries")
+	return ""
 }
+
+// handedOut is the ports freeAddr has returned in this test run.
+var handedOut = struct {
+	sync.Mutex
+	ports map[int]bool
+}{ports: map[int]bool{}}
 
 // serveChild starts `ledgerd serve` and returns once it answers /readyz.
 func serveChild(t *testing.T, bin string, vars map[string]string) *child {

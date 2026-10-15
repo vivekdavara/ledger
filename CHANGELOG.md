@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Tests: the crash tests' ports come from below the ephemeral ranges, so another test's outgoing connection can't
+  take one between restarts (seen once in CI on release day: "address already in use").
+
 ## v1.0.0 (2026-10-15)
 
 The first release: a double-entry payments ledger with REST and gRPC APIs over PostgreSQL 14. The design is in
