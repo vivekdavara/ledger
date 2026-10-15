@@ -333,6 +333,15 @@ layer (`internal/grpcapi`, port 9103, `proto/ledger/v1/ledger.proto`) only trans
 | Read an account | `GET /v1/accounts/{id}` | `GetAccount` |
 | An account's history | `GET /v1/accounts/{id}/postings?after_version=&limit=` | `ListPostings` |
 | Post an entry | `POST /v1/entries` with an `Idempotency-Key` header | `PostEntry` (`idempotency_key` field) |
+| Ready for traffic? | `GET /readyz` | `grpc.health.v1.Health/Check` (day 5) |
+| Alive? | `GET /livez` | (HTTP only) |
+
+**Health (day 5).** The gRPC port carries the standard health service (`grpcapi.RegisterHealth`), answering as
+`/readyz` does: `SERVING` when the database answers within 2 s and its schema is at the binary's newest migration,
+`NOT_SERVING` otherwise, for the service `""` and for `ledger.v1.LedgerService`, and `NOT_FOUND` for any other name.
+The reason goes to the log, not the response. `Watch` and `List` are unimplemented: a watch would poll the database
+per watcher, and grpc-go's client-side health checking reads `UNIMPLEMENTED` as "no health checking". Liveness stays
+HTTP-only, and checks nothing, so a database outage doesn't get every instance restarted.
 
 **Amounts.** gRPC carries `int64` minor units, the service's own representation. REST carries decimal strings in
 the currency's major unit (`"20.00"`, `"-19.40"`, `"1500"` for JPY), read by `money.Parse` and written by

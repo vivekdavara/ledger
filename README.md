@@ -207,6 +207,14 @@ with amounts in minor units. Server reflection is on, and grpcurl is pinned in t
 go tool -modfile=tools/go.mod grpcurl -plaintext -d '{"id": 2}' localhost:9103 ledger.v1.LedgerService/GetAccount
 ```
 
+The gRPC port also answers the standard health check, as `/readyz` does: `SERVING` when `/readyz` would answer 200,
+`NOT_SERVING` when it would answer 503 (the reason goes to the log), so a gRPC client or a Kubernetes gRPC probe needs
+no HTTP:
+
+```bash
+go tool -modfile=tools/go.mod grpcurl -plaintext localhost:9103 grpc.health.v1.Health/Check
+```
+
 A failed call carries the same reason in a `google.rpc.ErrorInfo` (`INSUFFICIENT_FUNDS`, metadata `posting: 0`).
 The full error table, and why each status, is in DESIGN.md, "Errors". Keys are shared by the two APIs: in the hand
 check, an entry posted over REST came back as `"replayed": true` when the same key and postings, in another order,

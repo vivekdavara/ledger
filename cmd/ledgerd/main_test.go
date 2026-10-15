@@ -27,6 +27,7 @@ import (
 	"github.com/vivekdavara/ledger/internal/store/storetest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // syncBuffer is a bytes.Buffer that the server goroutine and the test can share.
@@ -198,6 +199,11 @@ func TestServeAnswersBothAPIsThenShutsDownCleanly(t *testing.T) {
 	got, err := ledgerv1.NewLedgerServiceClient(conn).GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: created.ID})
 	if err != nil || got.GetAccount().GetName() != "wallet:alice" {
 		t.Fatalf("read over gRPC: %v, %v", got, err)
+	}
+	// The gRPC port answers the standard health check as /readyz does.
+	health, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil || health.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		t.Fatalf("health check over gRPC: %v, %v", health, err)
 	}
 
 	if !strings.Contains(logs.String(), `"isolation":"serializable"}`) {

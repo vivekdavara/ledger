@@ -250,8 +250,9 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 	// Close would wait for them: TestShutdownCutsOffWorkStillRunningAfterTheGrace fails only with both removed.
 	base, cutOff := context.WithCancel(context.Background())
 	defer cutOff()
+	ready := func(ctx context.Context) error { return store.Ready(ctx, db) }
 	httpSrv := &http.Server{
-		Handler:           server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, svc, log),
+		Handler:           server.New(ready, svc, log),
 		ReadHeaderTimeout: 5 * time.Second, // a client that trickles headers can't hold a connection open
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -259,6 +260,7 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 		BaseContext:       func(net.Listener) context.Context { return base },
 	}
 	grpcSrv := grpcapi.New(svc, log)
+	grpcapi.RegisterHealth(grpcSrv, ready, log) // the same readiness as /readyz, on the gRPC port
 	httpLn, err := net.Listen("tcp", httpAddr)
 	if err != nil {
 		log.Error("listen", "addr", httpAddr, "err", err)
