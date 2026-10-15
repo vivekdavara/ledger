@@ -465,6 +465,31 @@ func TestRESTPagesPastVersion2To31(t *testing.T) {
 	}
 }
 
+// A cached answer from this API would be a stale balance or a stale error, so every answer says no-store: success,
+// refusal, health and the router's own. No test removed the header before the day-5 review.
+func TestEveryAnswerSaysNoStore(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	id := createAccount(t, h, "cash:bank", "asset", "USD")
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", fmt.Sprintf("/v1/accounts/%d", id), ""},
+		{"GET", fmt.Sprintf("/v1/accounts/%d/postings", id), ""},
+		{"POST", "/v1/accounts", `{"name":"wallet:alice","type":"liability","currency":"USD"}`},
+		{"GET", "/v1/accounts/999999", ""},
+		{"GET", "/v1/entries/999999", ""},
+		{"POST", "/v1/entries", `{}`}, // no Idempotency-Key
+		{"GET", "/livez", ""},
+		{"GET", "/readyz", ""},
+		{"GET", "/v1/no-such-route", ""},
+		{"DELETE", fmt.Sprintf("/v1/accounts/%d", id), ""},
+	} {
+		r := call(t, h, tc.method, tc.path, "", tc.body)
+		if got := r.header.Get("Cache-Control"); got != "no-store" {
+			t.Errorf("%s %s (%d): Cache-Control %q, want no-store", tc.method, tc.path, r.code, got)
+		}
+	}
+}
+
 func TestAReplayIsTheOriginalResponseByteForByte(t *testing.T) {
 	t.Parallel()
 	h := newAPI(t)

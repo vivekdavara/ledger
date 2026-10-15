@@ -615,6 +615,33 @@ func TestALostConnectionDuringDeliveryLosesNoEvent(t *testing.T) {
 	}
 }
 
+// cancelAfterFirstLine is a writer whose first write ends the delivery's context, as a delivery timeout would.
+type cancelAfterFirstLine struct {
+	cancel context.CancelFunc
+	lines  int
+}
+
+func (w *cancelAfterFirstLine) Write(p []byte) (int, error) {
+	w.lines++
+	w.cancel()
+	return len(p), nil
+}
+
+// JSONLines checks its context between events, and that check is all that bounds a delivery to it (DESIGN.md,
+// "Limitations"): a batch whose context ends partway stops after the event being written, with the context's error,
+// so the publisher leaves the batch unmarked. No test removed the check before the day-5 review.
+func TestJSONLinesStopsBetweenEventsWhenItsContextEnds(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &cancelAfterFirstLine{cancel: cancel}
+	events := []outbox.Event{{ID: 1, Type: outbox.EntryPosted, EntryID: 1}, {ID: 2, Type: outbox.EntryPosted, EntryID: 2},
+		{ID: 3, Type: outbox.EntryPosted, EntryID: 3}}
+	if err := (&outbox.JSONLines{W: w}).Deliver(ctx, events); !errors.Is(err, context.Canceled) || w.lines != 1 {
+		t.Fatalf("Deliver = %v after %d lines; want context.Canceled after 1", err, w.lines)
+	}
+}
+
 // A publisher killed partway through a line leaves it cut off in output that outlives it (a file it appends to, a
 // pipe kept open across restarts). The next process's first event is glued onto the fragment and lost to a consumer
 // reading lines, though marked published, unless that process starts on a new line (found in review on day 4).
