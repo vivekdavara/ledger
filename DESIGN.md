@@ -394,24 +394,34 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
   the accounts at the time, and its transaction rolls back. A client that retries after "insufficient funds" gets
   whatever the accounts say now. The effect still happens at most once per key. Stripe stores rejections too; that
   needs a second transaction per failure and was left out.
-- **Concurrent requests with one key:** each finds the key unused. If their entries share an account, the first to
-  lock it posts and the others fail on the locked row with `40001`; if not, the second to insert the key fails on
-  its primary key with `23505`. Either way they retry, find the key, and replay (or, for a different entry, are
-  refused). `TestConcurrentRetriesOfOneRequestPostOnce` makes twelve requests find the key unused before any
-  proceeds: one posts and eleven replay. `TestTwoEntriesRacingForOneKey` covers the `23505` path.
+- **Concurrent requests with one key:** each finds the key unused, and only one can commit it. Which way the others
+  lose depends on the level and on the accounts (corrected on day 5: this said `40001` for all of them, which is
+  `SERIALIZABLE`'s way only):
+  - Their entries share an account, at `SERIALIZABLE`: the first to lock it posts, and the others fail on the locked
+    row with `40001` once it commits.
+  - Their entries share an account, at `READ COMMITTED`: the others wait for the row, then lock it as the first left
+    it. A copy that can still afford the entry inserts it and fails on the key's primary key (`23505`); one that
+    can't is refused by its own check, and the key lookup after a rejection finds the first's entry (day 3).
+  - They share no account: the second to insert the key fails on its primary key (`23505`).
+  A `40001` or `23505` is retried, and the retry finds the key and replays (or, for a different entry, is refused).
+  `TestConcurrentRetriesOfOneRequestPostOnce` makes twelve requests find the key unused before any proceeds: one
+  posts and eleven replay, at both levels. `TestTwoEntriesRacingForOneKey` covers the `23505` path,
+  `TestConcurrentCopiesOfAPaymentOnlyOneCanAffordAllGetIt` the refused copies.
 - **Keys never expire yet.** A retention job (delete keys older than, say, 30 days) would bound the table; a retry
   after that would post again.
 
 ### Posting an entry, step by step
 
-`Store.PostEntry` validates the key and the entry (`Entry.Validate`), hashes the entry, then runs attempts:
+`Store.PostEntry` validates the key and the entry (`Entry.Validate`), hashes the entry, then runs attempts (updated
+on day 5 for what days 3 and 4 added: the two lookups after an attempt, and the snapshot at each level):
 
 1. Look up the key, outside any transaction. The same hash: load the entry and return it as a replay. A different
    hash: `ErrKeyReused`. A replay needs no transaction: the key commits with its entry and postings, and history is
    append-only.
 2. `BEGIN` at the store's isolation level: `READ COMMITTED` by default since day 3, or `SERIALIZABLE`.
 3. Lock the entry's accounts in id order with `FOR UPDATE`, and check what needs them, naming the posting at fault.
-   This first statement also fixes the transaction's snapshot. The checks:
+   At `SERIALIZABLE` this first statement also fixes the transaction's snapshot; at `READ COMMITTED` each statement
+   takes its own, and a locked row is read as its latest committed version. The checks:
    the account exists (`unknown_account`), is in the posting's currency (`currency_mismatch`), isn't overdrawn by it
    (`insufficient_funds`, the same rule as the `accounts_no_overdraft` CHECK, in `Account.Overdraws`), and keeps a
    balance the ledger can store (`balance_out_of_range`).
@@ -420,6 +430,9 @@ A client sends a key with every `PostEntry` and the same key when it retries; th
    take are already held.
 5. Insert the key.
 6. Commit: the deferred checks run here.
+7. If the service's own check refused the entry, look the key up once more before answering: a request with the same
+   key may have committed while this attempt waited for the accounts, and the money found missing may be the money
+   it moved. Its entry replays (a different entry is `idempotency_key_reused`); otherwise the refusal stands (day 3).
 
 When an attempt fails with `40001` (serialization failure), `40P01` (deadlock) or a unique violation on the key,
 the whole attempt is retried after a "full jitter" wait: uniform in [0, min(100 ms, 1 ms × 2^(n−1))), so
@@ -435,8 +448,10 @@ its own two wallets (25 transfers each, three runs), 215 to 324 attempts were re
 of attempts. With the lookup outside, 68 to 142 were retried and none ran out (`TestDisjointTransfersRetries`; the
 README has the runs). Day 3 found where the rest come from: the commit-time check reads the entries and postings tables
 whole while they are small, and their last index pages after that (and on small tables the account lock reads all
-of `accounts`); see "Why serializable aborts transfers that share nothing". After 10 attempts the result is `ErrConflict`
-(`conflict`, HTTP 409, gRPC `ABORTED`): safe to retry with the same key. Nothing else is retried; a lost
+of `accounts`); see "Why serializable aborts transfers that share nothing". After 10 attempts the key is looked up once
+more, since the last attempt may have lost the key or the accounts to a copy that committed: then that entry replays
+(day 4). Otherwise the result is `ErrConflict` (`conflict`, HTTP 409, gRPC `ABORTED`): nothing posted, and it is safe to
+retry with the same key. Nothing else is retried; a lost
 connection is reported as `unavailable` (503), and the client's retry with its key is what makes that safe.
 
 The service checks every rule before the database does, for the errors' sake; the database checks them all again.
@@ -522,7 +537,10 @@ transactional outbox), and a separate publisher delivers it.
   `account_version`) from them when it delivers, and the event is the same whenever that is. No payload is
   duplicated in the table.
 - **The publisher** (`internal/outbox`, `ledgerd publish`): one transaction per batch, at `READ COMMITTED` whatever
-  the session's default.
+  the session's default. At `REPEATABLE READ` or `SERIALIZABLE`, a claim that reached a row another publisher marked
+  and committed after the claim's snapshot would fail with `40001`; at `READ COMMITTED` it re-reads the row, finds it
+  published, and passes over it. That window is inside one statement, so no test stages it, and no test fails with
+  the level removed (found again by the day-5 review; the reconciliation's `READ ONLY` is the same kind of guard).
   1. `SELECT id, entry_id FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`: the
      oldest unpublished events, skipping any another publisher holds. A partial index over the unpublished rows
      keeps this cheap however many have been published.

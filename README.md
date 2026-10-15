@@ -54,9 +54,9 @@ balance is the sum of its postings, and the database maintains it, so it can't d
 |---|---|---|
 | An entry's postings sum to zero in each currency | `Entry.Validate` | deferred constraint trigger, at commit |
 | 2 to 64 postings, exactly as many as declared | `Entry.Validate` | `CHECK` + the commit-time trigger |
-| A posting's currency is its account's | (needs the account) | composite foreign key `(account_id, currency)` |
+| A posting's currency is its account's | `checkAgainstAccounts`, under the accounts' row locks | composite foreign key `(account_id, currency)` |
 | A balance is the sum of its postings, with a gapless version chain | (the database does it) | `BEFORE` and `AFTER INSERT` triggers on postings |
-| A protected account never goes below zero | (day 2) | `CHECK` evaluated inside the row-locked update |
+| A protected account never goes below zero | `checkAgainstAccounts` (`Account.Overdraws`), under the row locks | `CHECK` evaluated inside the row-locked update |
 | History is append-only | no code path changes it | triggers reject `UPDATE`, `DELETE`, `TRUNCATE` |
 | A balance changes only through postings | no code path changes it | guard trigger on accounts |
 
@@ -110,8 +110,10 @@ LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./
 ```
 
 `publish` delivers the outbox's events (one per entry, written in the entry's own transaction) as JSON lines on
-stdout, at least once each, until SIGTERM, so a consumer dedupes by `id`. The first line from the hand check, on the
-`ledger` database after migration 0009 backfilled its three entries' events:
+stdout, at least once each, until SIGTERM, so a consumer dedupes by `id`. Its output starts with an empty line, which
+ends a line a killed predecessor may have left cut off in the same file or pipe (day 4), so a consumer skips empty
+lines. The first event from the hand check, on the `ledger` database after migration 0009 backfilled its three
+entries' events:
 
 ```json
 {"id":1,"type":"entry_posted","entry_id":1,"description":"Alice tops up $50","posted_at":"2026-10-12T11:24:20.435749-04:00","postings":[{"posting_id":1,"account_id":1,"currency":"USD","amount":5000,"balance_after":5000,"account_version":1},{"posting_id":2,"account_id":2,"currency":"USD","amount":-5000,"balance_after":-5000,"account_version":1}]}
@@ -159,8 +161,8 @@ go build -tags faults -o bin/ledgerd-faults ./cmd/ledgerd
 ```
 
 `LEDGER_FAULTS=store.after-commit:3 bin/ledgerd-faults serve` kills itself with `SIGKILL` just after its third
-commit; `store.after-commit:5%` does it with probability 5% at each one. A normal build refuses to start with
-`LEDGER_FAULTS` set. DESIGN.md, "Load and failure injection (day 4)", explains the points and the tests.
+commit; `store.after-commit:5%` does it with probability 5% at each one. A normal build refuses to start with a spec in
+`LEDGER_FAULTS` (a value of only blanks arms nothing and is ignored). DESIGN.md, "Load and failure injection (day 4)", explains the points and the tests.
 
 ## The API
 
@@ -293,7 +295,9 @@ the concurrency tests run at both isolation levels), all green locally and in CI
   first's rows without waiting; one publisher keeping each account's versions in order under six concurrent posters,
   at both levels, with the stream rebuilding every balance; `Run`'s backoff and its cap; a stop during a delivery
   that lets the batch finish; a connection lost during a delivery; an error that isn't storable as it is; a write
-  cut off mid-line; JSON lines. Each mechanism was removed once to see its test fail.
+  cut off mid-line; JSON lines; a delivery whose context ends stops between events (day 5). Each mechanism was
+  removed once to see its test fail, except the forced `READ COMMITTED` of a publisher's transaction, which no test
+  can stage (DESIGN.md, "Outbox (day 3)").
 - `cmd/ledgerd`: the real binary's `run`: migrations, an account created over REST and read back over gRPC from
   real ports, a clean shutdown of both, a taken port failing startup and releasing the other port, in-flight work
   finishing within the shutdown grace and cut off after it, and 50 stops at startup all exiting 0. Day 3: an unknown

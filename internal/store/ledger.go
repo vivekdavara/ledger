@@ -406,8 +406,9 @@ func (s *Store) postOnce(ctx context.Context, key string, hash []byte, e ledger.
 
 	s.at("begin", attempt)
 
-	// 1. Lock the accounts in id order and check what needs them, naming the posting at fault. This first statement
-	// also fixes the transaction's snapshot.
+	// 1. Lock the accounts in id order and check what needs them, naming the posting at fault. At SERIALIZABLE this
+	// first statement also fixes the transaction's snapshot; at READ COMMITTED each statement takes its own, and the
+	// rows it locks are read as their latest committed version.
 	ids := make([]int64, len(e.Postings))
 	for i, p := range e.Postings {
 		ids[i] = p.AccountID
