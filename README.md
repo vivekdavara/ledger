@@ -7,15 +7,27 @@ to zero in each currency, so money is moved, never created or destroyed. The rul
 validator, for clear errors, and by the database at commit, so no bug, second writer or hand-typed `psql` session
 can break it.
 
-> **Status: day 4 of 5.** Day 1: the money type, the entry validator, the schema with its database-enforced
-> invariants, the migration runner, health endpoints and CI. Day 2: the API, REST on :8103 and gRPC on :9103 over
-> one service: accounts, balances, paged history, and posting entries atomically with retries and idempotency keys.
-> Day 3: the two isolation levels compared under contention (`READ COMMITTED` is now the default), a property test
-> of random concurrent transfers, a transactional outbox with a publisher (`ledgerd publish`), and a reconciliation
-> job (`ledgerd reconcile`). Day 4: a load generator over either API that checks the books against its answers
-> (`ledgerload`, `make load`), and crash tests that kill a real `ledgerd` with `SIGKILL` (at crash points built into
-> a test-only binary, and at random) and show that every transfer still posts exactly once and no event is lost.
-> Next: the release (day 5). [DESIGN.md](DESIGN.md) is the full design.
+> **v1.0.0** (2026-10-15). [CHANGELOG.md](CHANGELOG.md) says what's in it, day by day; [DESIGN.md](DESIGN.md) is
+> the full design; [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an interviewer is likely to ask, with answers
+> that point at the code.
+
+## Why
+
+A payments ledger has to answer two questions exactly, at any moment: how much each account holds, and why. This
+one is built so the answers can't drift, whatever its clients do:
+
+- **Money is conserved.** Every entry's postings sum to zero in each currency, checked by the database at commit as
+  well as by the service.
+- **Every balance is explained.** The database derives each balance from its postings, numbers each account's
+  history without gaps, and refuses to change history.
+- **A retry moves money once.** Every request to post carries an idempotency key, stored in the entry's own
+  transaction.
+  Crash tests kill the server around its commits, and every transfer still posts exactly once.
+- **Nothing is lost downstream.** An outbox written in the entry's transaction feeds a publisher that delivers every
+  event at least once.
+- **It can be checked.** `ledgerd reconcile` recomputes the books from the postings in one snapshot.
+
+"Results" says what each of these costs, measured.
 
 ## Architecture
 
@@ -47,6 +59,25 @@ flowchart LR
 
 Amounts are `int64` minor units (cents, yen, fils); positive is a debit, negative a credit. An account's stored
 balance is the sum of its postings, and the database maintains it, so it can't drift.
+
+## Results at a glance
+
+v1.0.0's own numbers, from the release check (`scripts/release_check.sh` at `e5e4ee4`, the tag's code): Apple M3,
+PostgreSQL 14.20 at default settings, client, server and database on one machine, on power, nothing else running.
+Medians of 3 runs, or the range of the 3. "Results" has each one's first measurement, its full table and the
+comparison.
+
+| What | Result | Command |
+|---|---|---|
+| Posting one 2-posting entry through the service, one client | 467 µs (8 postings 1,072 µs, 64 postings 5,039 µs) | `make bench` |
+| Of which the database's commit-time check | 60 µs (1.8 ms at 64 postings) | `make bench` |
+| Answering a retry (a replay) | 86 µs | `make bench` |
+| One client over the API | p50 560 µs over REST, 557 µs over gRPC | `make load` |
+| Transfers/s, 16 clients at read committed: disjoint wallets, one hot account | REST 5,622 and 2,051; gRPC 5,595 and 2,021; in process 6,755 and 2,173 | `make load`, `make bench-contention` |
+| The same at serializable | REST 3,711 and 1,562; gRPC 3,640 and 1,519; in process 4,367 and 1,756; 39–72 of 3,000 hot-account transfers gave up | the same |
+| Transfers posted exactly once while `ledgerd` is killed | 600 of 600 in each of the 4 runs, with 9–12 crash-point deaths and 4–6 kills from outside per run | the crash tests |
+| One publisher draining the outbox | 103,339–108,696 events/s at batch 1,000 | `make bench-outbox` |
+| One reconciliation of 200,000 postings, all ten checks | 724–741 ms | `make bench-outbox` |
 
 ## The rules, and what enforces them
 
@@ -161,8 +192,9 @@ go build -tags faults -o bin/ledgerd-faults ./cmd/ledgerd
 ```
 
 `LEDGER_FAULTS=store.after-commit:3 bin/ledgerd-faults serve` kills itself with `SIGKILL` just after its third
-commit; `store.after-commit:5%` does it with probability 5% at each one. A normal build refuses to start with a spec in
-`LEDGER_FAULTS` (a value of only blanks arms nothing and is ignored). DESIGN.md, "Load and failure injection (day 4)", explains the points and the tests.
+commit; `store.after-commit:5%` does it with probability 5% at each one. A normal build refuses to start with a spec
+in `LEDGER_FAULTS` (a value of only blanks arms nothing and is ignored). DESIGN.md, "Load and failure injection
+(day 4)", explains the points and the tests.
 
 ## The API
 
@@ -232,10 +264,57 @@ were sent over gRPC.
 
 `make proto` lints the proto file and regenerates `internal/gen`; the generated code is committed.
 
+## Design decisions
+
+Each is argued in DESIGN.md, and the numbers are under "Results".
+
+1. **The database enforces the rules; the service explains them.** Go validates every entry first, for errors that
+   name the posting at fault. The database checks the same rules again with constraints and triggers, so a bug in
+   the service, a second writer or a hand-typed `psql` session can't unbalance the books. The commit-time check
+   costs 54 µs of a 302 µs posting (day 1).
+2. **The database keeps the balances.** Posting triggers lock the account's row, compute the new balance and the
+   next version, and write them. A read is one row, the overdraft rule runs under the lock, and the versions order
+   each account's history. A balance summed on read, or kept by the service, could drift from its postings.
+3. **Integers for money.** `int64` minor units with exact parsing; REST carries decimal strings, so no client handles
+   a float and a balance past 2^53 stays exact in JavaScript.
+4. **Idempotency keys commit with their entry, and are looked up before the transaction.** A key and its entry
+   commit together or not at all, so a retry can't post twice. The lookup runs outside the transaction because,
+   inside a `SERIALIZABLE` one, its predicate lock made unrelated transfers retry (day-2 review).
+5. **`READ COMMITTED` with row locks, not `SERIALIZABLE`.** Both keep every rule, because an attempt decides only on
+   rows it has locked or written. Under contention `READ COMMITTED` was 1.2 to 1.7 times faster and never gave up;
+   `SERIALIZABLE` aborted even transfers that shared nothing (day 3).
+6. **An outbox written by a trigger.** An entry's event commits with it, whoever writes the entry, so there is no
+   dual write to get wrong. The publisher delivers at least once, and consumers dedupe by `id`.
+7. **Reconciliation reports and never repairs.** A difference means a bug or a hand edit; the report says where, and
+   a person decides what the books should say.
+8. **Crash points that compile away.** Failure injection lives behind a build tag; a release binary has none and
+   refuses a crash-point spec in `LEDGER_FAULTS`.
+
+## Limitations
+
+The main ones; DESIGN.md, "Limitations", has every one, with its reason.
+
+- **A hot account is one queue.** Every posting to it takes its row lock, so one account topped out near 2,100
+  transfers a second here. Splitting it into sub-accounts is the known fix, not built.
+- **One database.** No sharding, so no entries across shards.
+- **No authentication or tenants.** Anyone who reaches the ports can post, and keys are one namespace for all
+  clients.
+- **Keys and published events are kept forever.** There is no retention job yet.
+- **No database roles.** The service should connect as a role that owns nothing: the tables' owner can switch the
+  triggers off.
+- **Delivery is at least once,** and in each account's order only with one publisher and for entries posted
+  through the service.
+- **Reconciliation reads everything:** 724–741 ms per 200,000 postings. A large ledger would reconcile from a
+  checkpoint.
+- **The crash tests kill `ledgerd`, not Postgres or the machine,** and the load numbers are one laptop's, with the
+  client and the server sharing its cores.
+
 ## Tests
 
-193 test functions (159 at the end of day 3, 122 at the end of day 2; several table-driven or property-based, and
-the concurrency tests run at both isolation levels), all green locally and in CI:
+206 test functions (193 at the end of day 4, 159 at the end of day 3, 122 at the end of day 2; several table-driven or
+property-based, and the concurrency tests run at both isolation levels), all green locally and in CI. `make check`
+runs them two packages at a time: each test has a schema and a connection pool of its own, and with every package at
+once the suite reached Postgres's 100 connections (day 5).
 
 - `internal/money`: exact parsing and formatting (`"12.345"` in USD is an error, not a rounding), a round-trip
   property over every `int64`, overflow-checked addition against `math/big`, and a fuzz target.
@@ -324,6 +403,15 @@ the concurrency tests run at both isolation levels), all green locally and in CI
   transfers are sent; settled transfers aren't timed; conflicts are given up or sent again; exit 3 on a mismatch;
   `LEDGER_FAULTS` refused by a release `ledgerd`; crash percentages; each publisher starts on a new line; children
   don't inherit `LEDGER_` settings.
+- Day 5, the release: `ledgerd version` needs no configuration, and a real build names its commit (checked against
+  `git rev-parse HEAD`); the gRPC health check is `SERVING` on a current schema, `NOT_SERVING` before migration (the
+  reason in the log) and within its 2 s when the check hangs, and `NOT_FOUND` for an unknown service; `ledgerload`
+  stops before sending anything to a ledger that isn't ready, over either API; an entry reads back exactly as posting
+  it answered, byte for byte over REST and field for field over gRPC, with `not_found` and `invalid_argument` the
+  same over both. From the review (each fails without its fix): 40 idle stops with a zero grace all exit 0, while a
+  gRPC call alone still running at the end of a grace is cut off with exit 1; REST pages past version 2^31; a
+  missing key is `invalid_argument` over both APIs; `serve`'s settings are refused before the database is touched;
+  `JSONLines` stops between events when its context ends; every REST answer says `Cache-Control: no-store`.
 
 ## Results
 
@@ -475,7 +563,7 @@ For the first two columns, run it in a worktree at `f581a56` and at `4eed7ca`.
 |---|---|
 | One publisher draining 10,000 events into a JSON encoder, batch 100 (`BenchmarkPublish`) | 63,963–71,266 events/s |
 | The same, batch 1,000 | 107,173–107,830 events/s |
-| One reconciliation of 100,000 entries, 200,000 postings, 200,000 accounts (`BenchmarkReconcile`) | 546–571 ms |
+| One reconciliation of 100,000 entries, 200,000 postings, 200,000 accounts (`BenchmarkReconcile`) | 546–571 ms (before the day-3 review's fixes; 724–741 ms at v1.0.0, under "Release check") |
 
 ```bash
 make bench-outbox
@@ -551,7 +639,103 @@ delivered at least once, each account's in version order after dedupe, no line c
 Throughput under crashes is not a result: it is set by how often the test kills `ledgerd` (270 to 495 transfers a
 second here, with each restart taking its share).
 
-## Review of day 4
+### Release check
+
+```bash
+scripts/release_check.sh
+```
+
+Run at `e5e4ee4`, the code v1.0.0 is tagged with (only docs changed after it), 10:43 to 10:54 on 2026-10-15: Apple M3,
+PostgreSQL 14.20 at default settings, on power, nothing else running. Every step passed:
+
+- `make check` (27 s), then `make check` on a clean `git archive` of the commit (32 s), so the release needs nothing
+  that isn't committed.
+- `make bench`, one round of `-count 3` (medians of 3; the day sections have medians of 6):
+
+  | Postings | Plain insert, check on | Check off | Through the service | Replay |
+  |---|---|---|---|---|
+  | 2 | 328 µs | 268 µs | 467 µs | 86 µs |
+  | 8 | 817 µs | 661 µs | 1,072 µs | 89 µs |
+  | 64 | 4,773 µs | 2,935 µs | 5,039 µs | 123 µs |
+
+  Day 3's last build (`ff899c7`): 321, 818 and 4,439 µs check on; 268 µs check off at 2 postings; 462, 1,243 and
+  4,979 µs through the service; replays 81–82, 85–86 and 118–119 µs. Every median is within 8% of those, except the
+  service at 8 postings, 14% below (runs of 974–1,143 µs, against day 3's 1,086–1,250).
+- `make bench-contention`, padded ledger, transfers/s at read committed and serializable: disjoint 6,755 and 4,367,
+  random 6,836 and 4,321, hot 2,173 and 1,756; read committed never retried, serializable retried 0.47, 0.71 and 0.83
+  times a transfer and gave up on 0, 0–1 and 71–72 of 3,000. Small tables, serializable: 117–126 of 3,000 disjoint
+  transfers gave up. Day 3 (on power): 6,231 / 6,370 / 2,113 and 4,042 / 3,787 / 1,755; day 4 (on battery): 6,904 /
+  6,673 / 2,140 and 4,165 / 4,094 / 1,756.
+- `make load`, transfers/s over REST and gRPC (in process above):
+
+  | | Read committed: REST | gRPC | Serializable: REST | gRPC (gave up) |
+  |---|---|---|---|---|
+  | disjoint | 5,622 | 5,595 | 3,711 | 3,640 (0) |
+  | random | 5,684 | 5,457 | 3,780 | 3,478 (0–1) |
+  | hot | 2,051 | 2,021 | 1,562 (44–51) | 1,519 (39–54) |
+
+  One client: p50 560 µs over REST and 557 µs over gRPC. The books agreed after all 42 runs, and `ledgerd reconcile`
+  was clean after each. Day 4's gap between gRPC and REST at serializable (gRPC 2,388 a second on random wallets,
+  with a run at 2,261 and one at 3,343) didn't appear in this run, which was on power where day 4's was on battery:
+  gRPC's three random runs were 3,569, 3,478 and 3,266. Not investigated further.
+- `make bench-outbox`: one publisher 58,326–70,971 events/s at batch 100 and 103,339–108,696 at batch 1,000 (day 3:
+  63,963–71,266 and 107,173–107,830). **One reconciliation of 200,000 postings: 724–741 ms, against day 3's 546–571.**
+  Day 3 measured it at `38041c6`, before its own review added two checks (`posting_currencies`, `orphan_rows`) and
+  made the sums `numeric` so they can't overflow (`7f00bb4`); the 546–571 ms was the old reconciliation's, and the
+  README cited it as current until this check.
+- The crash tests, once: over REST at read committed 14 starts, 9 crashes at a point and 4 kills from outside; REST
+  serializable 15, 10 and 4; gRPC read committed 18, 12 and 5; gRPC serializable 19, 12 and 6. Every one of the 600
+  transfers posted exactly once in each. The publisher: 19 processes, 14 killed after a delivery and 4 from outside;
+  3,614 lines for the 2,000 events, none cut off.
+
+## What the reviews found
+
+After each day's core was built, review agents read it, each in its own git worktree, reviewing a fixed commit, with
+correctness questions (do the rules hold on every write path, in every failure?). They reported only what they had
+reproduced; I reproduced each finding again before fixing it, and each fix has a test that fails without it. Their
+lists of tests that still passed with the mechanism removed drove most of the new tests each day.
+
+### Review of day 5 (the release)
+
+One agent read the whole repo at `1b585b5` (16 minutes), for rules that held when written but not after later days,
+and for docs that no longer match the code.
+
+1. **A stop with a zero grace always failed.** With `LEDGER_SHUTDOWN_GRACE=0s`, 40 of 40 stops of an idle server
+   exited 1, logging gRPC calls cut off that didn't exist: the expired deadline won a `select` against
+   `GracefulStop`, which takes a moment even with nothing to wait for. The gRPC server now counts its running calls,
+   and a stop fails only if any were cut off. The old cut-off test couldn't have caught a gRPC-side bug, since its
+   REST request alone made it exit 1, so a test with a gRPC call alone was added.
+2. **REST couldn't page past version 2^31.** `after_version` was parsed as an `int32`, so REST would have refused its
+   own `next_after_version` once an account passed 2,147,483,647 postings (about 12 days for a hot account at the
+   rate measured here), while gRPC answered.
+3. **The APIs gave different reasons for a missing idempotency key:** `malformed_request` over REST, `invalid_argument`
+   over gRPC (which can't tell a missing field from an empty one). Both say `invalid_argument` now, and the cross-API
+   test has the case.
+4. **A typo in `serve`'s settings migrated the database first:** `LEDGER_ISOLATION=bogus` applied the migrations,
+   then exited 1. The settings are checked before the database is touched.
+5. **Six docs errors**, all fixed. DESIGN.md said concurrent copies of a request that share an account fail with
+   `40001`, which is true at `SERIALIZABLE` only: at `READ COMMITTED` they wait for the row, then fail on the key or
+   are refused and replay. "Posting an entry, step by step" missed the two key lookups days 3 and 4 added. The
+   README's `publish` example didn't say the output starts with an empty line, its rules table still said "(day 2)",
+   its outbox tests claimed every mechanism was tested, and DESIGN.md's error table put a missing key under
+   `malformed_request`.
+
+Tests that still passed with their mechanism removed: `JSONLines`'s check of its context between events, and every
+answer's `Cache-Control: no-store`; each now has a test that fails without it. Two more have no test: the publisher's
+forced `READ COMMITTED`, whose race is inside one statement (DESIGN.md, "Outbox (day 3)"), and the reconciliation's
+`READ ONLY`, which guards against a write no code path makes. A test the review saw fail once
+(`TestALostConnectionDuringDeliveryLosesNoEvent`, "published 0") passed 300 runs in a row here; it had the window
+day 4 closed in its sibling test, and now polls the same way.
+
+Found while releasing:
+
+- `make check` failed once with "too many clients" (SQLSTATE 53300). Every test has a schema and a pool of its own,
+  and with every package at once the suite reached Postgres's 100 connections; it now runs two packages at a time
+  (sampled peak 82 → 56–57).
+- The release check found the README's reconciliation time stale: 546–571 ms was measured before day 3's review
+  added two checks and `numeric` sums, and v1.0.0's is 724–741 ms ("Release check").
+
+### Review of day 4
 
 Once the load generator and the crash tests were in (`1c8e796`), two review agents read them, one the crash points
 and crash tests, one the load generator, each in its own git worktree (13 minutes each). They reported only what they
@@ -589,7 +773,7 @@ percentages (5% firing on every hit), the release build's refusal through `ledge
 gRPC's code fallback, retries changing later transfers, settled transfers being timed, retrying after a conflict, and
 the exit code 3. Judgement calls are in DESIGN.md's "Limitations".
 
-## Review of day 3
+### Review of day 3
 
 Once the day's work was in (`ec83ff1`), two review agents read it: one the isolation levels and the
 reconciliation, one the outbox and the new subcommands, each in its own git worktree and test schemas. They
@@ -621,7 +805,7 @@ committed snapshot; the backoff's cap. Running the suite for the fixes also turn
 a delivery and its mark left an event to be sent again, and `Run` now lets the batch in flight finish. Judgement
 calls are in DESIGN.md's "Limitations".
 
-## Review of day 2
+### Review of day 2
 
 After the API was built, two review agents read it, one for the store's posting logic and one for the REST and gRPC
 layers, each in its own git worktree and test schemas. They reported only what they had reproduced; I reproduced
@@ -653,7 +837,7 @@ message cap, and a listener left open on a failed start. Each now has a test tha
 removing the mechanism. Judgement calls that stayed as they are, with the reason, are in DESIGN.md's
 "Limitations".
 
-## Review of day 1
+### Review of day 1
 
 After the core was built, two review agents read it, one for the SQL and one for the Go, and reproduced what they
 suspected. I re-ran every finding myself before fixing it. Five were real; each fix has a test that fails without
@@ -693,10 +877,10 @@ internal/apierr/          the one table from errors to reasons, HTTP statuses an
 internal/faults/          crash points: nothing in a normal build, SIGKILL in a -tags faults build
 internal/load/            the load generator: REST and gRPC clients, outcomes, Run and its books check
 internal/server/          HTTP: health endpoints and the REST API (api.go)
-internal/grpcapi/         gRPC: LedgerService
+internal/grpcapi/         gRPC: LedgerService, the health service, the running-call count
 internal/gen/             generated from proto/ by make proto (committed)
 tools/                    the code generators and grpcurl, in their own module
-scripts/                  dev-db.sh (the local databases), load.sh (make load)
+scripts/                  dev-db.sh (the local databases), load.sh (make load), release_check.sh (the release check)
 ```
 
 ## License
