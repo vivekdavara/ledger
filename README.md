@@ -115,7 +115,8 @@ LEDGER_DATABASE_URL="postgres://localhost:5432/ledger?sslmode=disable" go run ./
 
 `serve` applies any pending migrations (so does `ledgerd migrate`, which then exits) and listens on
 `LEDGER_HTTP_ADDR` (REST and health, default `:8103`) and `LEDGER_GRPC_ADDR` (default `:9103`). On SIGTERM both
-stop accepting, give in-flight requests 10 s, then cut what's left.
+stop accepting, give in-flight requests 10 s (`LEDGER_SHUTDOWN_GRACE`), then cut what's left; the exit is 1 only if
+something was cut off. A connection that hasn't sent a request can hold a stop for up to 5 s, net/http's rule.
 
 ```bash
 curl -s localhost:8103/livez

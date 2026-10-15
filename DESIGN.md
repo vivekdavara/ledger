@@ -905,6 +905,12 @@ listening on 127.0.0.1 alone: gRPC's default `dns` resolver never got to the IPv
 - **Load numbers are one machine's** (day 4). The load generator, `ledgerd` and Postgres share an 8-core laptop, so
   the client's CPU competes with the server's; the numbers compare designs on this machine and say nothing about a
   deployment's capacity.
+- **A stop can wait 5 s for a connection that sent nothing** (found after v1.0.0, while finding where a test's
+  random 5 s went). net/http's `Shutdown` counts a connection that hasn't sent a request yet as active for its first
+  5 s, so a client holding a spare connection open (a load balancer, or a Go client whose extra dial lost a race)
+  keeps a stop waiting that long. With a grace under 5 s that stop said requests were cut off and exited 1, though
+  none was running; `serve` now counts its running REST requests, as `grpcapi.Server` counts calls, and only those
+  make a failed stop (`TestAConnectionThatSentNothingDoesNotFailAStop`). The wait itself remains, within the grace.
 - **A restarted child reuses addresses that were free a moment before** (day 4). Another process could take a port
   in between; the test would then fail, never pass wrongly. It happened once in CI on day 5 (1 run in 20: "address
   already in use" on a restart). The ports came from listening on `:0`, so they were ephemeral, and any outgoing

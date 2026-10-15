@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `ledgerd serve`: a stop with a grace under 5 s no longer exits 1 because a client held a connection open without
+  sending a request. net/http's `Shutdown` counts such a connection as active for its first 5 s; `serve` now counts
+  its running REST requests, and only those make a failed stop, as for gRPC.
 - Tests: the crash tests' ports come from below the ephemeral ranges, so another test's outgoing connection can't
   take one between restarts (seen once in CI on release day: "address already in use").
 

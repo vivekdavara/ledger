@@ -35,6 +35,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -255,8 +256,14 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 	base, cutOff := context.WithCancel(context.Background())
 	defer cutOff()
 	ready := func(ctx context.Context) error { return store.Ready(ctx, db) }
+	var requests atomic.Int64 // REST requests running now: what a stop at the end of the grace cuts off
+	api := server.New(ready, svc, log)
 	httpSrv := &http.Server{
-		Handler:           server.New(ready, svc, log),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			defer requests.Add(-1)
+			api.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 5 * time.Second, // a client that trickles headers can't hold a connection open
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -304,10 +311,17 @@ func serve(ctx context.Context, db *pgxpool.Pool, svc *store.Store, httpAddr, gr
 	grpcStopped := make(chan struct{})
 	go func() { grpcSrv.GracefulStop(); close(grpcStopped) }()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shut down http", "err", "requests still running after the grace period; cutting them off")
+		// The grace is over. Shutdown also waits, for up to its first 5 s, on a connection that hasn't sent a request
+		// yet (net/http's rule), which cuts nothing off: only requests still running make this a failed stop (found
+		// on day 5, after the release: with a grace under 5 s, one such connection made a stop exit 1).
+		running := requests.Load()
 		cutOff()
 		_ = httpSrv.Close()
-		code = 1
+		if running > 0 {
+			log.Error("shut down http", "err", "requests still running after the grace period; cut them off",
+				"requests", running)
+			code = 1
+		}
 	}
 	select {
 	case <-grpcStopped:

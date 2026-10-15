@@ -434,26 +434,65 @@ func TestShutdownCutsOffWorkStillRunningAfterTheGrace(t *testing.T) {
 	}
 }
 
-// A call still running when the grace ends is cut off, and the exit says so, over gRPC alone too: REST's Shutdown
-// reports its own requests, and gRPC's are counted by grpcapi.Server.
-func TestAGRPCCallStillRunningAfterTheGraceIsCutOff(t *testing.T) {
-	f := startInFlight(t, "300ms", "grpc")
-	f.stop()
-	select {
-	case code := <-f.exit:
-		if code != 1 || !strings.Contains(f.logs.String(), `"calls":1`) {
-			t.Fatalf("exit %d, log %s; want 1 and one call cut off", code, f.logs.String())
+// Work still running when the grace ends is cut off, and the exit says so, over each API alone: serve counts the
+// REST requests it is running, and grpcapi.Server its calls.
+func TestWorkStillRunningAfterTheGraceIsCutOffOverEachAPI(t *testing.T) {
+	for api, counted := range map[string]string{"rest": `"requests":1`, "grpc": `"calls":1`} {
+		f := startInFlight(t, "300ms", api)
+		f.stop()
+		select {
+		case code := <-f.exit:
+			if code != 1 || !strings.Contains(f.logs.String(), counted) {
+				t.Fatalf("%s: exit %d, log %s; want 1 and %s", api, code, f.logs.String(), counted)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%s: still running 20 s after the stop, with a 300 ms grace: %s", api, f.logs.String())
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("still running 20 s after the stop, with a 300 ms grace: %s", f.logs.String())
+		select {
+		case err := <-map[string]chan error{"rest": f.rest, "grpc": f.grpc}[api]:
+			if err == nil {
+				t.Errorf("%s: posted after being cut off", api)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("%s: no answer after the cut-off", api)
+		}
 	}
+}
+
+// net/http's Shutdown counts a connection that hasn't sent a request yet as active for its first 5 s, so a stop with
+// a shorter grace and such a connection open (a load balancer's spare, or a Go client's dial that lost a race) said
+// requests were cut off when none was running, and exited 1. Found on day 5, after the release, while finding where a
+// test's random 5 s went.
+func TestAConnectionThatSentNothingDoesNotFailAStop(t *testing.T) {
+	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
+		"LEDGER_HTTP_ADDR": "127.0.0.1:0", "LEDGER_GRPC_ADDR": "127.0.0.1:0", "LEDGER_SHUTDOWN_GRACE": "300ms"}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	var logs syncBuffer
+	listening := make(chan addrs, 1)
+	exit := make(chan int, 1)
+	go func() { exit <- run(ctx, []string{"serve"}, env(vars), io.Discard, &logs, listening) }()
+	var at addrs
 	select {
-	case err := <-f.grpc:
-		if err == nil {
-			t.Errorf("posted after being cut off")
+	case at = <-listening:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("not listening: %s", logs.String())
+	}
+	quiet, err := net.Dial("tcp", at.HTTP) // connected, and never sends a byte
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer quiet.Close()
+	time.Sleep(100 * time.Millisecond) // the server has accepted it
+	start := time.Now()
+	stop()
+	select {
+	case code := <-exit:
+		if code != 0 || strings.Contains(logs.String(), "still running") {
+			t.Fatalf("exit %d after %v, log %s; want 0 and no requests cut off", code, time.Since(start), logs.String())
 		}
-	case <-time.After(10 * time.Second):
-		t.Errorf("no answer after the cut-off")
+	case <-time.After(15 * time.Second):
+		t.Fatalf("still running 15 s after the stop: %s", logs.String())
 	}
 }
 
