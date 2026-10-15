@@ -14,8 +14,11 @@ lint:
 
 # The faults build (DESIGN.md, "Load and failure injection (day 4)") is tested on its own: its points crash the
 # process, so only internal/faults's own tests, which watch a child process crash, run with the tag.
+# -p 2: at most two packages' tests at once. Each test has a schema and a pool of its own, and with every package at
+# once (8 on an 8-core Mac) the suite reached Postgres's 100 connections: up to 82 sampled, and one run failed with
+# "too many clients" (SQLSTATE 53300). With -p 2: 56-57 sampled, in 24-27 s instead of 19-20 (day 5).
 test:
-	go test -race -count=1 -timeout 4m ./...
+	go test -race -count=1 -timeout 4m -p 2 ./...
 	go test -race -count=1 -tags faults ./internal/faults
 
 # README, "Results": the commit-time check's cost (BenchmarkPostEntry) and the service's
