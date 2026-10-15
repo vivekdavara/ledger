@@ -333,12 +333,13 @@ layer (`internal/grpcapi`, port 9103, `proto/ledger/v1/ledger.proto`) only trans
 | Read an account | `GET /v1/accounts/{id}` | `GetAccount` |
 | An account's history | `GET /v1/accounts/{id}/postings?after_version=&limit=` | `ListPostings` |
 | Post an entry | `POST /v1/entries` with an `Idempotency-Key` header | `PostEntry` (`idempotency_key` field) |
-| Read an entry (day 5) | `GET /v1/entries/{id}` | (next) |
+| Read an entry (day 5) | `GET /v1/entries/{id}` | `GetEntry` |
 | Ready for traffic? | `GET /readyz` | `grpc.health.v1.Health/Check` (day 5) |
 | Alive? | `GET /livez` | (HTTP only) |
 
 **Reading an entry back (day 5).** `Store.Entry` rebuilds an entry from its append-only rows, as a replay does, so
-`GET /v1/entries/{id}` answers byte for byte what posting it answered (`TestAnEntryReadBackIsWhatPostingItAnswered`).
+`GET /v1/entries/{id}` answers byte for byte what posting it answered (`TestAnEntryReadBackIsWhatPostingItAnswered`),
+and `GetEntry` field for field (`TestGRPCReadsAnEntryBackAsPosted`).
 A client that lost a POST's answer and has no key to resend can find the entry id in an account's history and read
 it. A missing entry is `not_found`; an id that isn't positive is `invalid_argument`, as for accounts.
 

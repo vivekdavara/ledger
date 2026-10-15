@@ -21,6 +21,8 @@ service LedgerService {
   // PostEntry records an entry atomically, once per idempotency key. A retry with the key and the same entry gets
   // the original back with replayed true; the key with a different entry is FAILED_PRECONDITION.
   rpc PostEntry(PostEntryRequest) returns (PostEntryResponse);
+  // GetEntry returns one posted entry, as PostEntry returned it. A missing entry is NOT_FOUND.
+  rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
 }
 
 // AccountType sets an account's normal side: debit for assets and expenses, credit for the rest.
@@ -133,4 +135,12 @@ message PostEntryResponse {
   Entry entry = 1;
   // True when an earlier request with the same key posted the entry; nothing was posted this time.
   bool replayed = 2;
+}
+
+message GetEntryRequest {
+  int64 id = 1;
+}
+
+message GetEntryResponse {
+  Entry entry = 1;
 }

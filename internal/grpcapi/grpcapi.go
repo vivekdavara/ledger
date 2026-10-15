@@ -125,13 +125,25 @@ func (s *service) PostEntry(ctx context.Context, req *ledgerv1.PostEntryRequest)
 	if err != nil {
 		return nil, s.status(err)
 	}
-	out := &ledgerv1.Entry{Id: posted.ID, Description: posted.Description, CreatedAt: timestamppb.New(posted.CreatedAt),
-		Postings: make([]*ledgerv1.PostedPosting, len(posted.Postings))}
-	for i, p := range posted.Postings {
+	return &ledgerv1.PostEntryResponse{Entry: toEntry(posted), Replayed: replayed}, nil
+}
+
+func (s *service) GetEntry(ctx context.Context, req *ledgerv1.GetEntryRequest) (*ledgerv1.GetEntryResponse, error) {
+	e, err := s.svc.Entry(ctx, req.GetId())
+	if err != nil {
+		return nil, s.status(err)
+	}
+	return &ledgerv1.GetEntryResponse{Entry: toEntry(e)}, nil
+}
+
+func toEntry(e ledger.PostedEntry) *ledgerv1.Entry {
+	out := &ledgerv1.Entry{Id: e.ID, Description: e.Description, CreatedAt: timestamppb.New(e.CreatedAt),
+		Postings: make([]*ledgerv1.PostedPosting, len(e.Postings))}
+	for i, p := range e.Postings {
 		out.Postings[i] = &ledgerv1.PostedPosting{Id: p.ID, AccountId: p.AccountID, Currency: p.Currency,
 			Amount: p.Amount, BalanceAfter: p.BalanceAfter, AccountVersion: p.AccountVersion}
 	}
-	return &ledgerv1.PostEntryResponse{Entry: out, Replayed: replayed}, nil
+	return out
 }
 
 func toAccount(a ledger.Account) *ledgerv1.Account {

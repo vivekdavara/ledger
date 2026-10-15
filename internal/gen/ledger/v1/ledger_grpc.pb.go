@@ -23,6 +23,7 @@ const (
 	LedgerService_GetAccount_FullMethodName    = "/ledger.v1.LedgerService/GetAccount"
 	LedgerService_ListPostings_FullMethodName  = "/ledger.v1.LedgerService/ListPostings"
 	LedgerService_PostEntry_FullMethodName     = "/ledger.v1.LedgerService/PostEntry"
+	LedgerService_GetEntry_FullMethodName      = "/ledger.v1.LedgerService/GetEntry"
 )
 
 // LedgerServiceClient is the client API for LedgerService service.
@@ -44,6 +45,8 @@ type LedgerServiceClient interface {
 	// PostEntry records an entry atomically, once per idempotency key. A retry with the key and the same entry gets
 	// the original back with replayed true; the key with a different entry is FAILED_PRECONDITION.
 	PostEntry(ctx context.Context, in *PostEntryRequest, opts ...grpc.CallOption) (*PostEntryResponse, error)
+	// GetEntry returns one posted entry, as PostEntry returned it. A missing entry is NOT_FOUND.
+	GetEntry(ctx context.Context, in *GetEntryRequest, opts ...grpc.CallOption) (*GetEntryResponse, error)
 }
 
 type ledgerServiceClient struct {
@@ -94,6 +97,16 @@ func (c *ledgerServiceClient) PostEntry(ctx context.Context, in *PostEntryReques
 	return out, nil
 }
 
+func (c *ledgerServiceClient) GetEntry(ctx context.Context, in *GetEntryRequest, opts ...grpc.CallOption) (*GetEntryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetEntryResponse)
+	err := c.cc.Invoke(ctx, LedgerService_GetEntry_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LedgerServiceServer is the server API for LedgerService service.
 // All implementations must embed UnimplementedLedgerServiceServer
 // for forward compatibility.
@@ -113,6 +126,8 @@ type LedgerServiceServer interface {
 	// PostEntry records an entry atomically, once per idempotency key. A retry with the key and the same entry gets
 	// the original back with replayed true; the key with a different entry is FAILED_PRECONDITION.
 	PostEntry(context.Context, *PostEntryRequest) (*PostEntryResponse, error)
+	// GetEntry returns one posted entry, as PostEntry returned it. A missing entry is NOT_FOUND.
+	GetEntry(context.Context, *GetEntryRequest) (*GetEntryResponse, error)
 	mustEmbedUnimplementedLedgerServiceServer()
 }
 
@@ -134,6 +149,9 @@ func (UnimplementedLedgerServiceServer) ListPostings(context.Context, *ListPosti
 }
 func (UnimplementedLedgerServiceServer) PostEntry(context.Context, *PostEntryRequest) (*PostEntryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PostEntry not implemented")
+}
+func (UnimplementedLedgerServiceServer) GetEntry(context.Context, *GetEntryRequest) (*GetEntryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetEntry not implemented")
 }
 func (UnimplementedLedgerServiceServer) mustEmbedUnimplementedLedgerServiceServer() {}
 func (UnimplementedLedgerServiceServer) testEmbeddedByValue()                       {}
@@ -228,6 +246,24 @@ func _LedgerService_PostEntry_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LedgerService_GetEntry_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetEntryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LedgerServiceServer).GetEntry(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LedgerService_GetEntry_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LedgerServiceServer).GetEntry(ctx, req.(*GetEntryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LedgerService_ServiceDesc is the grpc.ServiceDesc for LedgerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -250,6 +286,10 @@ var LedgerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PostEntry",
 			Handler:    _LedgerService_PostEntry_Handler,
+		},
+		{
+			MethodName: "GetEntry",
+			Handler:    _LedgerService_GetEntry_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

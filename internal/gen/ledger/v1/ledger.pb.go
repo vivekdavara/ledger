@@ -948,6 +948,94 @@ func (x *PostEntryResponse) GetReplayed() bool {
 	return false
 }
 
+type GetEntryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetEntryRequest) Reset() {
+	*x = GetEntryRequest{}
+	mi := &file_ledger_v1_ledger_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetEntryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetEntryRequest) ProtoMessage() {}
+
+func (x *GetEntryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_ledger_v1_ledger_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetEntryRequest.ProtoReflect.Descriptor instead.
+func (*GetEntryRequest) Descriptor() ([]byte, []int) {
+	return file_ledger_v1_ledger_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GetEntryRequest) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+type GetEntryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entry         *Entry                 `protobuf:"bytes,1,opt,name=entry,proto3" json:"entry,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetEntryResponse) Reset() {
+	*x = GetEntryResponse{}
+	mi := &file_ledger_v1_ledger_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetEntryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetEntryResponse) ProtoMessage() {}
+
+func (x *GetEntryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_ledger_v1_ledger_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetEntryResponse.ProtoReflect.Descriptor instead.
+func (*GetEntryResponse) Descriptor() ([]byte, []int) {
+	return file_ledger_v1_ledger_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetEntryResponse) GetEntry() *Entry {
+	if x != nil {
+		return x.Entry
+	}
+	return nil
+}
+
 var File_ledger_v1_ledger_proto protoreflect.FileDescriptor
 
 const file_ledger_v1_ledger_proto_rawDesc = "" +
@@ -1020,20 +1108,25 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\bpostings\x18\x04 \x03(\v2\x18.ledger.v1.PostedPostingR\bpostings\"W\n" +
 	"\x11PostEntryResponse\x12&\n" +
 	"\x05entry\x18\x01 \x01(\v2\x10.ledger.v1.EntryR\x05entry\x12\x1a\n" +
-	"\breplayed\x18\x02 \x01(\bR\breplayed*\xac\x01\n" +
+	"\breplayed\x18\x02 \x01(\bR\breplayed\"!\n" +
+	"\x0fGetEntryRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\":\n" +
+	"\x10GetEntryResponse\x12&\n" +
+	"\x05entry\x18\x01 \x01(\v2\x10.ledger.v1.EntryR\x05entry*\xac\x01\n" +
 	"\vAccountType\x12\x1c\n" +
 	"\x18ACCOUNT_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12ACCOUNT_TYPE_ASSET\x10\x01\x12\x1a\n" +
 	"\x16ACCOUNT_TYPE_LIABILITY\x10\x02\x12\x17\n" +
 	"\x13ACCOUNT_TYPE_EQUITY\x10\x03\x12\x18\n" +
 	"\x14ACCOUNT_TYPE_REVENUE\x10\x04\x12\x18\n" +
-	"\x14ACCOUNT_TYPE_EXPENSE\x10\x052\xc7\x02\n" +
+	"\x14ACCOUNT_TYPE_EXPENSE\x10\x052\x8c\x03\n" +
 	"\rLedgerService\x12R\n" +
 	"\rCreateAccount\x12\x1f.ledger.v1.CreateAccountRequest\x1a .ledger.v1.CreateAccountResponse\x12I\n" +
 	"\n" +
 	"GetAccount\x12\x1c.ledger.v1.GetAccountRequest\x1a\x1d.ledger.v1.GetAccountResponse\x12O\n" +
 	"\fListPostings\x12\x1e.ledger.v1.ListPostingsRequest\x1a\x1f.ledger.v1.ListPostingsResponse\x12F\n" +
-	"\tPostEntry\x12\x1b.ledger.v1.PostEntryRequest\x1a\x1c.ledger.v1.PostEntryResponseB?Z=github.com/vivekdavara/ledger/internal/gen/ledger/v1;ledgerv1b\x06proto3"
+	"\tPostEntry\x12\x1b.ledger.v1.PostEntryRequest\x1a\x1c.ledger.v1.PostEntryResponse\x12C\n" +
+	"\bGetEntry\x12\x1a.ledger.v1.GetEntryRequest\x1a\x1b.ledger.v1.GetEntryResponseB?Z=github.com/vivekdavara/ledger/internal/gen/ledger/v1;ledgerv1b\x06proto3"
 
 var (
 	file_ledger_v1_ledger_proto_rawDescOnce sync.Once
@@ -1048,7 +1141,7 @@ func file_ledger_v1_ledger_proto_rawDescGZIP() []byte {
 }
 
 var file_ledger_v1_ledger_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_ledger_v1_ledger_proto_goTypes = []any{
 	(AccountType)(0),              // 0: ledger.v1.AccountType
 	(*Account)(nil),               // 1: ledger.v1.Account
@@ -1064,33 +1157,38 @@ var file_ledger_v1_ledger_proto_goTypes = []any{
 	(*PostedPosting)(nil),         // 11: ledger.v1.PostedPosting
 	(*Entry)(nil),                 // 12: ledger.v1.Entry
 	(*PostEntryResponse)(nil),     // 13: ledger.v1.PostEntryResponse
-	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(*GetEntryRequest)(nil),       // 14: ledger.v1.GetEntryRequest
+	(*GetEntryResponse)(nil),      // 15: ledger.v1.GetEntryResponse
+	(*timestamppb.Timestamp)(nil), // 16: google.protobuf.Timestamp
 }
 var file_ledger_v1_ledger_proto_depIdxs = []int32{
 	0,  // 0: ledger.v1.Account.type:type_name -> ledger.v1.AccountType
-	14, // 1: ledger.v1.Account.created_at:type_name -> google.protobuf.Timestamp
+	16, // 1: ledger.v1.Account.created_at:type_name -> google.protobuf.Timestamp
 	0,  // 2: ledger.v1.CreateAccountRequest.type:type_name -> ledger.v1.AccountType
 	1,  // 3: ledger.v1.CreateAccountResponse.account:type_name -> ledger.v1.Account
 	1,  // 4: ledger.v1.GetAccountResponse.account:type_name -> ledger.v1.Account
-	14, // 5: ledger.v1.HistoryLine.posted_at:type_name -> google.protobuf.Timestamp
+	16, // 5: ledger.v1.HistoryLine.posted_at:type_name -> google.protobuf.Timestamp
 	7,  // 6: ledger.v1.ListPostingsResponse.postings:type_name -> ledger.v1.HistoryLine
 	9,  // 7: ledger.v1.PostEntryRequest.postings:type_name -> ledger.v1.Posting
-	14, // 8: ledger.v1.Entry.created_at:type_name -> google.protobuf.Timestamp
+	16, // 8: ledger.v1.Entry.created_at:type_name -> google.protobuf.Timestamp
 	11, // 9: ledger.v1.Entry.postings:type_name -> ledger.v1.PostedPosting
 	12, // 10: ledger.v1.PostEntryResponse.entry:type_name -> ledger.v1.Entry
-	2,  // 11: ledger.v1.LedgerService.CreateAccount:input_type -> ledger.v1.CreateAccountRequest
-	4,  // 12: ledger.v1.LedgerService.GetAccount:input_type -> ledger.v1.GetAccountRequest
-	6,  // 13: ledger.v1.LedgerService.ListPostings:input_type -> ledger.v1.ListPostingsRequest
-	10, // 14: ledger.v1.LedgerService.PostEntry:input_type -> ledger.v1.PostEntryRequest
-	3,  // 15: ledger.v1.LedgerService.CreateAccount:output_type -> ledger.v1.CreateAccountResponse
-	5,  // 16: ledger.v1.LedgerService.GetAccount:output_type -> ledger.v1.GetAccountResponse
-	8,  // 17: ledger.v1.LedgerService.ListPostings:output_type -> ledger.v1.ListPostingsResponse
-	13, // 18: ledger.v1.LedgerService.PostEntry:output_type -> ledger.v1.PostEntryResponse
-	15, // [15:19] is the sub-list for method output_type
-	11, // [11:15] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	12, // 11: ledger.v1.GetEntryResponse.entry:type_name -> ledger.v1.Entry
+	2,  // 12: ledger.v1.LedgerService.CreateAccount:input_type -> ledger.v1.CreateAccountRequest
+	4,  // 13: ledger.v1.LedgerService.GetAccount:input_type -> ledger.v1.GetAccountRequest
+	6,  // 14: ledger.v1.LedgerService.ListPostings:input_type -> ledger.v1.ListPostingsRequest
+	10, // 15: ledger.v1.LedgerService.PostEntry:input_type -> ledger.v1.PostEntryRequest
+	14, // 16: ledger.v1.LedgerService.GetEntry:input_type -> ledger.v1.GetEntryRequest
+	3,  // 17: ledger.v1.LedgerService.CreateAccount:output_type -> ledger.v1.CreateAccountResponse
+	5,  // 18: ledger.v1.LedgerService.GetAccount:output_type -> ledger.v1.GetAccountResponse
+	8,  // 19: ledger.v1.LedgerService.ListPostings:output_type -> ledger.v1.ListPostingsResponse
+	13, // 20: ledger.v1.LedgerService.PostEntry:output_type -> ledger.v1.PostEntryResponse
+	15, // 21: ledger.v1.LedgerService.GetEntry:output_type -> ledger.v1.GetEntryResponse
+	17, // [17:22] is the sub-list for method output_type
+	12, // [12:17] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_ledger_v1_ledger_proto_init() }
@@ -1105,7 +1203,7 @@ func file_ledger_v1_ledger_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_ledger_v1_ledger_proto_rawDesc), len(file_ledger_v1_ledger_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   13,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

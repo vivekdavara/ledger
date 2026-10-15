@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -123,6 +124,29 @@ func TestGRPCPostsAndPages(t *testing.T) {
 	if err != nil || len(page.GetPostings()) != 1 || page.NextAfterVersion != nil ||
 		page.GetPostings()[0].GetDescription() != pay.GetDescription() {
 		t.Fatalf("page 2: %v, %v", page, err)
+	}
+}
+
+// GetEntry returns what PostEntry returned, field for field, the posting order and the timestamp included.
+func TestGRPCReadsAnEntryBackAsPosted(t *testing.T) {
+	t.Parallel()
+	c := client(t)
+	ctx := context.Background()
+	cash := open(t, c, "cash:bank", ledgerv1.AccountType_ACCOUNT_TYPE_ASSET, "USD")
+	alice := open(t, c, "wallet:alice", ledgerv1.AccountType_ACCOUNT_TYPE_LIABILITY, "USD")
+	posted, err := c.PostEntry(ctx, &ledgerv1.PostEntryRequest{IdempotencyKey: "top-up-1", Description: "top up",
+		Postings: []*ledgerv1.Posting{posting(alice, -5000), posting(cash, 5000)}}) // not in account-id order
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetEntry(ctx, &ledgerv1.GetEntryRequest{Id: posted.GetEntry().GetId()})
+	if err != nil || !proto.Equal(got.GetEntry(), posted.GetEntry()) {
+		t.Fatalf("GetEntry = %v, %v; PostEntry returned %v", got, err, posted.GetEntry())
+	}
+	for id, want := range map[int64]codes.Code{posted.GetEntry().GetId() + 1: codes.NotFound, 0: codes.InvalidArgument} {
+		if _, err := c.GetEntry(ctx, &ledgerv1.GetEntryRequest{Id: id}); status.Code(err) != want {
+			t.Errorf("GetEntry(%d): %v, want %v", id, err, want)
+		}
 	}
 }
 

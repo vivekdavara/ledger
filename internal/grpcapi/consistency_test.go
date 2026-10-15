@@ -118,6 +118,19 @@ func TestBothAPIsGiveTheSameReason(t *testing.T) {
 	account("missing account", "/v1/accounts/999999", 999999)
 	account("account zero", "/v1/accounts/0", 0)
 	account("negative account", "/v1/accounts/-3", -3)
+	entry := func(name, path string, id int64) {
+		cases = append(cases, struct {
+			name string
+			rest viaREST
+			grpc func() error
+		}{name, viaREST{"GET", path, "", ""}, func() error {
+			_, err := c.GetEntry(ctx, &ledgerv1.GetEntryRequest{Id: id})
+			return err
+		}})
+	}
+	entry("missing entry", "/v1/entries/999999", 999999)
+	entry("entry zero", "/v1/entries/0", 0)
+	entry("negative entry", "/v1/entries/-3", -3)
 	history := func(name, query string, id, after int64, size int32) {
 		cases = append(cases, struct {
 			name string
