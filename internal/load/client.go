@@ -278,11 +278,19 @@ type GRPC struct {
 // but never answers would otherwise hold a call until the run's own deadline.
 const callTimeout = 30 * time.Second
 
-// NewGRPC returns a gRPC client for the API at addr (host:port). It reconnects quickly after the server goes away
-// (from 50 ms, at most 1 s apart, instead of gRPC's default of 1 s growing to 2 minutes), since a crash test restarts
-// the server at once.
+// NewGRPC returns a gRPC client for the API at addr (host:port, or a gRPC target with its scheme, such as
+// dns:///host:port). It reconnects quickly after the server goes away (from 50 ms, at most 1 s apart, instead of
+// gRPC's default of 1 s growing to 2 minutes), since a crash test restarts the server at once.
+//
+// A host:port is dialled by Go's own dialer (gRPC's passthrough resolver), which tries each of a name's addresses in
+// turn. With gRPC's default dns resolver, localhost:9103 never reached a server listening on 127.0.0.1 alone on this
+// Mac, whose localhost is ::1 as well (found on day 5).
 func NewGRPC(addr string) (*GRPC, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+	target := addr
+	if !strings.Contains(addr, ":///") {
+		target = "passthrough:///" + addr
+	}
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(grpc.ConnectParams{MinConnectTimeout: time.Second, Backoff: backoff.Config{
 			BaseDelay: 50 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: time.Second}}))
 	if err != nil {
