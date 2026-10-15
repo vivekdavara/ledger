@@ -47,3 +47,10 @@ The first release: a double-entry payments ledger with REST and gRPC APIs over P
 - `GET /v1/entries/{id}` and `GetEntry` read a posted entry back as posting it answered.
 - The gRPC port answers the standard health check (`grpc.health.v1.Health/Check`) as `/readyz` does.
 - `ledgerload` asks the ledger whether it is ready before sending anything.
+- Fixed, from a review of the whole repo: a stop with a zero `LEDGER_SHUTDOWN_GRACE` always exited 1, though nothing
+  was cut off; REST refused `after_version` past 2^31, its own paging cursor for a busy enough account; a missing
+  idempotency key was `malformed_request` over REST but `invalid_argument` over gRPC (now `invalid_argument` over
+  both); a typo in `serve`'s settings migrated the database before failing; six places where the docs no longer
+  matched the code.
+- `scripts/release_check.sh`: `make check`, the same on a clean export of the commit, then every measurement in the
+  README again. Tests run two packages at a time, under Postgres's 100 connections.
