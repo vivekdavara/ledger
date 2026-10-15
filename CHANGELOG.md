@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v1.0.1 (2026-10-15)
+
+Two fixes found after v1.0.0 the same day. The measurements in the README are v1.0.0's: neither fix touches a measured
+path except one atomic counter per REST request.
 
 - `ledgerd serve`: a stop with a grace under 5 s no longer exits 1 because a client held a connection open without
   sending a request. net/http's `Shutdown` counts such a connection as active for its first 5 s; `serve` now counts

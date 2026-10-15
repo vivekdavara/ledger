@@ -7,9 +7,9 @@ to zero in each currency, so money is moved, never created or destroyed. The rul
 validator, for clear errors, and by the database at commit, so no bug, second writer or hand-typed `psql` session
 can break it.
 
-> **v1.0.0** (2026-10-15). [CHANGELOG.md](CHANGELOG.md) says what's in it, day by day; [DESIGN.md](DESIGN.md) is
-> the full design; [WALKTHROUGH.md](WALKTHROUGH.md) has the questions an interviewer is likely to ask, with answers
-> that point at the code.
+> **v1.0.0** (2026-10-15), and **v1.0.1** the same day with two fixes found after it. [CHANGELOG.md](CHANGELOG.md)
+> says what's in each, day by day; [DESIGN.md](DESIGN.md) is the full design; [WALKTHROUGH.md](WALKTHROUGH.md) has
+> the questions an interviewer is likely to ask, with answers that point at the code.
 
 ## Why
 
