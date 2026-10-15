@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -88,11 +89,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	defer client.Close()
 
 	// Run waits out a ledgerd that goes away during the run (a crash test restarts it); one that isn't there at the
-	// start is a mistake to report at once. Any answer will do, "no such account" included.
+	// start, or says it isn't ready (/readyz, or the gRPC health service), is a mistake to report at once, before
+	// anything is sent.
 	probe, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
-	_, err = client.Account(probe, 1)
+	err = client.Ready(probe)
 	cancelProbe()
-	if load.Classify(err) == load.Unknown {
+	switch {
+	case errors.Is(err, load.ErrNotReady):
+		fmt.Fprintf(stderr, "ledgerload: the ledger at %s isn't ready: %v\n", *addr, err)
+		return 1
+	case err != nil:
 		fmt.Fprintf(stderr, "ledgerload: nothing answers at %s: %v\n", *addr, err)
 		return 1
 	}

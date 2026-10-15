@@ -137,7 +137,8 @@ go run ./cmd/ledgerload -api grpc -layout hot -workers 16 -transfers 3000
 clients, and prints throughput, latency percentiles, how each transfer ended, and whether every account it used holds
 what the answers imply. `-layout` is `disjoint`, `random` or `hot`; `-wallets`, `-skew` (a Zipf exponent above 1),
 `-pad`, `-retry` (send conflicts and unanswered requests again with their key until answered) and `-json` adjust it.
-It exits 0 when the books agree, 3 when they don't.
+It exits 0 when the books agree, 3 when they don't. Before sending anything it asks the ledger whether it is ready
+(`/readyz` over REST, the health service over gRPC), and exits 1 at once if nothing answers or the answer is no.
 
 ```bash
 make load

@@ -477,6 +477,8 @@ func (m *memLedger) Account(_ context.Context, id int64) (load.Account, error) {
 	return load.Account{}, &load.APIError{Reason: "not_found"}
 }
 
+func (m *memLedger) Ready(context.Context) error { return nil }
+
 func (m *memLedger) Close() error { return nil }
 
 // A rerun with the same prefix and flags replays every transfer; with any other configuration it starts accounts and

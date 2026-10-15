@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 )
 
@@ -34,8 +35,15 @@ type Client interface {
 	PostEntry(ctx context.Context, key string, e ledger.Entry) (Posted, error)
 	// Account returns an account's stored balance and version.
 	Account(ctx context.Context, id int64) (Account, error)
+	// Ready asks the ledger whether it is ready for traffic (/readyz, or the gRPC health service): nil if it is, an
+	// error wrapping ErrNotReady if it answered that it isn't, and any other error if it didn't answer.
+	Ready(ctx context.Context) error
 	Close() error
 }
+
+// ErrNotReady is wrapped by Ready's error when the ledger answered that it can't take traffic: its database is down
+// or behind the binary's migrations, or (over gRPC) it has no health service.
+var ErrNotReady = errors.New("not ready")
 
 // Account is what the generator reads back from an account: its stored balance in minor units (debits positive)
 // and its version, the number of postings it has.
@@ -242,6 +250,24 @@ func (c *REST) Account(ctx context.Context, id int64) (Account, error) {
 	return Account{Balance: balance, Version: out.Version}, err
 }
 
+func (c *REST) Ready(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/readyz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	var out struct{ Reason string }
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out) // the status says enough without it
+	return fmt.Errorf("%w: %d %s", ErrNotReady, resp.StatusCode, out.Reason)
+}
+
 // GRPC is a Client over the gRPC API.
 type GRPC struct {
 	conn *grpc.ClientConn
@@ -266,6 +292,21 @@ func NewGRPC(addr string) (*GRPC, error) {
 }
 
 func (c *GRPC) Close() error { return c.conn.Close() }
+
+func (c *GRPC) Ready(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(c.conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	switch {
+	case err != nil && Classify(fromStatus(err)) == Unknown:
+		return err // no answer
+	case err != nil:
+		return fmt.Errorf("%w: %w", ErrNotReady, err) // an answer, but not from a ready ledger's health service
+	case resp.GetStatus() != healthpb.HealthCheckResponse_SERVING:
+		return fmt.Errorf("%w: the health service says %s", ErrNotReady, resp.GetStatus())
+	}
+	return nil
+}
 
 // fromStatus turns a gRPC error into an *APIError carrying the ErrorInfo's reason in the REST API's spelling. An
 // error with no ErrorInfo (the connection failed, or gRPC itself refused the call) is reasoned from its code.

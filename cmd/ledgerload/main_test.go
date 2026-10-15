@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vivekdavara/ledger/internal/grpcapi"
 	"github.com/vivekdavara/ledger/internal/server"
 	"github.com/vivekdavara/ledger/internal/store"
@@ -23,18 +24,45 @@ import (
 func serve(t *testing.T) (restAddr, grpcAddr string) {
 	t.Helper()
 	db := storetest.Migrated(t)
+	return serveWith(t, db, func(ctx context.Context) error { return store.Ready(ctx, db) })
+}
+
+// serveWith runs both APIs over db, reporting readiness (to /readyz and the gRPC health service) by ready.
+func serveWith(t *testing.T, db *pgxpool.Pool, ready func(context.Context) error) (restAddr, grpcAddr string) {
+	t.Helper()
 	svc := store.New(db)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	httpSrv := httptest.NewServer(server.New(func(ctx context.Context) error { return store.Ready(ctx, db) }, svc, log))
+	httpSrv := httptest.NewServer(server.New(ready, svc, log))
 	t.Cleanup(httpSrv.Close)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	grpcSrv := grpcapi.New(svc, log)
+	grpcapi.RegisterHealth(grpcSrv, ready, log)
 	go func() { _ = grpcSrv.Serve(ln) }()
 	t.Cleanup(grpcSrv.Stop)
 	return strings.TrimPrefix(httpSrv.URL, "http://"), ln.Addr().String()
+}
+
+// A ledger that answers but isn't ready (here: says its database is down) is reported at once, over either API,
+// and nothing is sent: before day 5 the probe read account 1, which any answer passed, so the run went ahead.
+func TestALedgerThatIsntReadyIsReportedBeforeAnythingIsSent(t *testing.T) {
+	db := storetest.Migrated(t)
+	restAddr, grpcAddr := serveWith(t, db, func(context.Context) error { return store.ErrUnavailable })
+	for api, addr := range map[string]string{"rest": restAddr, "grpc": grpcAddr} {
+		var errs bytes.Buffer
+		code := run(context.Background(), []string{"-api", api, "-addr", addr, "-layout", "hot", "-workers", "2",
+			"-transfers", "10", "-wallets", "4"}, io.Discard, &errs)
+		if code != 1 || !strings.Contains(errs.String(), "the ledger at "+addr+" isn't ready") {
+			t.Errorf("%s: exit %d, %s", api, code, errs.String())
+		}
+	}
+	var accounts int
+	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM accounts`).Scan(&accounts); err != nil ||
+		accounts != 0 {
+		t.Fatalf("%d accounts created (%v), want none", accounts, err)
+	}
 }
 
 func TestARunOverEachAPIAgreesWithTheBooks(t *testing.T) {
