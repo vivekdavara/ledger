@@ -48,6 +48,9 @@ func (f failing) History(context.Context, int64, int64, int) ([]ledger.HistoryLi
 func (f failing) PostEntry(context.Context, string, ledger.Entry) (ledger.PostedEntry, bool, error) {
 	return ledger.PostedEntry{}, false, f.err
 }
+func (f failing) Entry(context.Context, int64) (ledger.PostedEntry, error) {
+	return ledger.PostedEntry{}, f.err
+}
 
 // An error nobody planned for, or the database being down, can carry hosts, users and queries. The client sees
 // only the status text; the log gets the whole error.
@@ -65,12 +68,14 @@ func TestUnplannedAndUnavailableErrorsAreRedacted(t *testing.T) {
 		var logs syncBuffer
 		h := server.New(func(context.Context) error { return nil }, failing{tc.err},
 			slog.New(slog.NewJSONHandler(&logs, nil)))
-		r := call(t, h, "GET", "/v1/accounts/1", "", "")
-		if r.code != tc.code || r.message() != http.StatusText(tc.code) {
-			t.Errorf("%v: %d %q, want %d %q", tc.err, r.code, r.message(), tc.code, http.StatusText(tc.code))
-		}
-		if body := strings.Join([]string{r.message(), r.header.Get("Content-Type")}, " "); strings.Contains(body, tc.secret) {
-			t.Errorf("%v: the client sees %q", tc.err, tc.secret)
+		for _, path := range []string{"/v1/accounts/1", "/v1/entries/1"} {
+			r := call(t, h, "GET", path, "", "")
+			if r.code != tc.code || r.message() != http.StatusText(tc.code) {
+				t.Errorf("%s, %v: %d %q, want %d %q", path, tc.err, r.code, r.message(), tc.code, http.StatusText(tc.code))
+			}
+			if body := strings.Join([]string{r.message(), r.header.Get("Content-Type")}, " "); strings.Contains(body, tc.secret) {
+				t.Errorf("%s, %v: the client sees %q", path, tc.err, tc.secret)
+			}
 		}
 		if !strings.Contains(logs.String(), tc.secret) {
 			t.Errorf("%v: the log doesn't have the whole error: %s", tc.err, logs.String())

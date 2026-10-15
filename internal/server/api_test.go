@@ -400,6 +400,48 @@ func TestARequestStuckOnALockGivesUpAtItsDeadline(t *testing.T) {
 }
 
 // A replay is the original answer: the entry is rebuilt from append-only history, so the body is the same bytes.
+// GET /v1/entries/{id} answers with what posting the entry answered, byte for byte: a client that lost the answer to
+// a POST can read the entry back by the id it finds in an account's history.
+func TestAnEntryReadBackIsWhatPostingItAnswered(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	cash := createAccount(t, h, "cash:bank", "asset", "USD")
+	alice := createAccount(t, h, "wallet:alice", "liability", "USD")
+	body := fmt.Sprintf(`{"description":"top up","postings":[{"account_id":%d,"currency":"USD","amount":"-50.00"},
+		{"account_id":%d,"currency":"USD","amount":"50.00"}]}`, alice, cash) // not in account-id order
+	req := httptest.NewRequest("POST", "/v1/entries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "top-up-1")
+	posted := httptest.NewRecorder()
+	h.ServeHTTP(posted, req)
+	var entry struct{ ID int64 }
+	if err := json.Unmarshal(posted.Body.Bytes(), &entry); err != nil || posted.Code != http.StatusCreated {
+		t.Fatalf("post: %d %s", posted.Code, posted.Body.String())
+	}
+	read := httptest.NewRecorder()
+	h.ServeHTTP(read, httptest.NewRequest("GET", fmt.Sprintf("/v1/entries/%d", entry.ID), nil))
+	if read.Code != http.StatusOK || read.Body.String() != posted.Body.String() {
+		t.Fatalf("read back %d:\n%s\nposted:\n%s", read.Code, read.Body.String(), posted.Body.String())
+	}
+	for _, tc := range []struct {
+		path, reason string
+		code         int
+		message      string
+	}{
+		{fmt.Sprintf("/v1/entries/%d", entry.ID+1), "not_found", http.StatusNotFound, "there is no entry"},
+		{"/v1/entries/0", "invalid_argument", http.StatusBadRequest, "entry id 0 is not positive"},
+		{"/v1/entries/-3", "invalid_argument", http.StatusBadRequest, "entry id -3 is not positive"},
+		{"/v1/entries/top-up-1", "malformed_request", http.StatusBadRequest, `"top-up-1" is not an entry id`},
+	} {
+		r := call(t, h, "GET", tc.path, "", "")
+		if reason, posting := r.reason(); r.code != tc.code || reason != tc.reason || posting != -1 ||
+			!strings.Contains(r.message(), tc.message) {
+			t.Errorf("GET %s: %d %s %d %q; want %d %s, no posting, %q", tc.path, r.code, reason, posting, r.message(),
+				tc.code, tc.reason, tc.message)
+		}
+	}
+}
+
 func TestAReplayIsTheOriginalResponseByteForByte(t *testing.T) {
 	t.Parallel()
 	h := newAPI(t)

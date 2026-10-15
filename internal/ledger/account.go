@@ -77,6 +77,7 @@ var (
 	ErrAccountName       = errors.New("invalid account name")
 	ErrAccountType       = errors.New("unknown account type")
 	ErrAccountNotFound   = errors.New("account not found")
+	ErrEntryNotFound     = errors.New("entry not found")
 	ErrNameTaken         = errors.New("account name taken by a different account")
 	ErrCurrencyMismatch  = errors.New("currency does not match the account's")
 	ErrInsufficientFunds = errors.New("insufficient funds")

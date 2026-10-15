@@ -47,7 +47,7 @@ var (
 	// UnknownAccount is a posting naming an account that doesn't exist. It is NotFound in gRPC, but 422 in REST:
 	// a 404 from POST /v1/entries would read as "no such endpoint".
 	UnknownAccount = refused("unknown_account", codes.NotFound)
-	// NotFound is the resource in the request's own path, such as GET /v1/accounts/{id}.
+	// NotFound is the resource in the request's own path, such as GET /v1/accounts/{id} or GET /v1/entries/{id}.
 	NotFound = Kind{"not_found", http.StatusNotFound, codes.NotFound, false}
 	// Internal is anything not in the table. The client sees no details.
 	Internal = Kind{"internal", http.StatusInternalServerError, codes.Internal, true}
@@ -65,6 +65,8 @@ var table = []struct {
 	{ledger.ErrPostingCount, invalid},
 	{ledger.ErrDescription, invalid},
 	{ledger.ErrAccountID, invalid},
+	{ledger.ErrEntryID, invalid},
+	{ledger.ErrEntryNotFound, NotFound},
 	{ledger.ErrCurrency, invalid},
 	{ledger.ErrZeroAmount, invalid},
 	{ledger.ErrAmountRange, invalid},

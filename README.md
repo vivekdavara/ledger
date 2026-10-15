@@ -193,6 +193,13 @@ curl -s localhost:8103/v1/accounts/2
 curl -s 'localhost:8103/v1/accounts/2/postings?limit=100'
 ```
 
+```bash
+curl -s localhost:8103/v1/entries/1
+```
+
+An entry reads back exactly as posting it answered (without the `Idempotent-Replayed` header); each line of an
+account's history names its `entry_id`.
+
 Amounts are decimal strings in the currency's major unit (`"20.00"`, `"1500"` for JPY), never floats. A wallet is a
 liability, so its stored `balance` is negative (a credit) and its `shown_balance` positive. Errors name a stable
 reason and, when one posting is at fault, its index. From the hand check (an account holding $30.00):

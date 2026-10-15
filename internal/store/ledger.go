@@ -195,6 +195,21 @@ func (s *Store) Account(ctx context.Context, id int64) (ledger.Account, error) {
 	return acct, translate(err)
 }
 
+// Entry returns one posted entry with its postings in account-id order: what PostEntry returned when it posted it,
+// rebuilt from the append-only rows as a replay is. An entry and its postings commit together, so the two reads
+// can't see half of one.
+func (s *Store) Entry(ctx context.Context, id int64) (ledger.PostedEntry, error) {
+	if id <= 0 {
+		return ledger.PostedEntry{}, &ledger.ValidationError{Rule: ledger.ErrEntryID, Posting: -1,
+			Detail: fmt.Sprintf("entry id %d is not positive", id)}
+	}
+	e, err := loadEntry(ctx, s.db, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ledger.PostedEntry{}, fmt.Errorf("%w: there is no entry %d", ledger.ErrEntryNotFound, id)
+	}
+	return e, translate(err)
+}
+
 // History page sizes.
 const (
 	DefaultPageSize = 100

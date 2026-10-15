@@ -247,6 +247,9 @@ func (f failing) History(context.Context, int64, int64, int) ([]ledger.HistoryLi
 func (f failing) PostEntry(context.Context, string, ledger.Entry) (ledger.PostedEntry, bool, error) {
 	return ledger.PostedEntry{}, false, f.err
 }
+func (f failing) Entry(context.Context, int64) (ledger.PostedEntry, error) {
+	return ledger.PostedEntry{}, f.err
+}
 
 func TestGRPCRedactsUnplannedErrors(t *testing.T) {
 	var logs strings.Builder

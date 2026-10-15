@@ -15,4 +15,6 @@ type Service interface {
 	// PostEntry posts an entry once per idempotency key; replayed is true when an earlier request with the key
 	// already posted it.
 	PostEntry(ctx context.Context, key string, e Entry) (_ PostedEntry, replayed bool, _ error)
+	// Entry returns one posted entry, as PostEntry returned it.
+	Entry(ctx context.Context, id int64) (PostedEntry, error)
 }

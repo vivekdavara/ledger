@@ -45,6 +45,7 @@ var (
 	ErrPostingCount     = errors.New("wrong number of postings")
 	ErrDescription      = errors.New("invalid description")
 	ErrAccountID        = errors.New("invalid account id")
+	ErrEntryID          = errors.New("invalid entry id")
 	ErrCurrency         = errors.New("unknown currency")
 	ErrZeroAmount       = errors.New("zero amount")
 	ErrAmountRange      = errors.New("amount out of range")

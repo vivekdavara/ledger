@@ -150,6 +150,7 @@ func (a api) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/accounts/{id}", a.bounded(a.getAccount))
 	mux.HandleFunc("GET /v1/accounts/{id}/postings", a.bounded(a.history))
 	mux.HandleFunc("POST /v1/entries", a.bounded(a.postEntry))
+	mux.HandleFunc("GET /v1/entries/{id}", a.bounded(a.getEntry))
 }
 
 // bounded gives a handler's request a deadline of a.timeout. The database calls under it are cancelled when it
@@ -185,7 +186,7 @@ func (a api) createAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a api) getAccount(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
+	id, err := pathID(r, "an account id")
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -201,7 +202,7 @@ func (a api) getAccount(w http.ResponseWriter, r *http.Request) {
 // history pages through an account's postings: ?after_version=N (default 0) and ?limit=N (default 100, at most
 // 1000).
 func (a api) history(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
+	id, err := pathID(r, "an account id")
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -282,6 +283,21 @@ func (a api) postEntry(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
 	writeJSON(w, status, toPostedEntryJSON(posted))
+}
+
+// getEntry returns a posted entry in the shape POST /v1/entries answered with, byte for byte.
+func (a api) getEntry(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "an entry id")
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	e, err := a.svc.Entry(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toPostedEntryJSON(e))
 }
 
 // The JSON field names each request body may use, exactly as spelled.
@@ -422,10 +438,10 @@ func describe(err error) string {
 
 // pathID reads the account id in the path. Only a non-integer is malformed here; the service refuses an id that
 // can't exist (zero or negative) the same way for both APIs.
-func pathID(r *http.Request) (int64, error) {
+func pathID(r *http.Request, what string) (int64, error) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %q is not an account id", apierr.ErrMalformed, r.PathValue("id"))
+		return 0, fmt.Errorf("%w: %q is not %s", apierr.ErrMalformed, r.PathValue("id"), what)
 	}
 	return id, nil
 }
