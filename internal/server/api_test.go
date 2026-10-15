@@ -442,6 +442,29 @@ func TestAnEntryReadBackIsWhatPostingItAnswered(t *testing.T) {
 	}
 }
 
+// Versions are int64, and REST hands them out as next_after_version, so it must take them back: after_version was
+// read as an int32, and a page past version 2,147,483,647 was refused as malformed while gRPC answered it (found in
+// the day-5 review). A hot account at the ~2,100 transfers a second measured here passes that in about 12 days.
+func TestRESTPagesPastVersion2To31(t *testing.T) {
+	t.Parallel()
+	h := newAPI(t)
+	id := createAccount(t, h, "revenue:fees", "revenue", "USD")
+	for _, after := range []string{"2147483648", "9223372036854775807"} {
+		r := call(t, h, "GET", fmt.Sprintf("/v1/accounts/%d/postings?after_version=%s", id, after), "", "")
+		if postings, _ := r.body["postings"].([]any); r.code != http.StatusOK || postings == nil || len(postings) != 0 {
+			reason, _ := r.reason()
+			t.Errorf("after_version=%s: %d %s %q, want 200 and an empty page", after, r.code, reason, r.message())
+		}
+	}
+	// Past int64 it is malformed, and a limit is still an int32, as gRPC's page_size is.
+	for _, query := range []string{"after_version=9223372036854775808", "limit=2147483648"} {
+		r := call(t, h, "GET", fmt.Sprintf("/v1/accounts/%d/postings?%s", id, query), "", "")
+		if reason, _ := r.reason(); r.code != http.StatusBadRequest || reason != "malformed_request" {
+			t.Errorf("%s: %d %s, want 400 malformed_request", query, r.code, reason)
+		}
+	}
+}
+
 func TestAReplayIsTheOriginalResponseByteForByte(t *testing.T) {
 	t.Parallel()
 	h := newAPI(t)

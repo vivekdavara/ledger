@@ -207,12 +207,12 @@ func (a api) history(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	after, err := queryInt(r, "after_version")
+	after, err := queryInt(r, "after_version", 64) // versions are int64, as next_after_version is
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	limit, err := queryInt(r, "limit")
+	limit, err := queryInt(r, "limit", 32) // gRPC's page_size is int32
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -446,14 +446,15 @@ func pathID(r *http.Request, what string) (int64, error) {
 	return id, nil
 }
 
-// queryInt reads an optional integer parameter; absent is 0. Only a non-integer is malformed here: the service
-// refuses a negative or too large value, the same way for both APIs.
-func queryInt(r *http.Request, name string) (int64, error) {
+// queryInt reads an optional integer parameter of the given size in bits (the gRPC field's); absent is 0. Only a
+// non-integer, or one that doesn't fit that size, is malformed here: the service refuses a negative or too large
+// value, the same way for both APIs.
+func queryInt(r *http.Request, name string, bits int) (int64, error) {
 	s := r.URL.Query().Get(name)
 	if s == "" {
 		return 0, nil
 	}
-	n, err := strconv.ParseInt(s, 10, 32)
+	n, err := strconv.ParseInt(s, 10, bits)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %s=%q is not a whole number", apierr.ErrMalformed, name, s)
 	}
