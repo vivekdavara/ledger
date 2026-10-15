@@ -4,8 +4,10 @@ A double-entry payments ledger: the system of record that says how much money ev
 movement of money is a **journal entry** made of **postings**, and the postings of an entry always sum to zero in
 each currency, so money is moved, never created or destroyed. Go 1.27, PostgreSQL 14 (pgx), gRPC + REST.
 
-This file is the plan for all five days. Day 1 builds the parts everything else stands on: the money type, the
-entry validator, the schema with its database-enforced invariants, the migration runner, a health endpoint and CI.
+This file is the design as built, over five days, for v1.0.0. Day 1 built the parts everything else stands on (the
+money type, the entry validator, the schema with its database-enforced invariants, the migration runner); day 2 the
+API; day 3 the isolation levels, the outbox and reconciliation; day 4 load and crash testing; day 5 the release.
+Each section says which day it comes from.
 
 ## Vocabulary
 
@@ -540,7 +542,7 @@ transactional outbox), and a separate publisher delivers it.
   the session's default. At `REPEATABLE READ` or `SERIALIZABLE`, a claim that reached a row another publisher marked
   and committed after the claim's snapshot would fail with `40001`; at `READ COMMITTED` it re-reads the row, finds it
   published, and passes over it. That window is inside one statement, so no test stages it, and no test fails with
-  the level removed (found again by the day-5 review; the reconciliation's `READ ONLY` is the same kind of guard).
+  the level removed (found again by the day-5 review).
   1. `SELECT id, entry_id FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`: the
      oldest unpublished events, skipping any another publisher holds. A partial index over the unpublished rows
      keeps this cheap however many have been published.
@@ -756,6 +758,36 @@ process's own `LEDGER_` settings.
   reusing a prefix with another config gave false mismatches, so names carry a tag of the config; a steep skew hung
   the random layout; the crash tests' random killer was never checked to have killed anything.
 
+## The release (day 5)
+
+Day 5 added the small things a release needs, then reviewed the whole repo and checked every measurement again.
+
+- **`ledgerd version`** prints the version the go command stamps from git when it builds the binary (`v1.0.0` at
+  the tag, a pseudo-version naming the commit after it, `+dirty` with uncommitted changes, `(devel)` under `go run`),
+  the commit, the schema version the built-in migrations reach (what `/readyz` requires), the Go release, and
+  whether crash points are compiled in. It needs no configuration and opens no database. There's no version
+  constant to forget: a test builds the binary and compares its commit with `git rev-parse HEAD`.
+- **Reading an entry back** (`GET /v1/entries/{id}`, `GetEntry`) and **the gRPC health service**: "API (day 2)" has
+  both.
+- **`ledgerload` asks whether the ledger is ready** before it sends anything (`/readyz`, or the health service). Its
+  probe used to read account 1 and take any answer the ledger gave, "no such account" included. A ledger whose
+  database was down still stopped it, though as "nothing answers" (a 503 counts as no answer), but one whose schema
+  didn't match its binary, as during an upgrade, passed, and the run went ahead against it.
+- **`serve` checks its settings before it touches the database**, and **a stop that cuts nothing off exits 0**
+  whatever the grace: the gRPC server counts its running calls (`grpcapi.Server.Running`), and only calls still
+  running at the end of the grace make a failed stop. Both from the review.
+- **The release check** (`scripts/release_check.sh`): `make check`; `make check` again on a clean `git archive` of
+  the commit, so the release needs nothing that isn't committed; then every measurement in the README again, and the
+  crash tests with their logs. The README's "Release check" has the results.
+
+### What day 5 found
+
+The review's findings are in the README ("Review of day 5"), each with its fix and its test: a zero grace that made
+every stop fail, REST refusing its own paging cursor past version 2^31, the APIs disagreeing on a missing key, a typo
+in `serve`'s settings migrating the database first, and six places where the docs no longer said what the code
+does. The other find was the test suite's: with every package's tests at once, each with a schema and a pool of its
+own, `make check` reached Postgres's 100 connections and failed once, so tests run two packages at a time.
+
 ## Testing
 
 - **Unit and property tests** (`testing` and [rapid](https://pkg.go.dev/pgregory.net/rapid)) for money and the
@@ -796,6 +828,11 @@ process's own `LEDGER_` settings.
   tag and kill it (see "The crash tests"); each asserts that its crashes happened. The faults build's own tests run
   the test binary as a child and watch it die on the right hit. Mutations: the key's insert removed (the load crash
   test fails with double posts), the re-lookup after a rejection removed (the concurrent-copies test fails 3 of 3).
+- **Day 5: the release.** The new reads and the health service are tested over both APIs, against the same reasons
+  (`TestBothAPIsGiveTheSameReason`, 28 cases). Each review fix has a test that fails without it, and each of the two
+  untested mechanisms the review found (`JSONLines`'s context check, `Cache-Control: no-store`) has one now. Two
+  guards remain without a test: the publisher's forced `READ COMMITTED`, whose race is inside one statement, and the
+  reconciliation's `READ ONLY`, which guards against a write no code path makes.
 
 ## Limitations
 
@@ -807,7 +844,7 @@ process's own `LEDGER_` settings.
   nothing. Because the trigger functions run with the caller's rights, that role currently needs `UPDATE` on
   accounts as well as `INSERT` and `SELECT` on entries and postings (the guard still stops it setting a balance
   directly). Making the trigger functions `SECURITY DEFINER` would remove the `UPDATE`; their pinned
-  `search_path` (0007) is what makes that safe. Day 1 doesn't set up roles.
+  `search_path` (0007) is what makes that safe. v1.0.0 doesn't set up roles.
 - **Pinned search paths.** Each ledger function resolves table names in the schema it was created in, with
   `pg_temp` last, so a session's temporary tables can't stand in for the ledger's (found in review on day 1). A
   new function must be pinned too; `TestEveryFunctionPinsItsSearchPath` fails until it is.
@@ -847,7 +884,7 @@ process's own `LEDGER_` settings.
 - **What the reconciliation can't see:** an entry's description or time rewritten, a key pointed at another entry,
   an unused account deleted. None changes a balance. History's triggers stop the first for any role that doesn't own
   the tables; keys aren't append-only (see "A deleted key allows a double post"), so nothing stops the second.
-- **Reconciliation reads everything.** Each run scans every posting (546–571 ms for 200,000 here). A large ledger
+- **Reconciliation reads everything.** Each run scans every posting (724–741 ms for 200,000 here, at v1.0.0). A large ledger
   would reconcile incrementally, from a checkpoint of balances already checked.
 - **A request's outcome can be unknown to its client.** If the connection drops during the commit, the client can't
   tell whether the entry posted; retrying with the same key is the answer, which is why the key is required.

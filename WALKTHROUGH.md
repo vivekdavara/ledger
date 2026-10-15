@@ -1,10 +1,11 @@
 # Walkthrough
 
-The questions an interviewer is likely to ask about Ledger, with short answers that point at the code. This file
-grows each day; this version covers day 1 (the money type, the validator, the schema and its invariants, the
-migration runner, the binary), day 2 (the API: REST and gRPC over one service, posting with retries, idempotency
-keys), day 3 (the isolation levels compared, the outbox, reconciliation) and day 4 (a load generator over the API,
-and crash tests that kill a real ledgerd). Read DESIGN.md first for the full picture.
+The questions an interviewer is likely to ask about Ledger, with short answers that point at the code, for v1.0.0:
+day 1 (the money type, the validator, the schema and its invariants, the migration runner, the binary), day 2 (the
+API: REST and gRPC over one service, posting with retries, idempotency keys), day 3 (the isolation levels compared,
+the outbox, reconciliation), day 4 (a load generator over the API, and crash tests that kill a real ledgerd) and
+day 5 (the release: the review of the whole repo, the release check, and what a release needed). Read DESIGN.md
+first for the full picture.
 
 **Reading order:** `internal/money/money.go` → `internal/ledger/entry.go` → the migrations in
 `internal/store/migrations/` (0001–0003 are the design, 0005–0007 the fixes from the review) →
@@ -18,7 +19,11 @@ and crash tests that kill a real ledgerd). Read DESIGN.md first for the full pic
 `internal/store/reconcile_test.go`. For day 4: DESIGN.md "Load and failure injection" → `internal/faults/faults.go`
 and `on.go` → the three `faults.Point` calls (`internal/store/ledger.go` `postOnce`, `internal/outbox/outbox.go`
 `PublishOnce`) → `internal/load/client.go` (`Classify`) → `internal/load/load.go` (`Run`, `send`, `check`) →
-`cmd/ledgerd/crash_test.go` (the supervisor, then the three tests) → `scripts/load.sh`.
+`cmd/ledgerd/crash_test.go` (the supervisor, then the three tests) → `scripts/load.sh`. For day 5: DESIGN.md "The
+release (day 5)" → `cmd/ledgerd/main.go` (`printVersion`, the settings checked before `store.Open`, the end of
+`serve`) → `internal/grpcapi/grpcapi.go` (`Server`, `Running`) and `health.go` → `internal/store/ledger.go`
+(`Entry`) → `internal/server/api.go` (`getEntry`, `queryInt`, the key check in `postEntry`) →
+`scripts/release_check.sh` → the README's "Review of day 5" and "Release check".
 
 ## The model
 
@@ -542,3 +547,68 @@ context closes the connection and returns at once; Postgres ends that session, a
 later. Until then `FOR UPDATE SKIP LOCKED` skips the batch. That's correct behaviour (the next poll takes it), so the
 test now polls as `Run` does. The lesson: a lock held by a dead client lasts until the server notices, and code that
 skips locked rows must expect to see them again.
+
+## The release (day 5)
+
+**What's in v1.0.0, and what would you build next?**
+The ledger's rules enforced by the database (day 1), the two APIs over one service with idempotency keys (day 2),
+the isolation levels, the outbox and reconciliation (day 3), load and crash testing (day 4), and on day 5 the reads,
+the health service and the fixes from a review of the whole repo; CHANGELOG.md lists it all. Next, in the order I'd
+do it: database roles, with `SECURITY DEFINER` trigger functions, so the service can't switch a trigger off;
+authentication, with keys scoped per client; a retention job for keys and published events; sub-accounts for hot
+accounts; reconciliation from a checkpoint instead of from scratch; and a real broker behind the outbox's `Sink`.
+
+**Tell me about a bug the release review found.**
+With `LEDGER_SHUTDOWN_GRACE=0s`, every stop of an idle server exited 1 and logged gRPC calls cut off that didn't
+exist (40 of 40). `serve` starts `GracefulStop` in a goroutine, then waits for whichever comes first: it finishing,
+or the grace running out. With a zero grace the deadline had already passed, and `GracefulStop` takes a moment even
+with nothing to wait for (it stops its listener and `Serve`, and closes idle connections), so the deadline always
+won. The exit code claimed calls were cut
+off, but it was computed from which channel was ready first. Now it's computed from what it claims:
+`grpcapi.Server` counts running calls in its interceptors, and a stop fails only if any were running when the grace
+ended (`TestAnIdleStopWithNoGraceIsClean`). The old cut-off test couldn't have caught a gRPC-side bug, because its
+REST request alone made it exit 1, so `TestAGRPCCallStillRunningAfterTheGraceIsCutOff` has a gRPC call alone.
+
+**And one in the API?**
+REST read every query parameter as an `int32` (`queryInt` called `strconv.ParseInt(s, 10, 32)`), but versions are
+`int64` and REST hands them out as `next_after_version`. So REST would have refused its own paging cursor once an
+account passed 2^31 postings, about 12 days for a hot account at the rate measured here, while gRPC, with an `int64`
+field, answered. Each parameter now has its gRPC field's size (`TestRESTPagesPastVersion2To31`). The lesson: a cursor
+an API hands out has to be one it accepts.
+
+**Why is the gRPC health check readiness, and liveness HTTP only?**
+Readiness asks whether this instance can serve right now: the database answers within 2 s and is at the binary's
+schema. A load balancer or a Kubernetes readiness probe then stops sending it traffic. Liveness asks whether the
+process is wedged, and must not depend on the database: if it did, a database outage would fail every instance's
+liveness at once and the orchestrator would restart them all. So `/livez` checks nothing, and the health service
+mirrors `/readyz` for gRPC-only clients and probes (`grpcapi.RegisterHealth`). `Watch` is unimplemented, since it
+would poll the database for each watcher, and grpc-go's client-side health checking reads `UNIMPLEMENTED` as "no
+health checking".
+
+**How do you know the README's numbers still hold at the release?**
+`scripts/release_check.sh` ran every measurement again at v1.0.0's code, and the README's "Release check" puts the
+new numbers next to the first ones. It also runs `make check` on a clean `git archive` of the commit, which fails a
+release that depends on a file nobody committed.
+
+**Why do your tests run two packages at a time?**
+Every database test gets a schema and a connection pool of its own, so tests run in parallel without seeing each
+other's rows. With every package's tests running at once (8 at a time on an 8-core Mac), the suite reached Postgres's
+default limit of 100 connections and failed once with "too many clients". Sampling `pg_stat_activity` every 50 ms
+showed up to 82 by default and 56 to 57 with `-p 2`, at 24 to 27 s instead of 19 to 20. CI's runner has 4 cores, so
+it runs fewer at once anyway; it now runs the same way as `make check`.
+
+**Are there guards no test checks?**
+Two, and the docs say so. The publisher forces `READ COMMITTED`: at `REPEATABLE READ` or `SERIALIZABLE`, a claim that
+reached a row another publisher had marked after the claim's snapshot would fail with `40001` instead of passing over
+it. That window is inside one statement, so no test can stage it. And reconciliation runs `READ ONLY`, which guards
+against a write that no code path makes. Both stay, as defence in depth.
+
+**How would you run this in production?**
+`ledgerd serve` is stateless, so several instances run behind a load balancer that watches `/readyz` (or the health
+check). Migrations run as their own step (`ledgerd migrate`) before a rollout, so a failed migration stops the rollout
+before any instance changes; `serve` migrates at start too, under the advisory lock, so instances starting together
+are safe. There is one `ledgerd publish` per event stream, since per-account order needs
+a single publisher, restarted by its supervisor; consumers dedupe by `id`. `ledgerd reconcile` runs on a schedule and
+alerts on exit 3. On SIGTERM each instance gives in-flight requests their grace. Postgres needs synchronous
+replication for the durability the crash tests assume. Before any of that: roles, authentication, TLS, and key
+retention.
