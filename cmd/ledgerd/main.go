@@ -7,6 +7,8 @@
 //	ledgerd reconcile recompute the books from the postings and print the report as JSON on stdout; exit 0 if it
 //	                  found no difference, 3 if it found some, 1 if it couldn't run. It changes nothing, migrations
 //	                  included: the schema must be current.
+//	ledgerd version   print the version, the commit, the schema version the migrations reach and the Go release,
+//	                  then exit; it needs no configuration and opens no database
 //
 // A usage error exits 2, whatever the subcommand.
 //
@@ -29,6 +31,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"syscall"
@@ -60,7 +64,7 @@ func main() {
 type addrs struct{ HTTP, GRPC string }
 
 // commands are ledgerd's subcommands.
-var commands = []string{"migrate", "serve", "publish", "reconcile"}
+var commands = []string{"migrate", "serve", "publish", "reconcile", "version"}
 
 // exitDifferences is reconcile's exit code when it found differences: distinct from 1, its own failure.
 const exitDifferences = 3
@@ -74,6 +78,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if len(args) != 1 || !slices.Contains(commands, args[0]) {
 		fmt.Fprintln(stderr, "usage: ledgerd "+strings.Join(commands, "|"))
 		return 2
+	}
+	if args[0] == "version" {
+		return printVersion(stdout, stderr)
 	}
 	if spec := getenv("LEDGER_FAULTS"); spec != "" {
 		rules, err := faults.Arm(spec)
@@ -153,6 +160,37 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	return serve(ctx, db, store.NewWithOptions(db, store.Options{Isolation: isolation}), httpAddr, grpcAddr, grace,
 		log, listening)
+}
+
+// printVersion writes one line saying which ledgerd this is. The version is the one the go command stamps from git
+// when it builds the binary: the tag (v1.0.0) when built at it, a pseudo-version naming the commit when built after
+// it, with "+dirty" for uncommitted changes, and "(devel)" when nothing was stamped (go run, go test). Then the
+// commit, the schema version the built-in migrations reach (what /readyz requires of the database), the Go release
+// and platform, and whether crash points are compiled in.
+func printVersion(stdout, stderr io.Writer) int {
+	migrations, err := store.LoadMigrations(store.Migrations())
+	if err != nil {
+		fmt.Fprintln(stderr, "ledgerd: the built-in migrations:", err)
+		return 1
+	}
+	version, commit := "(devel)", "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" {
+			version = info.Main.Version
+		}
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
+				commit = s.Value[:12]
+			}
+		}
+	}
+	build := ""
+	if faults.Enabled {
+		build = ", faults build"
+	}
+	fmt.Fprintf(stdout, "ledgerd %s (commit %s, schema %d, %s %s/%s%s)\n", version, commit, len(migrations),
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, build)
+	return 0
 }
 
 // reconcile runs the reconciliation and prints its report (DESIGN.md, "Reconciliation (day 3)").

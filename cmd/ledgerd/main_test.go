@@ -9,6 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os/exec"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +57,44 @@ func TestUsage(t *testing.T) {
 		if code := run(context.Background(), args, env(nil), io.Discard, &out, nil); code != 2 || !strings.Contains(out.String(), "usage") {
 			t.Errorf("run(%q) = %d, %q; want 2 and the usage", args, code, out.String())
 		}
+	}
+}
+
+func TestVersionNeedsNoConfiguration(t *testing.T) {
+	migrations, err := store.LoadMigrations(store.Migrations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No database URL, and a crash-point spec that every other subcommand of a normal build refuses: version only
+	// says what the binary is.
+	var out, errOut bytes.Buffer
+	vars := map[string]string{"LEDGER_FAULTS": faults.AfterCommit + ":1"}
+	if code := run(context.Background(), []string{"version"}, env(vars), &out, &errOut, nil); code != 0 ||
+		errOut.Len() != 0 {
+		t.Fatalf("exit %d, stderr %q; want 0 and nothing", code, errOut.String())
+	}
+	want := regexp.MustCompile(`^ledgerd \S+ \(commit \S+, schema ` + strconv.Itoa(len(migrations)) + `, ` +
+		regexp.QuoteMeta(runtime.Version()) + ` \S+/\S+\)\n$`)
+	if !want.MatchString(out.String()) {
+		t.Fatalf("version printed %q, want a line matching %s", out.String(), want)
+	}
+}
+
+// TestABuiltLedgerdNamesItsCommit checks what go build stamps into a real binary, which go test doesn't do for the
+// test binary: it reuses the crash tests' faults build, so that build must say so too.
+func TestABuiltLedgerdNamesItsCommit(t *testing.T) {
+	head, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Skipf("not in a git checkout, so nothing is stamped: %v", err)
+	}
+	out, err := exec.Command(faultsBinary(t), "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ledgerd version: %v: %s", err, out)
+	}
+	commit := strings.TrimSpace(string(head))[:12]
+	if !strings.Contains(string(out), "(commit "+commit+",") || !strings.HasSuffix(string(out), ", faults build)\n") ||
+		strings.HasPrefix(string(out), "ledgerd (devel)") {
+		t.Fatalf("ledgerd version printed %q; want commit %s, a stamped version and the faults build", out, commit)
 	}
 }
 

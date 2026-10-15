@@ -97,6 +97,11 @@ curl -s localhost:8103/readyz
 `/livez` checks nothing and answers while the process runs. `/readyz` answers 200 only when the database responds
 within 2 s and its schema is at the binary's newest migration, and 503 with the reason otherwise.
 
+`ledgerd version` prints the version the go command stamped from git when the binary was built (`v1.0.0` at the
+tag, a pseudo-version naming the commit after it, `+dirty` with uncommitted changes, `(devel)` under `go run`), the
+commit, the schema version its migrations reach, the Go release, and whether crash points are compiled in. It needs
+no configuration.
+
 `LEDGER_ISOLATION` picks the posting transactions' level: `read-committed` (the default) or `serializable`. DESIGN.md,
 "Concurrency (days 2 and 3)", says why both keep every rule and what each costs.
 
