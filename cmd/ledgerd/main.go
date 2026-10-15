@@ -105,6 +105,24 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if grpcAddr == "" {
 		grpcAddr = defaultGRPCAddr
 	}
+	// serve's own settings are checked before anything touches the database: a typo must not migrate it first
+	// (found in the day-5 review: LEDGER_ISOLATION=bogus applied the migrations, then failed).
+	grace, isolation := defaultShutdownGrace, store.DefaultIsolation
+	if args[0] == "serve" {
+		var err error
+		if v := getenv("LEDGER_SHUTDOWN_GRACE"); v != "" {
+			if grace, err = time.ParseDuration(v); err != nil || grace < 0 {
+				log.Error("LEDGER_SHUTDOWN_GRACE is not a duration such as 10s", "value", v)
+				return 1
+			}
+		}
+		if v := getenv("LEDGER_ISOLATION"); v != "" {
+			if isolation, err = store.ParseIsolation(v); err != nil {
+				log.Error("LEDGER_ISOLATION", "err", err)
+				return 1
+			}
+		}
+	}
 
 	// For serve and publish a stop signal is the normal way to end, so one that comes while they connect or migrate
 	// is a clean stop too: they had done nothing yet. migrate and reconcile were asked for one job, and a stop leaves
@@ -144,20 +162,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return publish(ctx, db, stdout, log)
 	}
 
-	grace := defaultShutdownGrace
-	if v := getenv("LEDGER_SHUTDOWN_GRACE"); v != "" {
-		if grace, err = time.ParseDuration(v); err != nil || grace < 0 {
-			log.Error("LEDGER_SHUTDOWN_GRACE is not a duration such as 10s", "value", v)
-			return 1
-		}
-	}
-	isolation := store.DefaultIsolation
-	if v := getenv("LEDGER_ISOLATION"); v != "" {
-		if isolation, err = store.ParseIsolation(v); err != nil {
-			log.Error("LEDGER_ISOLATION", "err", err)
-			return 1
-		}
-	}
 	return serve(ctx, db, store.NewWithOptions(db, store.Options{Isolation: isolation}), httpAddr, grpcAddr, grace,
 		log, listening)
 }

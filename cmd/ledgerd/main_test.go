@@ -107,13 +107,26 @@ func TestADatabaseURLIsRequired(t *testing.T) {
 	}
 }
 
-func TestAnUnknownIsolationLevelIsRefused(t *testing.T) {
-	vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, storetest.EmptySchema(t)),
-		"LEDGER_ISOLATION": "repeatable-read"}
-	var out bytes.Buffer
-	if code := run(context.Background(), []string{"serve"}, env(vars), io.Discard, &out, nil); code != 1 ||
-		!strings.Contains(out.String(), `unknown isolation level \"repeatable-read\"`) {
-		t.Fatalf("got %d, %q", code, out.String())
+// A setting serve can't use is refused before anything touches the database: the schema stays unmigrated (found in
+// the day-5 review: an unknown level applied the migrations, then failed).
+func TestServesSettingsAreCheckedBeforeTheDatabase(t *testing.T) {
+	db := storetest.EmptySchema(t)
+	for _, tc := range []struct{ name, value, want string }{
+		{"LEDGER_ISOLATION", "repeatable-read", `unknown isolation level \"repeatable-read\"`},
+		{"LEDGER_SHUTDOWN_GRACE", "soon", "LEDGER_SHUTDOWN_GRACE is not a duration"},
+		{"LEDGER_SHUTDOWN_GRACE", "-1s", "LEDGER_SHUTDOWN_GRACE is not a duration"},
+	} {
+		vars := map[string]string{"LEDGER_DATABASE_URL": storetest.SchemaURL(t, db), tc.name: tc.value}
+		var out bytes.Buffer
+		if code := run(context.Background(), []string{"serve"}, env(vars), io.Discard, &out, nil); code != 1 ||
+			!strings.Contains(out.String(), tc.want) || strings.Contains(out.String(), `"msg":"migrated"`) {
+			t.Errorf("%s=%s: exit %d, log %q; want 1, %q, and no migration", tc.name, tc.value, code, out.String(), tc.want)
+		}
+	}
+	var migrations *string
+	if err := db.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations')::text`).Scan(&migrations); err != nil ||
+		migrations != nil {
+		t.Fatalf("the schema was migrated (%v, %v)", migrations, err)
 	}
 }
 
