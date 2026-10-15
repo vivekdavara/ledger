@@ -567,7 +567,10 @@ won. The exit code claimed calls were cut
 off, but it was computed from which channel was ready first. Now it's computed from what it claims:
 `grpcapi.Server` counts running calls in its interceptors, and a stop fails only if any were running when the grace
 ended (`TestAnIdleStopWithNoGraceIsClean`). The old cut-off test couldn't have caught a gRPC-side bug, because its
-REST request alone made it exit 1, so `TestAGRPCCallStillRunningAfterTheGraceIsCutOff` has a gRPC call alone.
+REST request alone made it exit 1, so `TestWorkStillRunningAfterTheGraceIsCutOffOverEachAPI` runs each API alone.
+The same bug turned up on the REST side after the release: net/http's `Shutdown` counts a connection that hasn't sent
+a request as active for its first 5 s, so with a shorter grace one such connection made a stop exit 1. `serve` now
+counts its REST requests too (`TestAConnectionThatSentNothingDoesNotFailAStop`).
 
 **And one in the API?**
 REST read every query parameter as an `int32` (`queryInt` called `strconv.ParseInt(s, 10, 32)`), but versions are

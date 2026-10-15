@@ -312,7 +312,7 @@ The main ones; DESIGN.md, "Limitations", has every one, with its reason.
 
 ## Tests
 
-207 test functions (193 at the end of day 4, 159 at the end of day 3, 122 at the end of day 2; several table-driven or
+208 test functions (207 at v1.0.0, 193 at the end of day 4, 159 at the end of day 3, 122 at the end of day 2; several table-driven or
 property-based, and the concurrency tests run at both isolation levels), all green locally and in CI. `make check`
 runs them two packages at a time: each test has a schema and a connection pool of its own, and with every package at
 once the suite reached Postgres's 100 connections (day 5).
@@ -408,12 +408,13 @@ once the suite reached Postgres's 100 connections (day 5).
   `git rev-parse HEAD`); the gRPC health check is `SERVING` on a current schema, `NOT_SERVING` before migration (the
   reason in the log) and within its 2 s when the check hangs, and `NOT_FOUND` for an unknown service; `ledgerload`
   stops before sending anything to a ledger that isn't ready, over either API; an entry reads back exactly as posting
-  it answered, byte for byte over REST and field for field over gRPC, with `not_found` and `invalid_argument` the
-  same over both. From the review (each fails without its fix): 40 idle stops with a zero grace all exit 0, while a
-  gRPC call alone still running at the end of a grace is cut off with exit 1; REST pages past version 2^31; a
-  missing key is `invalid_argument` over both APIs; `serve`'s settings are refused before the database is touched;
-  `JSONLines` stops between events when its context ends; every REST answer says `Cache-Control: no-store`. From the
-  release's hand check: a gRPC client of `localhost` reaches a server listening on 127.0.0.1 alone.
+  it answered, byte for byte over REST and field for field over gRPC, with `not_found` and `invalid_argument` the same
+  over both. From the review (each fails without its fix): 40 idle stops with a zero grace all exit 0, while work
+  still running at the end of a grace is cut off with exit 1, over each API alone (and, after the release, a
+  connection that sent nothing doesn't fail a stop); REST pages past version 2^31; a missing key is `invalid_argument`
+  over both APIs; `serve`'s settings are refused before the database is touched; `JSONLines` stops between events when
+  its context ends; every REST answer says `Cache-Control: no-store`. From the release's hand check: a gRPC client of
+  `localhost` reaches a server listening on 127.0.0.1 alone.
 
 ## Results
 
