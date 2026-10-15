@@ -607,7 +607,16 @@ func TestALostConnectionDuringDeliveryLosesNoEvent(t *testing.T) {
 	if n := unpublished(t, db); n != 3 {
 		t.Fatalf("%d unpublished after the lost connection, want 3", n)
 	}
-	if n, err := p.PublishOnce(ctx); n != 3 || err != nil {
+	// The ended backend sends its error before it exits, and frees its row locks as it exits: until then SKIP LOCKED
+	// passes over the three rows, and the next poll takes them, as in TestEventsWhoseMarkIsLostAreDeliveredAgain.
+	// (The day-5 review saw "published 0" here once, in a run alongside other tests; 300 runs of this test alone
+	// were green.)
+	n, err := p.PublishOnce(ctx)
+	for deadline := time.Now().Add(10 * time.Second); n == 0 && err == nil && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		n, err = p.PublishOnce(ctx)
+	}
+	if n != 3 || err != nil {
 		t.Fatalf("on a new connection: published %d, %v; want 3", n, err)
 	}
 	if got := sk.events(); len(got) != 6 || len(outbox.Dedupe(map[int64]bool{}, got)) != 3 {
